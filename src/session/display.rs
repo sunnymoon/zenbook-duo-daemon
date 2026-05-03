@@ -3,6 +3,7 @@ use std::sync::Arc;
 use log::{debug, error, info, warn};
 use tokio::sync::broadcast;
 use zbus::{Connection, proxy, zvariant::OwnedValue};
+use futures::stream::StreamExt;
 
 // ── Mutter D-Bus type aliases ─────────────────────────────────────────────────
 
@@ -29,6 +30,9 @@ pub trait DisplayConfig {
         logical_monitors: Vec<ApplyLm>,
         properties: HashMap<String, OwnedValue>,
     ) -> zbus::Result<()>;
+    
+    #[zbus(signal)]
+    fn monitors_changed(&self) -> zbus::Result<()>;
 }
 
 // ── Layout helpers ────────────────────────────────────────────────────────────
@@ -625,52 +629,55 @@ async fn apply_toggle_secondary_display(
     Ok(())
 }
 
-/// Monitor display configuration changes by subscribing to PropertiesChanged signals
-/// When display state changes, trigger availability check
-async fn monitor_display_availability(
+/// Subscribe to D-Bus MonitorsChanged signal from Mutter
+/// When signal fires, check if eDP-2 availability changed (needed to restore desired_primary)
+/// Only acts when: desired_primary=eDP-2 AND eDP-2 is now available AND not primary
+async fn subscribe_monitors_changed(
     display: &DisplayConfigProxy<'_>,
     availability_tx: broadcast::Sender<()>,
     desired_primary: Arc<tokio::sync::RwLock<String>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    info!("DisplayConfig: monitor availability started (event-driven via display state polling)");
+    info!("DisplayConfig: subscribing to MonitorsChanged signal (event-driven, no polling)");
     
-    let mut last_monitor_count = 0;
+    let mut signal_rx = display.receive_monitors_changed().await?;
     
-    loop {
-        // Check display state every 2 seconds
-        // This is lightweight - just checking current config
-        match display.get_current_state().await {
-            Ok((_, _physical, logical, _)) => {
-                let current_count = logical.len();
-                
-                // If monitor count changed, trigger availability check
-                if current_count != last_monitor_count {
-                    info!("DisplayConfig: monitor count changed {} -> {}", last_monitor_count, current_count);
-                    last_monitor_count = current_count;
-                    let _ = availability_tx.send(());
-                } else if current_count >= 2 {
-                    // Both monitors present - check if swap needed (safety check)
-                    let desired = desired_primary.read().await.clone();
-                    let (logical_map, _) = read_current_config(&logical);
-                    
-                    if let Some((_, _, _, _, is_primary)) = logical_map.get(&desired) {
-                        if !*is_primary {
-                            // Desired monitor available but not primary - trigger check
-                            let _ = availability_tx.send(());
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                warn!("DisplayConfig: failed to get state: {}", e);
-            }
+    while signal_rx.next().await.is_some() {
+        // D-Bus signal fired: monitors changed
+        // Check if this affects eDP-2 availability for desired_primary restoration
+        let desired = desired_primary.read().await.clone();
+        
+        // Only care if we want eDP-2
+        if desired != "eDP-2" {
+            debug!("MonitorsChanged: desired_primary is {}, not eDP-2, skipping", desired);
+            continue;
         }
         
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        // Get current display state
+        if let Ok((_serial, _physical, logical, _)) = display.get_current_state().await {
+            let (logical_map, _) = read_current_config(&logical);
+            
+            // Check eDP-2: is it available AND not primary?
+            match logical_map.get("eDP-2") {
+                Some((_, _, _, _, is_primary)) if !*is_primary => {
+                    // eDP-2 available but not primary - trigger restoration
+                    info!("MonitorsChanged: eDP-2 is available and desired, attempting to restore as primary");
+                    let _ = availability_tx.send(());
+                }
+                Some((_, _, _, _, is_primary)) if *is_primary => {
+                    debug!("MonitorsChanged: eDP-2 already primary, no action needed");
+                }
+                None => {
+                    debug!("MonitorsChanged: eDP-2 not available");
+                }
+                _ => {}
+            }
+        }
     }
+    
+    Ok(())
 }
 
-pub async fn run(mut orient_rx: broadcast::Receiver<String>, mut kb_rx: broadcast::Receiver<bool>, mut swap_rx: broadcast::Receiver<()>, mut toggle_rx: broadcast::Receiver<bool>, swap_result_tx: tokio::sync::mpsc::Sender<String>, kb_result_tx: tokio::sync::mpsc::Sender<()>, toggle_result_tx: tokio::sync::mpsc::Sender<()>, desired_primary: Arc<tokio::sync::RwLock<String>>) {
+pub async fn run(mut orient_rx: broadcast::Receiver<String>, mut kb_rx: broadcast::Receiver<bool>, mut toggle_rx: broadcast::Receiver<bool>, toggle_result_tx: tokio::sync::mpsc::Sender<()>, kb_result_tx: tokio::sync::mpsc::Sender<()>, desired_primary: Arc<tokio::sync::RwLock<String>>) {
     let conn = loop {
         match Connection::session().await {
             Ok(c) => break c,
@@ -694,16 +701,40 @@ pub async fn run(mut orient_rx: broadcast::Receiver<String>, mut kb_rx: broadcas
     // Broadcast channel for availability checks triggered by display state changes
     let (availability_tx, _) = broadcast::channel::<()>(8);
     
-    // Start display availability monitor task
+    // Start proactive desired_primary application task
+    // Checks if desired display is available on startup and applies it immediately
+    // Also watches for desired_primary changes and applies them when available
     {
         let display_clone = display.clone();
         let availability_tx_clone = availability_tx.clone();
         let desired_primary_clone = Arc::clone(&desired_primary);
         tokio::spawn(async move {
             loop {
-                if let Err(e) = monitor_display_availability(&display_clone, availability_tx_clone.clone(), desired_primary_clone.clone()).await {
-                    error!("DisplayConfig: availability monitor error: {e}");
+                let desired = desired_primary_clone.read().await.clone();
+                
+                if let Ok((_serial, _physical, logical, _)) = display_clone.get_current_state().await {
+                    let (logical_map, _) = read_current_config(&logical);
+                    
+                    // Check if desired display is available
+                    if let Some((_, _, _, _, is_primary)) = logical_map.get(&desired) {
+                        if !*is_primary {
+                            // Desired display is available but NOT primary - apply it immediately
+                            info!("DisplayConfig: {} is desired and available, making it primary", desired);
+                            let _ = availability_tx_clone.send(());
+                        } else {
+                            debug!("DisplayConfig: {} is already primary", desired);
+                        }
+                    } else {
+                        debug!("DisplayConfig: {} is not available, will monitor for it", desired);
+                        // Subscribe to MonitorsChanged to wait for it to become available
+                        if desired == "eDP-2" {
+                            if let Err(e) = subscribe_monitors_changed(&display_clone, availability_tx_clone.clone(), desired_primary_clone.clone()).await {
+                                error!("DisplayConfig: MonitorsChanged subscription error: {e}");
+                            }
+                        }
+                    }
                 }
+                
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         });
@@ -722,24 +753,6 @@ pub async fn run(mut orient_rx: broadcast::Receiver<String>, mut kb_rx: broadcas
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => warn!("Display handler lagged by {n}"),
-                Err(broadcast::error::RecvError::Closed) => break,
-            },
-            msg = swap_rx.recv() => match msg {
-                Ok(_response_tx) => {
-                    info!("Display: swap_rx received event");
-                    let start = std::time::Instant::now();
-                    match apply_display_swap(&display).await {
-                        Ok(new_primary) => {
-                            info!("SwapDisplays completed in {:.2}ms, new_primary={}", start.elapsed().as_secs_f64() * 1000.0, new_primary);
-                            let _ = swap_result_tx.send(new_primary).await;
-                        }
-                        Err(e) => {
-                            warn!("SwapDisplays failed: {e}");
-                            let _ = swap_result_tx.send("error".to_string()).await;
-                        }
-                    }
-                }
-                Err(broadcast::error::RecvError::Lagged(n)) => warn!("Swap handler lagged by {n}"),
                 Err(broadcast::error::RecvError::Closed) => break,
             },
             msg = toggle_rx.recv() => match msg {

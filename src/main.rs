@@ -41,6 +41,7 @@ enum Args {
 }
 
 mod config;
+mod daemon_socket;
 mod dwt;
 mod events;
 mod idle_detection;
@@ -139,11 +140,10 @@ async fn run_daemon(config_path: PathBuf) {
             (state_manager, activity_notifier, None)
         };
 
-    // Spawn background task to sync desired_primary with session daemon
-    // This keeps trying until ACK is received, handling session daemon restarts
+    // Start bidirectional daemon socket server (root daemon listens for session daemon connections)
     let state_mgr = state_manager.clone();
     tokio::spawn(async move {
-        config::sync_desired_primary_background(&state_mgr).await;
+        daemon_socket::start_server(&state_mgr).await;
     });
 
     start_secondary_display_task(

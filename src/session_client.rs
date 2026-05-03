@@ -12,9 +12,8 @@ static LAST_SESSION_ID: Mutex<Option<u64>> = tokio::sync::Mutex::const_new(None)
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum SessionCmd {
     KeyboardAttached { value: bool },
-    SwapDisplays,
-    ToggleSecondaryDisplay { enable: bool },
     SetDesiredPrimary { value: String },
+    ToggleSecondaryDisplay { enable: bool },
 }
 
 /// Check if a new session daemon has connected
@@ -87,16 +86,26 @@ pub async fn try_send_with_response(cmd: &SessionCmd) -> String {
             continue;
         }
         match UnixStream::connect(&sock_path).await {
-            Ok(mut stream) => {
-                if let Err(e) = stream.write_all(json.as_bytes()).await {
+            Ok(stream) => {
+                // Split stream: separate reader and writer to avoid conflicts
+                let (mut reader, mut writer) = tokio::io::split(stream);
+                
+                // Write command
+                if let Err(e) = writer.write_all(json.as_bytes()).await {
                     warn!("Failed to write to session daemon {:?}: {e}", sock_path);
                     continue;
                 }
                 debug!("Sent to session daemon {:?}: {json}", sock_path);
                 
+                // Ensure write is flushed before reading
+                if let Err(e) = writer.flush().await {
+                    warn!("Failed to flush to session daemon: {e}");
+                    continue;
+                }
+                
                 // Wait for response with generous timeout (5s) for display operations
                 let mut buf = vec![0; 1024];
-                match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await {
+                match tokio::time::timeout(Duration::from_secs(5), reader.read(&mut buf)).await {
                     Ok(Ok(n)) => {
                         if n > 0 {
                             let response = String::from_utf8_lossy(&buf[..n]).trim().to_string();

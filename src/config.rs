@@ -70,15 +70,15 @@ impl KeyFunction {
                 state_manager.set_desired_primary(new_desired);
                 info!("User intention: swap to {}", new_desired);
                 
-                // Now try to apply it via session daemon
+                // Send SetDesiredPrimary to session daemon (will apply if monitor available)
                 let response = crate::session_client::try_send_with_response(
-                    &crate::session_client::SessionCmd::SwapDisplays,
+                    &crate::session_client::SessionCmd::SetDesiredPrimary { value: new_desired.to_string() },
                 ).await;
                 
-                if response.starts_with("ok:") {
-                    info!("SwapDisplays applied successfully");
+                if response.starts_with("ok") {
+                    info!("SetDesiredPrimary sent successfully, session will apply when appropriate");
                 } else {
-                    warn!("SwapDisplays not yet applied: {}, will retry on keyboard/display events", response);
+                    warn!("SetDesiredPrimary not acked: {}", response);
                 }
             }
             _ => {
@@ -210,56 +210,3 @@ impl Config {
     }
 }
 
-/// Sync desired_primary with session daemon only on specific triggers
-/// Triggers: on startup and periodically as safety net
-/// This avoids constant polling while ensuring state is synced when needed
-pub async fn sync_desired_primary_background(state_manager: &KeyboardStateManager) {
-    // On startup: immediately check for any active session and send desired_primary
-    {
-        debug!("Sync: checking for active session on startup");
-        if crate::session_client::is_new_session().await {
-            if let Some(desired_primary) = state_manager.get_desired_primary() {
-                info!("Session active on startup, sending desired_primary={}", desired_primary);
-                let response = crate::session_client::try_send_with_response(
-                    &crate::session_client::SessionCmd::SetDesiredPrimary {
-                        value: desired_primary.clone(),
-                    },
-                ).await;
-                
-                if response.contains("ok") {
-                    info!("Session daemon acknowledged desired_primary={}", desired_primary);
-                }
-            }
-        }
-    }
-    
-    // Main loop: periodically check (safety fallback) but very infrequently
-    // The real sync happens through session_ready messages and display availability signals
-    let mut check_interval = std::time::Instant::now();
-    
-    loop {
-        // Only check every 30 seconds as a safety fallback (very infrequent)
-        if check_interval.elapsed() > std::time::Duration::from_secs(30) {
-            debug!("Sync: periodic check for session reconnection");
-            if crate::session_client::is_new_session().await {
-                if let Some(desired_primary) = state_manager.get_desired_primary() {
-                    info!("New session detected during periodic check, sending desired_primary={}", desired_primary);
-                    let response = crate::session_client::try_send_with_response(
-                        &crate::session_client::SessionCmd::SetDesiredPrimary {
-                            value: desired_primary.clone(),
-                        },
-                    ).await;
-                    
-                    if response.contains("ok") {
-                        info!("Session daemon acknowledged desired_primary={}", desired_primary);
-                    } else {
-                        warn!("Session daemon did not acknowledge desired_primary");
-                    }
-                }
-            }
-            check_interval = std::time::Instant::now();
-        }
-        
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-    }
-}
