@@ -114,6 +114,9 @@ async fn run_daemon(config_path: PathBuf) {
 
     // Create event channel
     let (event_sender, _) = broadcast::channel::<Event>(64);
+    
+    // Create state update broadcast channel (for desired_primary changes)
+    let (state_update_tx, _) = broadcast::channel::<String>(16);
 
     // Create virtual keyboard
     let virtual_keyboard = Arc::new(Mutex::new(VirtualKeyboard::new(&config)));
@@ -142,8 +145,9 @@ async fn run_daemon(config_path: PathBuf) {
 
     // Start bidirectional daemon socket server (root daemon listens for session daemon connections)
     let state_mgr = state_manager.clone();
+    let update_tx = state_update_tx.clone();
     tokio::spawn(async move {
-        daemon_socket::start_server(&state_mgr).await;
+        daemon_socket::start_server(&state_mgr, update_tx).await;
     });
 
     start_secondary_display_task(

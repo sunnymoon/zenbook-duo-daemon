@@ -1,4 +1,4 @@
-use log::{debug, info, warn};
+use log::{info, warn};
 use std::{path::PathBuf, sync::Arc};
 use tokio::fs;
 use tokio::sync::Mutex;
@@ -70,16 +70,8 @@ impl KeyFunction {
                 state_manager.set_desired_primary(new_desired);
                 info!("User intention: swap to {}", new_desired);
                 
-                // Send SetDesiredPrimary to session daemon (will apply if monitor available)
-                let response = crate::session_client::try_send_with_response(
-                    &crate::session_client::SessionCmd::SetDesiredPrimary { value: new_desired.to_string() },
-                ).await;
-                
-                if response.starts_with("ok") {
-                    info!("SetDesiredPrimary sent successfully, session will apply when appropriate");
-                } else {
-                    warn!("SetDesiredPrimary not acked: {}", response);
-                }
+                // Desired primary is now persisted to state file.
+                // Session daemon will receive update via bidirectional daemon socket.
             }
             _ => {
                 // do nothing

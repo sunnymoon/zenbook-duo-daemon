@@ -1,66 +1,16 @@
-use log::{debug, info, warn};
+use log::{debug, warn};
 use serde::Serialize;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use std::time::Duration;
-use tokio::sync::Mutex;
-
-// Global session ID tracker to detect when session daemon restarts
-static LAST_SESSION_ID: Mutex<Option<u64>> = tokio::sync::Mutex::const_new(None);
 
 #[derive(Serialize, Debug)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum SessionCmd {
     KeyboardAttached { value: bool },
+    #[allow(dead_code)]
     SetDesiredPrimary { value: String },
     ToggleSecondaryDisplay { enable: bool },
-}
-
-/// Check if a new session daemon has connected
-/// Returns true if this is a NEW session (different ID from last seen)
-pub async fn is_new_session() -> bool {
-    let sock_path = {
-        let uid = unsafe { nix::libc::getuid() };
-        format!("/run/user/{uid}/zenbook-duo-session.sock")
-    };
-    
-    if !tokio::fs::try_exists(&sock_path).await.unwrap_or(false) {
-        debug!("is_new_session: socket not found at {}", sock_path);
-        return false;
-    }
-    
-    match UnixStream::connect(&sock_path).await {
-        Ok(stream) => {
-            let (reader, _) = stream.into_split();
-            let mut reader = BufReader::new(reader);
-            let mut line = String::new();
-            
-            // Read the session identity message: "session_ready:{session_id}"
-            if let Ok(_) = reader.read_line(&mut line).await {
-                if let Some(session_id_str) = line.strip_prefix("session_ready:") {
-                    if let Ok(session_id) = session_id_str.trim().parse::<u64>() {
-                        let mut last_id = LAST_SESSION_ID.lock().await;
-                        
-                        // Check if this is a NEW session
-                        let is_new = last_id.as_ref() != Some(&session_id);
-                        
-                        if is_new {
-                            info!("is_new_session: Detected new session daemon: {}", session_id);
-                            *last_id = Some(session_id);
-                        }
-                        
-                        return is_new;
-                    }
-                }
-            }
-            debug!("is_new_session: failed to read session_ready message");
-        }
-        Err(e) => {
-            debug!("is_new_session: Failed to connect to session socket: {}", e);
-        }
-    }
-    
-    false
 }
 
 /// Send command to session daemon and wait for response.

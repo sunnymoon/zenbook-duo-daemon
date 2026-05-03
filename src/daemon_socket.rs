@@ -1,6 +1,6 @@
 // Bidirectional socket communication between root daemon and session daemon
-// Root daemon: creates and listens on the socket
-// Session daemon: connects to the root daemon's socket
+// Root daemon: creates and listens on the socket, broadcasts updates to all connected clients
+// Session daemon: connects to the root daemon's socket and receives broadcasts
 
 use log::{error, info, warn, debug};
 use serde::{Serialize, Deserialize};
@@ -9,6 +9,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use std::path::Path;
 use std::os::unix::fs::PermissionsExt;
+use tokio::sync::broadcast;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -27,8 +28,12 @@ pub enum DaemonMsg {
 }
 
 /// Start the daemon socket server (called by root daemon)
-/// Listens on a Unix socket and sends desired_primary to session daemon on connect
-pub async fn start_server(state_manager: &crate::state::KeyboardStateManager) {
+/// Listens on a Unix socket and broadcasts desired_primary updates to all connected session daemons
+/// Takes a broadcast sender to notify about state changes
+pub async fn start_server(
+    state_manager: &crate::state::KeyboardStateManager,
+    state_update_tx: broadcast::Sender<String>,
+) {
     let sock_path = "/run/zenbook-duo-daemon.sock";
     
     // Remove stale socket if it exists
@@ -52,8 +57,9 @@ pub async fn start_server(state_manager: &crate::state::KeyboardStateManager) {
                 match listener.accept().await {
                     Ok((stream, _)) => {
                         let state_mgr = state_manager.clone();
+                        let update_tx = state_update_tx.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_session_connection(stream, state_mgr).await {
+                            if let Err(e) = handle_session_connection(stream, state_mgr, update_tx).await {
                                 warn!("Session connection error: {}", e);
                             }
                         });
@@ -71,14 +77,16 @@ pub async fn start_server(state_manager: &crate::state::KeyboardStateManager) {
 }
 
 /// Handle incoming session daemon connection
-/// Send desired_primary immediately and handle future messages
+/// Send desired_primary immediately and listen for broadcasts/updates
 async fn handle_session_connection(
-    mut stream: tokio::net::UnixStream,
+    stream: tokio::net::UnixStream,
     state_manager: crate::state::KeyboardStateManager,
+    state_update_tx: broadcast::Sender<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
+    let mut broadcast_rx = state_update_tx.subscribe();
     
     // Send desired_primary immediately on connect
     if let Some(desired_primary) = state_manager.get_desired_primary() {
@@ -91,43 +99,91 @@ async fn handle_session_connection(
         info!("ROOT: Sent DesiredPrimaryUpdate={} to session daemon", desired_primary);
     }
     
-    // Listen for messages from session daemon
+    // Listen for incoming messages from session and broadcasts from state changes
     loop {
-        line.clear();
-        match reader.read_line(&mut line).await {
-            Ok(0) => {
-                // Connection closed
-                info!("ROOT: Session daemon connection closed");
-                break;
-            }
-            Ok(_) => {
-                // Parse and handle message
-                match serde_json::from_str::<DaemonMsg>(&line) {
-                    Ok(msg) => {
-                        debug!("ROOT: Received message from session: {:?}", msg);
-                        // Handle message if needed (e.g., acknowledgments)
-                        match msg {
-                            DaemonMsg::Ack { msg: ack_msg } => {
-                                debug!("ROOT: Session acknowledged: {}", ack_msg);
+        tokio::select! {
+            // Handle messages from session daemon
+            result = reader.read_line(&mut line) => {
+                match result {
+                    Ok(0) => {
+                        // Connection closed
+                        info!("ROOT: Session daemon connection closed");
+                        break;
+                    }
+                    Ok(_) => {
+                        // Parse and handle message
+                        match serde_json::from_str::<DaemonMsg>(&line) {
+                            Ok(msg) => {
+                                debug!("ROOT: Received message from session: {:?}", msg);
+                                // Handle message if needed (e.g., acknowledgments)
+                                match msg {
+                                    DaemonMsg::Ack { msg: ack_msg } => {
+                                        debug!("ROOT: Session acknowledged: {}", ack_msg);
+                                    }
+                                    _ => {
+                                        // Other messages can be handled here if needed
+                                    }
+                                }
                             }
-                            _ => {
-                                // Other messages can be handled here if needed
+                            Err(e) => {
+                                warn!("ROOT: Failed to parse message from session: {}", e);
                             }
                         }
+                        line.clear();
                     }
                     Err(e) => {
-                        warn!("ROOT: Failed to parse message from session: {}", e);
+                        error!("ROOT: Error reading from session: {}", e);
+                        break;
                     }
                 }
             }
-            Err(e) => {
-                error!("ROOT: Error reading from session: {}", e);
-                break;
+            
+            // Handle broadcasts from root daemon state changes
+            result = broadcast_rx.recv() => {
+                match result {
+                    Ok(new_desired) => {
+                        info!("ROOT: Broadcasting DesiredPrimaryUpdate={} to connected session daemon", new_desired);
+                        let msg = DaemonMsg::DesiredPrimaryUpdate {
+                            value: new_desired,
+                        };
+                        if let Ok(json) = serde_json::to_string(&msg) {
+                            if let Err(e) = writer.write_all(format!("{}\n", json).as_bytes()).await {
+                                error!("ROOT: Failed to send broadcast to session daemon: {}", e);
+                                break;
+                            }
+                            if let Err(e) = writer.flush().await {
+                                error!("ROOT: Failed to flush to session daemon: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        warn!("ROOT: Session daemon fell behind on broadcasts");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        info!("ROOT: State update broadcast channel closed");
+                        break;
+                    }
+                }
             }
         }
     }
     
     Ok(())
+}
+
+/// Broadcast a desired_primary update to all connected session daemons
+/// Called when Fn+F8 is pressed or state changes
+#[allow(dead_code)]
+pub async fn broadcast_desired_primary_update(tx: &broadcast::Sender<String>, new_desired: String) {
+    match tx.send(new_desired) {
+        Ok(_) => {
+            debug!("ROOT: Broadcasted desired_primary update");
+        }
+        Err(e) => {
+            warn!("ROOT: Failed to broadcast desired_primary update: {}", e);
+        }
+    }
 }
 
 /// Connect to root daemon socket (called by session daemon)
