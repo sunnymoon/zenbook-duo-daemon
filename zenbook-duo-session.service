@@ -1,0 +1,13 @@
+[Unit]
+Description=Zenbook Duo Session Daemon
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=/opt/zenbook-duo-daemon/zenbook-duo-daemon session
+Restart=on-failure
+RestartSec=3
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=graphical-session.target

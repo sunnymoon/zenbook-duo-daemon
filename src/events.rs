@@ -5,4 +5,5 @@ pub enum Event {
     MicMuteLed(bool),
     Backlight(KeyboardBacklightState),
     SecondaryDisplay(bool),
+    KeyboardAttached(bool),
 }

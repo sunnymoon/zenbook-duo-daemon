@@ -1,4 +1,4 @@
-use log::{info, warn};
+use log::{debug, info, warn};
 use std::{path::PathBuf, sync::Arc};
 use tokio::fs;
 use tokio::sync::Mutex;
@@ -13,6 +13,7 @@ use crate::state::KeyboardStateManager;
 pub enum KeyFunction {
     KeyboardBacklight(bool),
     ToggleSecondaryDisplay(bool),
+    SwapDisplays(bool),
     KeyBind(Vec<EV_KEY>),
     Command(String),
     NoOp(bool),
@@ -39,7 +40,46 @@ impl KeyFunction {
                 state_manager.toggle_keyboard_backlight();
             }
             KeyFunction::ToggleSecondaryDisplay(true) => {
-                state_manager.toggle_secondary_display();
+                let new_state = !state_manager.is_secondary_display_enabled();
+                info!("KeyFunction: executing ToggleSecondaryDisplay -> {}", new_state);
+                
+                let response = crate::session_client::try_send_with_response(
+                    &crate::session_client::SessionCmd::ToggleSecondaryDisplay { enable: new_state },
+                ).await;
+                
+                if response.starts_with("ok") {
+                    info!("ToggleSecondaryDisplay: session daemon handled it");
+                    state_manager.toggle_secondary_display();
+                } else {
+                    warn!("ToggleSecondaryDisplay: session daemon not available or error, falling back to sysfs");
+                    state_manager.toggle_secondary_display();
+                }
+            }
+            KeyFunction::SwapDisplays(true) => {
+                info!("KeyFunction: executing SwapDisplays");
+                
+                // Read current desired state to determine what we want
+                let current_desired = state_manager.get_desired_primary();
+                let new_desired = if current_desired.as_deref() == Some("eDP-2") {
+                    "eDP-1"
+                } else {
+                    "eDP-2"
+                };
+                
+                // Save the intended primary BEFORE attempting swap (independent of success)
+                state_manager.set_desired_primary(new_desired);
+                info!("User intention: swap to {}", new_desired);
+                
+                // Now try to apply it via session daemon
+                let response = crate::session_client::try_send_with_response(
+                    &crate::session_client::SessionCmd::SwapDisplays,
+                ).await;
+                
+                if response.starts_with("ok:") {
+                    info!("SwapDisplays applied successfully");
+                } else {
+                    warn!("SwapDisplays not yet applied: {}, will retry on keyboard/display events", response);
+                }
             }
             _ => {
                 // do nothing
@@ -108,7 +148,7 @@ impl Default for Config {
             keyboard_backlight_key: KeyFunction::KeyboardBacklight(true),
             brightness_down_key: KeyFunction::KeyBind(vec![EV_KEY::KEY_BRIGHTNESSDOWN]),
             brightness_up_key: KeyFunction::KeyBind(vec![EV_KEY::KEY_BRIGHTNESSUP]),
-            swap_up_down_display_key: KeyFunction::NoOp(true),
+            swap_up_down_display_key: KeyFunction::SwapDisplays(true),
             microphone_mute_key: KeyFunction::KeyBind(vec![EV_KEY::KEY_MICMUTE]),
             emoji_picker_key: KeyFunction::KeyBind(vec![EV_KEY::KEY_LEFTCTRL, EV_KEY::KEY_DOT]),
             myasus_key: KeyFunction::NoOp(true),
@@ -167,5 +207,41 @@ impl Config {
         }
         let config_str = fs::read_to_string(config_path).await.unwrap();
         toml::from_str(&config_str).unwrap()
+    }
+}
+
+/// Persistent background task to sync desired_primary with session daemon
+/// Only sends when session daemon reconnects (detected by new session ID)
+/// No polling on desired_primary value - only reacts to reconnection
+pub async fn sync_desired_primary_background(state_manager: &KeyboardStateManager) {
+    let mut check_cooldown = std::time::Instant::now();
+    
+    loop {
+        // Check for new session every 5 seconds (only when we detect it's new)
+        if check_cooldown.elapsed() > std::time::Duration::from_secs(5) {
+            debug!("Sync check: elapsed={:?}, checking for new session", check_cooldown.elapsed());
+            if crate::session_client::is_new_session().await {
+                // New session daemon detected - send desired_primary immediately
+                if let Some(desired_primary) = state_manager.get_desired_primary() {
+                    info!("New session daemon detected, sending desired_primary={}", desired_primary);
+                    let response = crate::session_client::try_send_with_response(
+                        &crate::session_client::SessionCmd::SetDesiredPrimary {
+                            value: desired_primary.clone(),
+                        },
+                    ).await;
+                    
+                    if response.contains("ok") {
+                        info!("Session daemon acknowledged desired_primary={}", desired_primary);
+                    } else {
+                        warn!("Session daemon did not acknowledge desired_primary");
+                    }
+                }
+            } else {
+                debug!("No new session detected");
+            }
+            check_cooldown = std::time::Instant::now();
+        }
+        
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 }

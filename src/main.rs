@@ -19,17 +19,19 @@ use crate::{
 };
 use clap::Parser;
 use keyboard_bt::start_bt_keyboard_monitor_task;
-use log::{error, info};
+use log::{error, info, warn};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 enum Args {
-    /// Run the daemon
+    /// Run the root daemon (requires root privileges)
     Run {
         /// Path to the config file, defaults to /etc/zenbook-duo-daemon/config.toml
         #[arg(short, long)]
         config_path: Option<PathBuf>,
     },
+    /// Run the session daemon (runs as the logged-in user, started by systemd user service)
+    Session,
     /// Migrate config file - backs up old config and writes new default if read fails
     MigrateConfig {
         /// Path to the config file, defaults to /etc/zenbook-duo-daemon/config.toml
@@ -39,12 +41,15 @@ enum Args {
 }
 
 mod config;
+mod dwt;
 mod events;
 mod idle_detection;
 mod keyboard_bt;
 mod keyboard_usb;
 mod mute_state;
 mod secondary_display;
+mod session;
+mod session_client;
 mod state;
 mod unix_pipe;
 mod virtual_keyboard;
@@ -59,6 +64,9 @@ async fn main() {
         Args::MigrateConfig { config_path } => {
             migrate_config(config_path.unwrap_or(PathBuf::from(DEFAULT_CONFIG_PATH))).await;
             return;
+        }
+        Args::Session => {
+            session::run().await;
         }
         Args::Run { config_path } => {
             run_daemon(config_path.unwrap_or(PathBuf::from(DEFAULT_CONFIG_PATH))).await;
@@ -131,6 +139,13 @@ async fn run_daemon(config_path: PathBuf) {
             (state_manager, activity_notifier, None)
         };
 
+    // Spawn background task to sync desired_primary with session daemon
+    // This keeps trying until ACK is received, handling session daemon restarts
+    let state_mgr = state_manager.clone();
+    tokio::spawn(async move {
+        config::sync_desired_primary_background(&state_mgr).await;
+    });
+
     start_secondary_display_task(
         config.clone(),
         state_manager.clone(),
@@ -146,6 +161,8 @@ async fn run_daemon(config_path: PathBuf) {
         activity_notifier.clone(),
     );
 
+    // Software disable-while-typing for BT mode (needs root to grab /dev/input).
+    let initial_usb_attached = current_usb_keyboard.is_some();
     start_usb_keyboard_monitor_task(
         &config,
         current_usb_keyboard,
@@ -158,6 +175,40 @@ async fn run_daemon(config_path: PathBuf) {
     start_listen_mute_state_thread(state_manager.clone());
 
     start_receive_commands_task(&config, state_manager.clone(), activity_notifier.clone());
+
+    dwt::start_task(initial_usb_attached, event_sender.clone());
+
+    // Forward keyboard attachment state changes to the session daemon
+    // Try to let session daemon handle it gracefully first, fall back to sysfs if needed
+    {
+        let mut event_rx = event_sender.subscribe();
+        let _state_manager_clone = state_manager.clone();
+        tokio::spawn(async move {
+            loop {
+                match event_rx.recv().await {
+                    Ok(Event::KeyboardAttached(attached)) => {
+                        info!("KeyboardAttached event: {}", attached);
+                        
+                        // Try to notify session daemon with timeout
+                        let response = session_client::try_send_with_response(
+                            &session_client::SessionCmd::KeyboardAttached { value: attached }
+                        ).await;
+                        
+                        if response.contains("ok") {
+                            info!("KeyboardAttached: session daemon handled it");
+                        } else {
+                            warn!("KeyboardAttached: session daemon not responding (timeout or error), will be handled via sysfs");
+                            // Session daemon is down, but the actual sysfs disable/enable is handled elsewhere
+                            // Root daemon just needs to track the state for the fallback in handle_keyboard_attach()
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                }
+            }
+        });
+    }
 
     panic::set_hook(Box::new(|info| {
         error!("Thread panicked: {info}");
