@@ -210,20 +210,40 @@ impl Config {
     }
 }
 
-/// Persistent background task to sync desired_primary with session daemon
-/// Only sends when session daemon reconnects (detected by new session ID)
-/// No polling on desired_primary value - only reacts to reconnection
+/// Sync desired_primary with session daemon only on specific triggers
+/// Triggers: on startup and periodically as safety net
+/// This avoids constant polling while ensuring state is synced when needed
 pub async fn sync_desired_primary_background(state_manager: &KeyboardStateManager) {
-    let mut check_cooldown = std::time::Instant::now();
+    // On startup: immediately check for any active session and send desired_primary
+    {
+        debug!("Sync: checking for active session on startup");
+        if crate::session_client::is_new_session().await {
+            if let Some(desired_primary) = state_manager.get_desired_primary() {
+                info!("Session active on startup, sending desired_primary={}", desired_primary);
+                let response = crate::session_client::try_send_with_response(
+                    &crate::session_client::SessionCmd::SetDesiredPrimary {
+                        value: desired_primary.clone(),
+                    },
+                ).await;
+                
+                if response.contains("ok") {
+                    info!("Session daemon acknowledged desired_primary={}", desired_primary);
+                }
+            }
+        }
+    }
+    
+    // Main loop: periodically check (safety fallback) but very infrequently
+    // The real sync happens through session_ready messages and display availability signals
+    let mut check_interval = std::time::Instant::now();
     
     loop {
-        // Check for new session every 5 seconds (only when we detect it's new)
-        if check_cooldown.elapsed() > std::time::Duration::from_secs(5) {
-            debug!("Sync check: elapsed={:?}, checking for new session", check_cooldown.elapsed());
+        // Only check every 30 seconds as a safety fallback (very infrequent)
+        if check_interval.elapsed() > std::time::Duration::from_secs(30) {
+            debug!("Sync: periodic check for session reconnection");
             if crate::session_client::is_new_session().await {
-                // New session daemon detected - send desired_primary immediately
                 if let Some(desired_primary) = state_manager.get_desired_primary() {
-                    info!("New session daemon detected, sending desired_primary={}", desired_primary);
+                    info!("New session detected during periodic check, sending desired_primary={}", desired_primary);
                     let response = crate::session_client::try_send_with_response(
                         &crate::session_client::SessionCmd::SetDesiredPrimary {
                             value: desired_primary.clone(),
@@ -236,12 +256,10 @@ pub async fn sync_desired_primary_background(state_manager: &KeyboardStateManage
                         warn!("Session daemon did not acknowledge desired_primary");
                     }
                 }
-            } else {
-                debug!("No new session detected");
             }
-            check_cooldown = std::time::Instant::now();
+            check_interval = std::time::Instant::now();
         }
         
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
 }
