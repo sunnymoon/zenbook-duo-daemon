@@ -1,17 +1,17 @@
 use std::panic;
 use std::time::Duration;
 use std::{path::PathBuf, process, sync::Arc};
+use std::sync::OnceLock;
 
 use tokio::fs;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{Mutex, broadcast};
-
-use crate::mute_state::start_listen_mute_state_thread;
 use crate::{
     config::{Config, DEFAULT_CONFIG_PATH},
     events::Event,
     idle_detection::start_idle_detection_task,
     keyboard_usb::{find_wired_keyboard, start_usb_keyboard_monitor_task, start_usb_keyboard_task},
+    mute_state::start_listen_mute_state_thread,
     secondary_display::start_secondary_display_task,
     state::{KeyboardBacklightState, KeyboardStateManager},
     unix_pipe::start_receive_commands_task,
@@ -50,10 +50,13 @@ mod keyboard_usb;
 mod mute_state;
 mod secondary_display;
 mod session;
-mod session_client;
 mod state;
 mod unix_pipe;
 mod virtual_keyboard;
+
+// Global daemon-message broadcast sender - initialized in run_daemon and used by config.rs
+static STATE_BROADCAST: OnceLock<Mutex<Option<broadcast::Sender<daemon_socket::DaemonMsg>>>> = OnceLock::new();
+static ACK_BROADCAST: OnceLock<Mutex<Option<broadcast::Sender<String>>>> = OnceLock::new();
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -116,7 +119,12 @@ async fn run_daemon(config_path: PathBuf) {
     let (event_sender, _) = broadcast::channel::<Event>(64);
     
     // Create state update broadcast channel (for desired_primary changes)
-    let (state_update_tx, _) = broadcast::channel::<String>(16);
+    let (state_update_tx, _) = broadcast::channel::<daemon_socket::DaemonMsg>(16);
+    let (ack_tx, _) = broadcast::channel::<String>(16);
+    
+    // Store the broadcast sender globally so config.rs can access it
+    let _ = STATE_BROADCAST.get_or_init(|| Mutex::new(Some(state_update_tx.clone())));
+    let _ = ACK_BROADCAST.get_or_init(|| Mutex::new(Some(ack_tx.clone())));
 
     // Create virtual keyboard
     let virtual_keyboard = Arc::new(Mutex::new(VirtualKeyboard::new(&config)));
@@ -146,8 +154,9 @@ async fn run_daemon(config_path: PathBuf) {
     // Start bidirectional daemon socket server (root daemon listens for session daemon connections)
     let state_mgr = state_manager.clone();
     let update_tx = state_update_tx.clone();
+    let ack_tx_clone = ack_tx.clone();
     tokio::spawn(async move {
-        daemon_socket::start_server(&state_mgr, update_tx).await;
+        daemon_socket::start_server(&state_mgr, update_tx, ack_tx_clone).await;
     });
 
     start_secondary_display_task(
@@ -186,24 +195,57 @@ async fn run_daemon(config_path: PathBuf) {
     // Try to let session daemon handle it gracefully first, fall back to sysfs if needed
     {
         let mut event_rx = event_sender.subscribe();
-        let _state_manager_clone = state_manager.clone();
+        let state_manager_clone = state_manager.clone();
         tokio::spawn(async move {
             loop {
                 match event_rx.recv().await {
                     Ok(Event::KeyboardAttached(attached)) => {
                         info!("KeyboardAttached event: {}", attached);
-                        
-                        // Try to notify session daemon with timeout
-                        let response = session_client::try_send_with_response(
-                            &session_client::SessionCmd::KeyboardAttached { value: attached }
-                        ).await;
-                        
-                        if response.contains("ok") {
-                            info!("KeyboardAttached: session daemon handled it");
+
+                        let state_tx = if let Some(mutex) = STATE_BROADCAST.get() {
+                            mutex.lock().await.clone()
                         } else {
-                            warn!("KeyboardAttached: session daemon not responding (timeout or error), will be handled via sysfs");
-                            // Session daemon is down, but the actual sysfs disable/enable is handled elsewhere
-                            // Root daemon just needs to track the state for the fallback in handle_keyboard_attach()
+                            None
+                        };
+                        let ack_tx = if let Some(mutex) = ACK_BROADCAST.get() {
+                            mutex.lock().await.clone()
+                        } else {
+                            None
+                        };
+
+                        if let (Some(state_tx), Some(ack_tx)) = (state_tx, ack_tx) {
+                            let expected_ack = format!("keyboard_attached_received:{attached}");
+                            let mut ack_rx = ack_tx.subscribe();
+
+                            if let Err(e) = state_tx.send(daemon_socket::DaemonMsg::KeyboardAttached { value: attached }) {
+                                warn!("KeyboardAttached: failed to notify session daemon over daemon socket: {}", e);
+                                secondary_display::arm_sysfs_fallback_once();
+                                state_manager_clone.set_secondary_display(!attached);
+                            } else {
+                                let acked = tokio::time::timeout(Duration::from_secs(5), async {
+                                    loop {
+                                        match ack_rx.recv().await {
+                                            Ok(msg) if msg == expected_ack => break true,
+                                            Ok(_) => continue,
+                                            Err(_) => break false,
+                                        }
+                                    }
+                                })
+                                .await
+                                .unwrap_or(false);
+
+                                if acked {
+                                    info!("KeyboardAttached: session daemon acknowledged request");
+                                } else {
+                                    warn!("KeyboardAttached: no session daemon ack, falling back to sysfs");
+                                    secondary_display::arm_sysfs_fallback_once();
+                                    state_manager_clone.set_secondary_display(!attached);
+                                }
+                            }
+                        } else {
+                            warn!("KeyboardAttached: daemon socket channels not initialized");
+                            secondary_display::arm_sysfs_fallback_once();
+                            state_manager_clone.set_secondary_display(!attached);
                         }
                     }
                     Ok(_) => {}

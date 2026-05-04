@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use log::warn;
@@ -11,6 +11,7 @@ use crate::events::Event;
 use crate::state::KeyboardStateManager;
 
 const ENFORCER_COOLDOWN_SECS: u64 = 8;
+static FORCE_SYSFS_FALLBACK_ONCE: AtomicBool = AtomicBool::new(false);
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -25,6 +26,10 @@ async fn control_secondary_display(status_path: &str, enable: bool, last_change:
     if let Err(e) = fs::write(status_path, data).await {
         warn!("Failed to control secondary display: {}", e);
     }
+}
+
+pub fn arm_sysfs_fallback_once() {
+    FORCE_SYSFS_FALLBACK_ONCE.store(true, Ordering::SeqCst);
 }
 
 /// Check if the secondary display is currently enabled by reading its status
@@ -57,6 +62,13 @@ pub async fn start_secondary_display_task(
             loop {
                 match event_receiver.recv().await {
                     Ok(Event::SecondaryDisplay(new_state)) => {
+                        let forced_fallback = FORCE_SYSFS_FALLBACK_ONCE.swap(false, Ordering::SeqCst);
+                        if crate::daemon_socket::is_session_connected() && !forced_fallback {
+                            warn!(
+                                "Skipping sysfs secondary display change because session daemon is connected; session path owns display state"
+                            );
+                            continue;
+                        }
                         control_secondary_display(&status_path, new_state, &last_change).await;
                     }
                     Ok(_) => {}
@@ -81,6 +93,9 @@ pub async fn start_secondary_display_task(
             let mut interval = tokio::time::interval(Duration::from_millis(500));
             loop {
                 interval.tick().await;
+                if crate::daemon_socket::is_session_connected() {
+                    continue;
+                }
                 if now_secs().saturating_sub(last_change.load(Ordering::Relaxed)) < ENFORCER_COOLDOWN_SECS {
                     continue;
                 }

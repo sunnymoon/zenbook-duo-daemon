@@ -1,5 +1,6 @@
 use log::{info, warn};
 use std::{path::PathBuf, sync::Arc};
+use std::time::Duration;
 use tokio::fs;
 use tokio::sync::Mutex;
 
@@ -42,16 +43,50 @@ impl KeyFunction {
             KeyFunction::ToggleSecondaryDisplay(true) => {
                 let new_state = !state_manager.is_secondary_display_enabled();
                 info!("KeyFunction: executing ToggleSecondaryDisplay -> {}", new_state);
-                
-                let response = crate::session_client::try_send_with_response(
-                    &crate::session_client::SessionCmd::ToggleSecondaryDisplay { enable: new_state },
-                ).await;
-                
-                if response.starts_with("ok") {
-                    info!("ToggleSecondaryDisplay: session daemon handled it");
-                    state_manager.toggle_secondary_display();
+
+                let state_tx = if let Some(mutex) = crate::STATE_BROADCAST.get() {
+                    mutex.lock().await.clone()
                 } else {
-                    warn!("ToggleSecondaryDisplay: session daemon not available or error, falling back to sysfs");
+                    None
+                };
+                let ack_tx = if let Some(mutex) = crate::ACK_BROADCAST.get() {
+                    mutex.lock().await.clone()
+                } else {
+                    None
+                };
+
+                if let (Some(state_tx), Some(ack_tx)) = (state_tx, ack_tx) {
+                    let expected_ack = format!("toggle_secondary_received:{new_state}");
+                    let mut ack_rx = ack_tx.subscribe();
+
+                    if let Err(e) = state_tx.send(crate::daemon_socket::DaemonMsg::ToggleSecondaryDisplay { enable: new_state }) {
+                        warn!("ToggleSecondaryDisplay: failed to notify session daemon over daemon socket: {}", e);
+                        state_manager.toggle_secondary_display();
+                    } else {
+                        let acked = tokio::time::timeout(Duration::from_secs(5), async {
+                            loop {
+                                match ack_rx.recv().await {
+                                    Ok(msg) if msg == expected_ack => break true,
+                                    Ok(_) => continue,
+                                    Err(_) => break false,
+                                }
+                            }
+                        })
+                        .await
+                        .unwrap_or(false);
+
+                        if acked {
+                            info!("ToggleSecondaryDisplay: session daemon acknowledged request");
+                            state_manager.set_secondary_display_tracked(new_state);
+                        } else {
+                            warn!("ToggleSecondaryDisplay: no session daemon ack, falling back to sysfs");
+                            crate::secondary_display::arm_sysfs_fallback_once();
+                            state_manager.toggle_secondary_display();
+                        }
+                    }
+                } else {
+                    warn!("ToggleSecondaryDisplay: daemon socket channels not initialized");
+                    crate::secondary_display::arm_sysfs_fallback_once();
                     state_manager.toggle_secondary_display();
                 }
             }
@@ -71,7 +106,18 @@ impl KeyFunction {
                 info!("User intention: swap to {}", new_desired);
                 
                 // Desired primary is now persisted to state file.
-                // Session daemon will receive update via bidirectional daemon socket.
+                // Broadcast the update to daemon socket so session daemon gets notified immediately
+                if let Some(mutex) = crate::STATE_BROADCAST.get() {
+                    if let Some(tx) = mutex.lock().await.as_ref() {
+                        if let Err(e) = tx.send(crate::daemon_socket::DaemonMsg::DesiredPrimaryUpdate {
+                            value: new_desired.to_string(),
+                        }) {
+                            warn!("Failed to broadcast desired_primary update: {}", e);
+                        } else {
+                            info!("Broadcasted desired_primary={} to daemon socket", new_desired);
+                        }
+                    }
+                }
             }
             _ => {
                 // do nothing
@@ -201,4 +247,3 @@ impl Config {
         toml::from_str(&config_str).unwrap()
     }
 }
-

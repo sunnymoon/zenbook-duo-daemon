@@ -216,6 +216,15 @@ impl KeyboardStateManager {
             .ok();
     }
 
+    pub fn set_secondary_display_tracked(&self, enabled: bool) {
+        let mut state = self.state.write().unwrap();
+        state.is_secondary_display_enabled = enabled;
+
+        if state.is_usb_attached {
+            state.is_secondary_display_enabled = false;
+        }
+    }
+
     pub fn toggle_secondary_display(&self) {
         let mut state = self.state.write().unwrap();
         state.is_secondary_display_enabled = !state.is_secondary_display_enabled;

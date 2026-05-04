@@ -28,6 +28,7 @@ pub async fn run() {
     let (kb_tx, _) = broadcast::channel::<bool>(8);
     let (orient_tx, _) = broadcast::channel::<String>(8);
     let (toggle_tx, _) = broadcast::channel::<bool>(8);
+    let (desired_primary_tx, _) = broadcast::channel::<String>(8);
     
     // Channel for keyboard attach/detach result - shared by all connections
     let (kb_result_tx, kb_result_rx) = tokio::sync::mpsc::channel(8);
@@ -41,30 +42,6 @@ pub async fn run() {
     // Will be updated by root daemon on connect via daemon socket
     let desired_primary = Arc::new(tokio::sync::RwLock::new(String::from("eDP-1")));
     
-    // Start connecting to root daemon socket to get desired_primary updates
-    {
-        let desired_primary_clone = Arc::clone(&desired_primary);
-        tokio::spawn(async move {
-            loop {
-                info!("SESSION: Attempting to connect to root daemon socket...");
-                match crate::daemon_socket::connect_to_root().await {
-                    Ok(stream) => {
-                        // Read and handle messages from root daemon (desired_primary updates, etc)
-                        if let Err(e) = crate::daemon_socket::listen_from_root_and_update(stream, desired_primary_clone.clone()).await {
-                            error!("SESSION: Error listening to root daemon: {}", e);
-                        }
-                        // If connection closes, try to reconnect after a short delay
-                        info!("SESSION: Root daemon connection closed, will reconnect...");
-                    }
-                    Err(e) => {
-                        error!("SESSION: Failed to connect to root daemon: {}", e);
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-        });
-    }
-
     // Unique session ID to detect when session daemon restarts
     let session_id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -85,8 +62,47 @@ pub async fn run() {
         });
     }
 
-    tokio::spawn(display::run(orient_tx.subscribe(), kb_tx.subscribe(), toggle_tx.subscribe(), toggle_result_tx.clone(), kb_result_tx.clone(), desired_primary.clone()));
+    tokio::spawn(display::run(
+        orient_tx.subscribe(),
+        kb_tx.subscribe(),
+        toggle_tx.subscribe(),
+        desired_primary_tx.subscribe(),
+        toggle_result_tx.clone(),
+        kb_result_tx.clone(),
+        desired_primary.clone(),
+    ));
     tokio::spawn(notifications::run(kb_tx.subscribe()));
+
+    // Start connecting to root daemon socket to get desired_primary updates
+    {
+        let desired_primary_clone = Arc::clone(&desired_primary);
+        let desired_primary_tx = desired_primary_tx.clone();
+        let kb_tx_for_root = kb_tx.clone();
+        let toggle_tx_for_root = toggle_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                info!("SESSION: Attempting to connect to root daemon socket...");
+                match crate::daemon_socket::connect_to_root().await {
+                    Ok(stream) => {
+                        if let Err(e) = crate::daemon_socket::listen_from_root_and_update(
+                            stream,
+                            desired_primary_clone.clone(),
+                            desired_primary_tx.clone(),
+                            kb_tx_for_root.clone(),
+                            toggle_tx_for_root.clone(),
+                        ).await {
+                            error!("SESSION: Error listening to root daemon: {}", e);
+                        }
+                        info!("SESSION: Root daemon connection closed, will reconnect...");
+                    }
+                    Err(e) => {
+                        error!("SESSION: Failed to connect to root daemon: {}", e);
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        });
+    }
 
     // Unix socket listener for commands from the root daemon
     let listener = match UnixListener::bind(&sock_path) {
@@ -112,6 +128,7 @@ pub async fn run() {
         let kb_result_rx = Arc::clone(&kb_result_rx);
         let toggle_result_rx = Arc::clone(&toggle_result_rx);
         let desired_primary = Arc::clone(&desired_primary);
+        let desired_primary_tx = desired_primary_tx.clone();
         let session_id_str = session_id_str.clone();
         
         tokio::spawn(async move {
@@ -153,6 +170,7 @@ pub async fn run() {
                         info!("SESSION: Received SetDesiredPrimary from root daemon, value={}", value);
                         *desired_primary.write().await = value.clone();
                         info!("SESSION: Stored desired_primary={}", value);
+                        desired_primary_tx.send(value).ok();
                         
                         if let Err(e) = writer.write_all(b"ok\n").await {
                             warn!("Failed to write response to root daemon: {e}");
@@ -193,4 +211,3 @@ pub async fn run() {
         });
     }
 }
-

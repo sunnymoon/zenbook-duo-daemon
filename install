@@ -9,6 +9,8 @@ PRE_SLEEP_SERVICE_NAME="zenbook-duo-daemon-pre-sleep"
 PRE_SLEEP_SERVICE_FILE="/etc/systemd/system/${PRE_SLEEP_SERVICE_NAME}.service"
 POST_SLEEP_SERVICE_NAME="zenbook-duo-daemon-post-sleep"
 POST_SLEEP_SERVICE_FILE="/etc/systemd/system/${POST_SLEEP_SERVICE_NAME}.service"
+SESSION_SERVICE_NAME="zenbook-duo-session"
+SESSION_SERVICE_FILE="/etc/systemd/user/${SESSION_SERVICE_NAME}.service"
 INSTALL_DIR="/opt/zenbook-duo-daemon"
 BINARY_PATH="${INSTALL_DIR}/zenbook-duo-daemon"
 GITHUB_REPO="https://github.com/PegasisForever/zenbook-duo-daemon/releases/latest/download"
@@ -17,6 +19,59 @@ check_root() {
     if [ "$EUID" -ne 0 ]; then
         echo "Error: This script must be run as root" >&2
         exit 1
+    fi
+}
+
+run_user_systemctl() {
+    local uid="$1"
+    local user="$2"
+    shift 2
+
+    if [ ! -d "/run/user/${uid}" ]; then
+        return 1
+    fi
+
+    runuser -u "${user}" -- env \
+        XDG_RUNTIME_DIR="/run/user/${uid}" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" \
+        systemctl --user "$@"
+}
+
+for_each_active_user() {
+    while read -r uid user _; do
+        if [ -n "${uid}" ] && [ -n "${user}" ]; then
+            "$@" "${uid}" "${user}"
+        fi
+    done < <(loginctl list-users --no-legend 2>/dev/null || true)
+}
+
+stop_session_service_for_user() {
+    local uid="$1"
+    local user="$2"
+
+    if run_user_systemctl "${uid}" "${user}" is-active --quiet "${SESSION_SERVICE_NAME}" 2>/dev/null; then
+        echo "Stopping session service for ${user}..."
+        run_user_systemctl "${uid}" "${user}" stop "${SESSION_SERVICE_NAME}" || true
+    fi
+}
+
+restart_session_service_for_user() {
+    local uid="$1"
+    local user="$2"
+
+    if ! run_user_systemctl "${uid}" "${user}" daemon-reload; then
+        echo "Warning: Failed to reload user systemd for ${user}" >&2
+        return
+    fi
+
+    if run_user_systemctl "${uid}" "${user}" is-enabled --quiet "${SESSION_SERVICE_NAME}" 2>/dev/null; then
+        if run_user_systemctl "${uid}" "${user}" is-active --quiet "${SESSION_SERVICE_NAME}" 2>/dev/null; then
+            echo "Restarting session service for ${user}..."
+            run_user_systemctl "${uid}" "${user}" restart "${SESSION_SERVICE_NAME}" || true
+        else
+            echo "Starting session service for ${user}..."
+            run_user_systemctl "${uid}" "${user}" start "${SESSION_SERVICE_NAME}" || true
+        fi
     fi
 }
 
@@ -57,6 +112,10 @@ uninstall() {
         echo "Disabling post-sleep service..."
         systemctl disable "${POST_SLEEP_SERVICE_NAME}" || true
     fi
+
+    for_each_active_user stop_session_service_for_user
+    echo "Disabling session service globally..."
+    systemctl --global disable "${SESSION_SERVICE_NAME}" >/dev/null 2>&1 || true
     
     # Remove service files
     if [ -f "${SERVICE_FILE}" ]; then
@@ -74,7 +133,13 @@ uninstall() {
         rm -f "${POST_SLEEP_SERVICE_FILE}"
     fi
     
+    if [ -f "${SESSION_SERVICE_FILE}" ]; then
+        echo "Removing session service file..."
+        rm -f "${SESSION_SERVICE_FILE}"
+    fi
+    
     systemctl daemon-reload
+    for_each_active_user restart_session_service_for_user
     
     # Remove installation directory
     if [ -d "${INSTALL_DIR}" ]; then
@@ -150,6 +215,19 @@ install() {
         exit 1
     fi
     
+    # Download session service file
+    echo "Downloading session service file from ${GITHUB_REPO}/zenbook-duo-session.service..."
+    if ! curl -fSL -o "${SESSION_SERVICE_FILE}" "${GITHUB_REPO}/zenbook-duo-session.service"; then
+        echo "Error: Failed to download session service file" >&2
+        rm -f "${BINARY_PATH}" "${SERVICE_FILE}" "${PRE_SLEEP_SERVICE_FILE}" "${POST_SLEEP_SERVICE_FILE}"
+        exit 1
+    fi
+    if [ ! -s "${SESSION_SERVICE_FILE}" ]; then
+        echo "Error: Downloaded session service file is empty" >&2
+        rm -f "${BINARY_PATH}" "${SERVICE_FILE}" "${PRE_SLEEP_SERVICE_FILE}" "${POST_SLEEP_SERVICE_FILE}" "${SESSION_SERVICE_FILE}"
+        exit 1
+    fi
+    
     # Run migrate-config command
     echo "Running config migration..."
     "${BINARY_PATH}" migrate-config || {
@@ -159,14 +237,17 @@ install() {
     # Reload systemd and enable/start services
     echo "Reloading systemd daemon..."
     systemctl daemon-reload
+    for_each_active_user restart_session_service_for_user
     
     echo "Enabling services..."
     systemctl enable "${SERVICE_NAME}"
     systemctl enable "${PRE_SLEEP_SERVICE_NAME}"
     systemctl enable "${POST_SLEEP_SERVICE_NAME}"
+    systemctl --global enable "${SESSION_SERVICE_NAME}" || true
     
     echo "Starting main service..."
     systemctl start "${SERVICE_NAME}"
+    for_each_active_user restart_session_service_for_user
     
     echo "Installation complete."
     echo "Service status:"
@@ -187,6 +268,7 @@ local_install() {
     local service_file_path="${SCRIPT_DIR}/zenbook-duo-daemon.service"
     local pre_sleep_service_file_path="${SCRIPT_DIR}/zenbook-duo-daemon-pre-sleep.service"
     local post_sleep_service_file_path="${SCRIPT_DIR}/zenbook-duo-daemon-post-sleep.service"
+    local session_service_file_path="${SCRIPT_DIR}/zenbook-duo-session.service"
     
     if [ ! -f "${binary_path}" ]; then
         echo "Error: Binary file not found: ${binary_path}" >&2
@@ -205,6 +287,11 @@ local_install() {
     
     if [ ! -f "${post_sleep_service_file_path}" ]; then
         echo "Error: Post-sleep service file not found: ${post_sleep_service_file_path}" >&2
+        exit 1
+    fi
+    
+    if [ ! -f "${session_service_file_path}" ]; then
+        echo "Error: Session service file not found: ${session_service_file_path}" >&2
         exit 1
     fi
     
@@ -233,6 +320,9 @@ local_install() {
     echo "Copying post-sleep service file from ${post_sleep_service_file_path}..."
     cp "${post_sleep_service_file_path}" "${POST_SLEEP_SERVICE_FILE}"
     
+    echo "Copying session service file from ${session_service_file_path}..."
+    cp "${session_service_file_path}" "${SESSION_SERVICE_FILE}"
+    
     # Run migrate-config command
     echo "Running config migration..."
     "${BINARY_PATH}" migrate-config || {
@@ -242,14 +332,17 @@ local_install() {
     # Reload systemd and enable/start services
     echo "Reloading systemd daemon..."
     systemctl daemon-reload
+    for_each_active_user restart_session_service_for_user
     
     echo "Enabling services..."
     systemctl enable "${SERVICE_NAME}"
     systemctl enable "${PRE_SLEEP_SERVICE_NAME}"
     systemctl enable "${POST_SLEEP_SERVICE_NAME}"
+    systemctl --global enable "${SESSION_SERVICE_NAME}" || true
     
     echo "Starting main service..."
     systemctl start "${SERVICE_NAME}"
+    for_each_active_user restart_session_service_for_user
     
     echo "Installation complete."
     echo "Service status:"

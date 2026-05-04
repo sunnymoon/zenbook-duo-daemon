@@ -5,11 +5,33 @@
 use log::{error, info, warn, debug};
 use serde::{Serialize, Deserialize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use std::path::Path;
 use std::os::unix::fs::PermissionsExt;
 use tokio::sync::broadcast;
+
+static SESSION_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+struct SessionConnectionGuard;
+
+impl SessionConnectionGuard {
+    fn new() -> Self {
+        SESSION_CONNECTIONS.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for SessionConnectionGuard {
+    fn drop(&mut self) {
+        SESSION_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+pub fn is_session_connected() -> bool {
+    SESSION_CONNECTIONS.load(Ordering::SeqCst) > 0
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -32,7 +54,8 @@ pub enum DaemonMsg {
 /// Takes a broadcast sender to notify about state changes
 pub async fn start_server(
     state_manager: &crate::state::KeyboardStateManager,
-    state_update_tx: broadcast::Sender<String>,
+    state_update_tx: broadcast::Sender<DaemonMsg>,
+    ack_tx: broadcast::Sender<String>,
 ) {
     let sock_path = "/run/zenbook-duo-daemon.sock";
     
@@ -58,8 +81,9 @@ pub async fn start_server(
                     Ok((stream, _)) => {
                         let state_mgr = state_manager.clone();
                         let update_tx = state_update_tx.clone();
+                        let ack_tx = ack_tx.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_session_connection(stream, state_mgr, update_tx).await {
+                            if let Err(e) = handle_session_connection(stream, state_mgr, update_tx, ack_tx).await {
                                 warn!("Session connection error: {}", e);
                             }
                         });
@@ -81,8 +105,10 @@ pub async fn start_server(
 async fn handle_session_connection(
     stream: tokio::net::UnixStream,
     state_manager: crate::state::KeyboardStateManager,
-    state_update_tx: broadcast::Sender<String>,
+    state_update_tx: broadcast::Sender<DaemonMsg>,
+    ack_tx: broadcast::Sender<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let _connection_guard = SessionConnectionGuard::new();
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
@@ -119,6 +145,7 @@ async fn handle_session_connection(
                                 match msg {
                                     DaemonMsg::Ack { msg: ack_msg } => {
                                         debug!("ROOT: Session acknowledged: {}", ack_msg);
+                                        let _ = ack_tx.send(ack_msg);
                                     }
                                     _ => {
                                         // Other messages can be handled here if needed
@@ -141,11 +168,19 @@ async fn handle_session_connection(
             // Handle broadcasts from root daemon state changes
             result = broadcast_rx.recv() => {
                 match result {
-                    Ok(new_desired) => {
-                        info!("ROOT: Broadcasting DesiredPrimaryUpdate={} to connected session daemon", new_desired);
-                        let msg = DaemonMsg::DesiredPrimaryUpdate {
-                            value: new_desired,
-                        };
+                    Ok(msg) => {
+                        match &msg {
+                            DaemonMsg::DesiredPrimaryUpdate { value } => {
+                                info!("ROOT: Broadcasting DesiredPrimaryUpdate={} to connected session daemon", value);
+                            }
+                            DaemonMsg::KeyboardAttached { value } => {
+                                info!("ROOT: Broadcasting KeyboardAttached={} to connected session daemon", value);
+                            }
+                            DaemonMsg::ToggleSecondaryDisplay { enable } => {
+                                info!("ROOT: Broadcasting ToggleSecondaryDisplay={} to connected session daemon", enable);
+                            }
+                            DaemonMsg::Ack { .. } => {}
+                        }
                         if let Ok(json) = serde_json::to_string(&msg) {
                             if let Err(e) = writer.write_all(format!("{}\n", json).as_bytes()).await {
                                 error!("ROOT: Failed to send broadcast to session daemon: {}", e);
@@ -172,16 +207,15 @@ async fn handle_session_connection(
     Ok(())
 }
 
-/// Broadcast a desired_primary update to all connected session daemons
-/// Called when Fn+F8 is pressed or state changes
+/// Broadcast a daemon message to all connected session daemons
 #[allow(dead_code)]
-pub async fn broadcast_desired_primary_update(tx: &broadcast::Sender<String>, new_desired: String) {
-    match tx.send(new_desired) {
+pub async fn broadcast_message(tx: &broadcast::Sender<DaemonMsg>, msg: DaemonMsg) {
+    match tx.send(msg) {
         Ok(_) => {
-            debug!("ROOT: Broadcasted desired_primary update");
+            debug!("ROOT: Broadcasted daemon message");
         }
         Err(e) => {
-            warn!("ROOT: Failed to broadcast desired_primary update: {}", e);
+            warn!("ROOT: Failed to broadcast daemon message: {}", e);
         }
     }
 }
@@ -211,8 +245,11 @@ pub async fn connect_to_root() -> Result<tokio::net::UnixStream, Box<dyn std::er
 pub async fn listen_from_root_and_update(
     stream: tokio::net::UnixStream,
     desired_primary: Arc<tokio::sync::RwLock<String>>,
+    desired_primary_tx: broadcast::Sender<String>,
+    kb_tx: broadcast::Sender<bool>,
+    toggle_tx: broadcast::Sender<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (reader, _writer) = stream.into_split();
+    let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
     
@@ -230,13 +267,33 @@ pub async fn listen_from_root_and_update(
                         match msg {
                             DaemonMsg::DesiredPrimaryUpdate { value } => {
                                 info!("SESSION: Root daemon sent DesiredPrimaryUpdate={}", value);
-                                *desired_primary.write().await = value;
+                                *desired_primary.write().await = value.clone();
+                                if let Err(e) = desired_primary_tx.send(value.clone()) {
+                                    warn!("SESSION: Failed to notify display loop about desired_primary update: {}", e);
+                                }
+                                let ack = serde_json::to_string(&DaemonMsg::Ack {
+                                    msg: format!("desired_primary_received:{value}"),
+                                })?;
+                                writer.write_all(format!("{ack}\n").as_bytes()).await?;
+                                writer.flush().await?;
                             }
                             DaemonMsg::KeyboardAttached { value } => {
                                 info!("SESSION: Root daemon sent KeyboardAttached={}", value);
+                                kb_tx.send(value).ok();
+                                let ack = serde_json::to_string(&DaemonMsg::Ack {
+                                    msg: format!("keyboard_attached_received:{value}"),
+                                })?;
+                                writer.write_all(format!("{ack}\n").as_bytes()).await?;
+                                writer.flush().await?;
                             }
                             DaemonMsg::ToggleSecondaryDisplay { enable } => {
                                 info!("SESSION: Root daemon sent ToggleSecondaryDisplay={}", enable);
+                                toggle_tx.send(enable).ok();
+                                let ack = serde_json::to_string(&DaemonMsg::Ack {
+                                    msg: format!("toggle_secondary_received:{enable}"),
+                                })?;
+                                writer.write_all(format!("{ack}\n").as_bytes()).await?;
+                                writer.flush().await?;
                             }
                             _ => {}
                         }

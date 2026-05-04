@@ -621,11 +621,6 @@ async fn apply_toggle_secondary_display(
     info!("Applying toggle secondary display (enable={}), monitors count={}", enable, new_monitors.len());
     display.apply_monitors_config(serial, 1, new_monitors.clone(), HashMap::new()).await?;
     info!("Secondary display toggle completed");
-    
-    // When re-enabling eDP-2, D-Bus will emit PropertiesChanged signal
-    // The availability signal listener will check and restore desired_primary if needed
-    // (no polling here - purely event-driven)
-    
     Ok(())
 }
 
@@ -677,7 +672,107 @@ async fn subscribe_monitors_changed(
     Ok(())
 }
 
-pub async fn run(mut orient_rx: broadcast::Receiver<String>, mut kb_rx: broadcast::Receiver<bool>, mut toggle_rx: broadcast::Receiver<bool>, toggle_result_tx: tokio::sync::mpsc::Sender<()>, kb_result_tx: tokio::sync::mpsc::Sender<()>, desired_primary: Arc<tokio::sync::RwLock<String>>) {
+async fn apply_desired_primary_if_possible(
+    display: &DisplayConfigProxy<'_>,
+    desired: &str,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let (_serial, _physical, logical, _) = display.get_current_state().await?;
+    let (logical_map, _) = read_current_config(&logical);
+
+    match logical_map.get(desired) {
+        Some((_, _, _, _, is_primary)) if *is_primary => {
+            info!("DesiredPrimary: {} already primary", desired);
+            Ok(true)
+        }
+        Some(_) => {
+            info!("DesiredPrimary: {} available and not primary, applying now", desired);
+            let new_primary = apply_display_swap(display).await?;
+            if new_primary == desired {
+                info!("DesiredPrimary: switched primary to {}", desired);
+                Ok(true)
+            } else {
+                warn!(
+                    "DesiredPrimary: swap completed but primary is {} instead of {}",
+                    new_primary, desired
+                );
+                Ok(false)
+            }
+        }
+        None => {
+            info!("DesiredPrimary: {} currently unavailable", desired);
+            Ok(false)
+        }
+    }
+}
+
+fn stop_availability_monitor(
+    availability_task: &mut Option<tokio::task::JoinHandle<()>>,
+) {
+    if let Some(task) = availability_task.take() {
+        task.abort();
+        info!("DisplayConfig: stopped MonitorsChanged listener");
+    }
+}
+
+fn ensure_availability_monitor(
+    availability_task: &mut Option<tokio::task::JoinHandle<()>>,
+    conn: &Connection,
+    availability_tx: &broadcast::Sender<()>,
+    desired_primary: &Arc<tokio::sync::RwLock<String>>,
+) {
+    let already_running = availability_task
+        .as_ref()
+        .is_some_and(|task| !task.is_finished());
+    if already_running {
+        return;
+    }
+
+    let conn_clone = conn.clone();
+    let availability_tx_clone = availability_tx.clone();
+    let desired_primary_clone = Arc::clone(desired_primary);
+    *availability_task = Some(tokio::spawn(async move {
+        match DisplayConfigProxy::new(&conn_clone).await {
+            Ok(display) => {
+                if let Err(e) = subscribe_monitors_changed(
+                    &display,
+                    availability_tx_clone,
+                    desired_primary_clone,
+                )
+                .await
+                {
+                    error!("DisplayConfig: MonitorsChanged subscription error: {e}");
+                }
+            }
+            Err(e) => {
+                error!("DisplayConfig: failed to create proxy for MonitorsChanged listener: {e}");
+            }
+        }
+    }));
+}
+
+fn update_availability_monitor_for_edp2(
+    availability_task: &mut Option<tokio::task::JoinHandle<()>>,
+    conn: &Connection,
+    availability_tx: &broadcast::Sender<()>,
+    desired_primary: &Arc<tokio::sync::RwLock<String>>,
+    should_wait_for_edp2: bool,
+) {
+    if should_wait_for_edp2 {
+        ensure_availability_monitor(availability_task, conn, availability_tx, desired_primary);
+    } else {
+        stop_availability_monitor(availability_task);
+    }
+}
+
+pub async fn run(
+    mut orient_rx: broadcast::Receiver<String>,
+    mut kb_rx: broadcast::Receiver<bool>,
+    mut toggle_rx: broadcast::Receiver<bool>,
+    mut desired_primary_rx: broadcast::Receiver<String>,
+    toggle_result_tx: tokio::sync::mpsc::Sender<()>,
+    kb_result_tx: tokio::sync::mpsc::Sender<()>,
+    desired_primary: Arc<tokio::sync::RwLock<String>>,
+) {
     let conn = loop {
         match Connection::session().await {
             Ok(c) => break c,
@@ -700,49 +795,15 @@ pub async fn run(mut orient_rx: broadcast::Receiver<String>, mut kb_rx: broadcas
 
     // Broadcast channel for availability checks triggered by display state changes
     let (availability_tx, _) = broadcast::channel::<()>(8);
-    
-    // Start proactive desired_primary application task
-    // Checks if desired display is available on startup and applies it immediately
-    // Also watches for desired_primary changes and applies them when available
-    {
-        let display_clone = display.clone();
-        let availability_tx_clone = availability_tx.clone();
-        let desired_primary_clone = Arc::clone(&desired_primary);
-        tokio::spawn(async move {
-            loop {
-                let desired = desired_primary_clone.read().await.clone();
-                
-                if let Ok((_serial, _physical, logical, _)) = display_clone.get_current_state().await {
-                    let (logical_map, _) = read_current_config(&logical);
-                    
-                    // Check if desired display is available
-                    if let Some((_, _, _, _, is_primary)) = logical_map.get(&desired) {
-                        if !*is_primary {
-                            // Desired display is available but NOT primary - apply it immediately
-                            info!("DisplayConfig: {} is desired and available, making it primary", desired);
-                            let _ = availability_tx_clone.send(());
-                        } else {
-                            debug!("DisplayConfig: {} is already primary", desired);
-                        }
-                    } else {
-                        debug!("DisplayConfig: {} is not available, will monitor for it", desired);
-                        // Subscribe to MonitorsChanged to wait for it to become available
-                        if desired == "eDP-2" {
-                            if let Err(e) = subscribe_monitors_changed(&display_clone, availability_tx_clone.clone(), desired_primary_clone.clone()).await {
-                                error!("DisplayConfig: MonitorsChanged subscription error: {e}");
-                            }
-                        }
-                    }
-                }
-                
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
-        });
-    }
 
     // Cache for secondary monitor config so we can restore it after disabling
     let mut cached_secondary: Option<(String, String, i32, i32, f64)> = None;  // (connector, mode_id, x, y, scale)
     let mut availability_rx = availability_tx.subscribe();
+    let mut availability_task: Option<tokio::task::JoinHandle<()>> = None;
+
+    // Do not apply any desired_primary at startup from the local default.
+    // Root daemon is the authority and will immediately send the real desired_primary
+    // over the daemon socket; acting before that causes visible primary-display flips.
 
     loop {
         tokio::select! {
@@ -762,6 +823,15 @@ pub async fn run(mut orient_rx: broadcast::Receiver<String>, mut kb_rx: broadcas
                     if let Err(e) = apply_toggle_secondary_display(&display, enable, &mut cached_secondary, &desired_primary).await {
                         warn!("Toggle secondary display failed: {e}");
                     } else {
+                        let desired = desired_primary.read().await.clone();
+                        let should_wait_for_edp2 = desired == "eDP-2";
+                        update_availability_monitor_for_edp2(
+                            &mut availability_task,
+                            &conn,
+                            &availability_tx,
+                            &desired_primary,
+                            should_wait_for_edp2,
+                        );
                         info!("Toggle secondary display completed in {:.2}ms", start.elapsed().as_secs_f64() * 1000.0);
                     }
                     // Send ACK to root daemon
@@ -777,6 +847,15 @@ pub async fn run(mut orient_rx: broadcast::Receiver<String>, mut kb_rx: broadcas
                     if let Err(e) = handle_keyboard_attached(&display, attached, &mut cached_secondary, &desired_primary).await {
                         warn!("Handle keyboard attached failed: {e}");
                     } else {
+                        let desired = desired_primary.read().await.clone();
+                        let should_wait_for_edp2 = desired == "eDP-2";
+                        update_availability_monitor_for_edp2(
+                            &mut availability_task,
+                            &conn,
+                            &availability_tx,
+                            &desired_primary,
+                            should_wait_for_edp2,
+                        );
                         info!("Handle keyboard attached completed in {:.2}ms", start.elapsed().as_secs_f64() * 1000.0);
                     }
                     // Send ACK to root daemon
@@ -785,32 +864,40 @@ pub async fn run(mut orient_rx: broadcast::Receiver<String>, mut kb_rx: broadcas
                 Err(broadcast::error::RecvError::Lagged(n)) => warn!("Keyboard handler lagged by {n}"),
                 Err(broadcast::error::RecvError::Closed) => break,
             },
+            msg = desired_primary_rx.recv() => match msg {
+                Ok(desired) => {
+                    info!("Display: desired_primary update received: {}", desired);
+                    match apply_desired_primary_if_possible(&display, &desired).await {
+                        Ok(true) => {
+                            stop_availability_monitor(&mut availability_task);
+                        }
+                        Ok(false) if desired == "eDP-2" => {
+                            ensure_availability_monitor(
+                                &mut availability_task,
+                                &conn,
+                                &availability_tx,
+                                &desired_primary,
+                            );
+                        }
+                        Ok(false) => {
+                            stop_availability_monitor(&mut availability_task);
+                            warn!("DesiredPrimary: {} could not be applied immediately", desired);
+                        }
+                        Err(e) => {
+                            warn!("DesiredPrimary update failed for {}: {e}", desired);
+                        }
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => warn!("DesiredPrimary handler lagged by {n}"),
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
             msg = availability_rx.recv() => match msg {
                 Ok(_) => {
-                    // D-Bus signal indicates display configuration changed
-                    // Check if desired_primary is now available and not already primary
-                    if let Ok((_serial, _physical, logical, _)) = display.get_current_state().await {
-                        let (logical_map, _) = read_current_config(&logical);
-                        let desired = desired_primary.read().await.clone();
-                        
-                        // Verify: desired is available AND not primary
-                        if let Some((_, _, _, _, is_primary)) = logical_map.get(&desired) {
-                            if !*is_primary {
-                                info!("Availability check: {} is available but not primary, attempting swap", desired);
-                                match apply_display_swap(&display).await {
-                                    Ok(new_primary) => {
-                                        info!("Restored desired_primary via availability signal: {}", new_primary);
-                                    }
-                                    Err(e) => {
-                                        warn!("Failed to restore desired_primary: {}", e);
-                                    }
-                                }
-                            } else {
-                                debug!("Availability check: {} is already primary", desired);
-                            }
-                        } else {
-                            debug!("Availability check: {} not available", desired);
-                        }
+                    let desired = desired_primary.read().await.clone();
+                    match apply_desired_primary_if_possible(&display, &desired).await {
+                        Ok(true) => stop_availability_monitor(&mut availability_task),
+                        Ok(false) => debug!("Availability check: {} still not ready", desired),
+                        Err(e) => warn!("Failed to restore desired_primary {}: {}", desired, e),
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {} // Ignore lag on availability checks
