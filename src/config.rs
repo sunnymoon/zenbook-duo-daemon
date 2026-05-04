@@ -88,15 +88,12 @@ impl KeyFunction {
 
                     if acked {
                         info!("ToggleSecondaryDisplay: session daemon applied desired secondary state");
-                        if !new_state {
-                            // Intentionally commented out for race testing: session has already
-                            // removed eDP-2 logically, and this extra root-side sysfs-off
-                            // follow-up may be the second "off" in the observed off/on/off
-                            // bounce. Keep the original code visible here while disabled.
-                            // crate::secondary_display::arm_sysfs_fallback_once();
-                            // state_manager.emit_secondary_display_state();
-                            info!("ToggleSecondaryDisplay: skipping post-ACK root sysfs off for test");
-                        }
+                        // When session ACKs the disable, root must NOT write sysfs off.
+                        // Session owns logical convergence; an extra root sysfs-off after the
+                        // ACK causes the visible off→on→off bounce (kernel re-enables the
+                        // panel in response to the logical remove, then root tears it down
+                        // again). The no-ACK fallback path below is the only case where root
+                        // takes direct sysfs action.
                     } else {
                         warn!("ToggleSecondaryDisplay: no session daemon ack, falling back to sysfs");
                         crate::secondary_display::arm_sysfs_fallback_once();
