@@ -6,6 +6,7 @@ use log::{error, info, warn, debug};
 use serde::{Serialize, Deserialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use std::path::Path;
@@ -38,6 +39,9 @@ pub fn is_session_connected() -> bool {
 pub enum DaemonMsg {
     /// Root daemon → Session daemon: Send current desired_primary on connect
     DesiredPrimaryUpdate { value: String },
+
+    /// Root daemon → Session daemon: Send current desired secondary-display state
+    DesiredSecondaryUpdate { value: bool },
     
     /// Session daemon → Root daemon: Acknowledge receipt
     Ack { msg: String },
@@ -100,8 +104,8 @@ pub async fn start_server(
     }
 }
 
-/// Handle incoming session daemon connection
-/// Send desired_primary immediately and listen for broadcasts/updates
+    /// Handle incoming session daemon connection
+    /// Send persisted display state immediately and listen for broadcasts/updates
 async fn handle_session_connection(
     stream: tokio::net::UnixStream,
     state_manager: crate::state::KeyboardStateManager,
@@ -114,7 +118,39 @@ async fn handle_session_connection(
     let mut line = String::new();
     let mut broadcast_rx = state_update_tx.subscribe();
     
-    // Send desired_primary immediately on connect
+    if state_manager.is_secondary_display_enabled() {
+        crate::secondary_display::arm_sysfs_fallback_once();
+        state_manager.emit_secondary_display_state();
+        if crate::secondary_display::wait_for_secondary_display_state(true, Duration::from_secs(8)).await {
+            info!("ROOT: Secondary display reported enabled via sysfs before startup sync");
+        } else {
+            warn!("ROOT: Timed out waiting for secondary display to report enabled before startup sync");
+        }
+    }
+
+    let msg = DaemonMsg::KeyboardAttached {
+        value: state_manager.is_usb_keyboard_attached(),
+    };
+    let json = serde_json::to_string(&msg)?;
+    writer.write_all(format!("{}\n", json).as_bytes()).await?;
+    writer.flush().await?;
+    info!(
+        "ROOT: Sent startup KeyboardAttached={} to session daemon",
+        state_manager.is_usb_keyboard_attached()
+    );
+
+    let desired_secondary = state_manager.is_secondary_display_desired_enabled();
+    let msg = DaemonMsg::DesiredSecondaryUpdate {
+        value: desired_secondary,
+    };
+    let json = serde_json::to_string(&msg)?;
+    writer.write_all(format!("{}\n", json).as_bytes()).await?;
+    writer.flush().await?;
+    info!(
+        "ROOT: Sent DesiredSecondaryUpdate={} to session daemon",
+        desired_secondary
+    );
+
     if let Some(desired_primary) = state_manager.get_desired_primary() {
         let msg = DaemonMsg::DesiredPrimaryUpdate {
             value: desired_primary.clone(),
@@ -122,7 +158,10 @@ async fn handle_session_connection(
         let json = serde_json::to_string(&msg)?;
         writer.write_all(format!("{}\n", json).as_bytes()).await?;
         writer.flush().await?;
-        info!("ROOT: Sent DesiredPrimaryUpdate={} to session daemon", desired_primary);
+        info!(
+            "ROOT: Sent DesiredPrimaryUpdate={} to session daemon after startup display sync",
+            desired_primary
+        );
     }
     
     // Listen for incoming messages from session and broadcasts from state changes
@@ -172,6 +211,9 @@ async fn handle_session_connection(
                         match &msg {
                             DaemonMsg::DesiredPrimaryUpdate { value } => {
                                 info!("ROOT: Broadcasting DesiredPrimaryUpdate={} to connected session daemon", value);
+                            }
+                            DaemonMsg::DesiredSecondaryUpdate { value } => {
+                                info!("ROOT: Broadcasting DesiredSecondaryUpdate={} to connected session daemon", value);
                             }
                             DaemonMsg::KeyboardAttached { value } => {
                                 info!("ROOT: Broadcasting KeyboardAttached={} to connected session daemon", value);
@@ -245,9 +287,11 @@ pub async fn connect_to_root() -> Result<tokio::net::UnixStream, Box<dyn std::er
 pub async fn listen_from_root_and_update(
     stream: tokio::net::UnixStream,
     desired_primary: Arc<tokio::sync::RwLock<String>>,
+    desired_secondary: Arc<tokio::sync::RwLock<bool>>,
     desired_primary_tx: broadcast::Sender<String>,
+    desired_secondary_tx: broadcast::Sender<bool>,
     kb_tx: broadcast::Sender<bool>,
-    toggle_tx: broadcast::Sender<bool>,
+    desired_secondary_result_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<()>>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -277,6 +321,25 @@ pub async fn listen_from_root_and_update(
                                 writer.write_all(format!("{ack}\n").as_bytes()).await?;
                                 writer.flush().await?;
                             }
+                            DaemonMsg::DesiredSecondaryUpdate { value } => {
+                                info!("SESSION: Root daemon sent DesiredSecondaryUpdate={}", value);
+                                *desired_secondary.write().await = value;
+                                desired_secondary_tx.send(value).ok();
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_secs(8),
+                                    desired_secondary_result_rx.lock().await.recv(),
+                                ).await {
+                                    Ok(Some(_)) => {}
+                                    _ => {
+                                        warn!("SESSION: Timed out waiting for desired secondary application={}", value);
+                                    }
+                                }
+                                let ack = serde_json::to_string(&DaemonMsg::Ack {
+                                    msg: format!("desired_secondary_applied:{value}"),
+                                })?;
+                                writer.write_all(format!("{ack}\n").as_bytes()).await?;
+                                writer.flush().await?;
+                            }
                             DaemonMsg::KeyboardAttached { value } => {
                                 info!("SESSION: Root daemon sent KeyboardAttached={}", value);
                                 kb_tx.send(value).ok();
@@ -287,10 +350,11 @@ pub async fn listen_from_root_and_update(
                                 writer.flush().await?;
                             }
                             DaemonMsg::ToggleSecondaryDisplay { enable } => {
-                                info!("SESSION: Root daemon sent ToggleSecondaryDisplay={}", enable);
-                                toggle_tx.send(enable).ok();
+                                info!("SESSION: Root daemon sent legacy ToggleSecondaryDisplay={}", enable);
+                                *desired_secondary.write().await = enable;
+                                desired_secondary_tx.send(enable).ok();
                                 let ack = serde_json::to_string(&DaemonMsg::Ack {
-                                    msg: format!("toggle_secondary_received:{enable}"),
+                                    msg: format!("desired_secondary_applied:{enable}"),
                                 })?;
                                 writer.write_all(format!("{ack}\n").as_bytes()).await?;
                                 writer.flush().await?;

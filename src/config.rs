@@ -41,8 +41,19 @@ impl KeyFunction {
                 state_manager.toggle_keyboard_backlight();
             }
             KeyFunction::ToggleSecondaryDisplay(true) => {
-                let new_state = !state_manager.is_secondary_display_enabled();
+                let new_state = !state_manager.is_secondary_display_desired_enabled();
                 info!("KeyFunction: executing ToggleSecondaryDisplay -> {}", new_state);
+                state_manager.set_secondary_display_tracked(new_state);
+
+                if new_state && state_manager.is_secondary_display_enabled() {
+                    crate::secondary_display::arm_sysfs_fallback_once();
+                    state_manager.emit_secondary_display_state();
+                    if crate::secondary_display::wait_for_secondary_display_state(true, Duration::from_secs(8)).await {
+                        info!("ToggleSecondaryDisplay: secondary display reported enabled via sysfs");
+                    } else {
+                        warn!("ToggleSecondaryDisplay: timed out waiting for secondary display to report enabled; notifying session anyway");
+                    }
+                }
 
                 let state_tx = if let Some(mutex) = crate::STATE_BROADCAST.get() {
                     mutex.lock().await.clone()
@@ -56,38 +67,45 @@ impl KeyFunction {
                 };
 
                 if let (Some(state_tx), Some(ack_tx)) = (state_tx, ack_tx) {
-                    let expected_ack = format!("toggle_secondary_received:{new_state}");
+                    let expected_ack = format!("desired_secondary_applied:{new_state}");
                     let mut ack_rx = ack_tx.subscribe();
 
-                    if let Err(e) = state_tx.send(crate::daemon_socket::DaemonMsg::ToggleSecondaryDisplay { enable: new_state }) {
-                        warn!("ToggleSecondaryDisplay: failed to notify session daemon over daemon socket: {}", e);
-                        state_manager.toggle_secondary_display();
-                    } else {
-                        let acked = tokio::time::timeout(Duration::from_secs(5), async {
-                            loop {
-                                match ack_rx.recv().await {
-                                    Ok(msg) if msg == expected_ack => break true,
-                                    Ok(_) => continue,
-                                    Err(_) => break false,
-                                }
-                            }
-                        })
-                        .await
-                        .unwrap_or(false);
+                    if let Err(e) = state_tx.send(crate::daemon_socket::DaemonMsg::DesiredSecondaryUpdate { value: new_state }) {
+                        warn!("ToggleSecondaryDisplay: failed to broadcast desired secondary update: {}", e);
+                    }
 
-                        if acked {
-                            info!("ToggleSecondaryDisplay: session daemon acknowledged request");
-                            state_manager.set_secondary_display_tracked(new_state);
-                        } else {
-                            warn!("ToggleSecondaryDisplay: no session daemon ack, falling back to sysfs");
-                            crate::secondary_display::arm_sysfs_fallback_once();
-                            state_manager.toggle_secondary_display();
+                    let acked = tokio::time::timeout(Duration::from_secs(8), async {
+                        loop {
+                            match ack_rx.recv().await {
+                                Ok(msg) if msg == expected_ack => break true,
+                                Ok(_) => continue,
+                                Err(_) => break false,
+                            }
                         }
+                    })
+                    .await
+                    .unwrap_or(false);
+
+                    if acked {
+                        info!("ToggleSecondaryDisplay: session daemon applied desired secondary state");
+                        if !new_state {
+                            // Intentionally commented out for race testing: session has already
+                            // removed eDP-2 logically, and this extra root-side sysfs-off
+                            // follow-up may be the second "off" in the observed off/on/off
+                            // bounce. Keep the original code visible here while disabled.
+                            // crate::secondary_display::arm_sysfs_fallback_once();
+                            // state_manager.emit_secondary_display_state();
+                            info!("ToggleSecondaryDisplay: skipping post-ACK root sysfs off for test");
+                        }
+                    } else {
+                        warn!("ToggleSecondaryDisplay: no session daemon ack, falling back to sysfs");
+                        crate::secondary_display::arm_sysfs_fallback_once();
+                        state_manager.emit_secondary_display_state();
                     }
                 } else {
                     warn!("ToggleSecondaryDisplay: daemon socket channels not initialized");
                     crate::secondary_display::arm_sysfs_fallback_once();
-                    state_manager.toggle_secondary_display();
+                    state_manager.emit_secondary_display_state();
                 }
             }
             KeyFunction::SwapDisplays(true) => {

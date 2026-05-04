@@ -1,4 +1,5 @@
 use crate::events::Event;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -7,6 +8,12 @@ use tokio::sync::broadcast;
 const STATE_DIR: &str = "/var/lib/zenbook-duo-daemon";
 const BACKLIGHT_STATE_FILE: &str = "/var/lib/zenbook-duo-daemon/backlight";
 const DISPLAY_STATE_FILE: &str = "/var/lib/zenbook-duo-daemon/display-state";
+
+#[derive(Default, Serialize, Deserialize)]
+struct PersistedDisplayState {
+    desired_primary: Option<String>,
+    desired_secondary_enabled: Option<bool>,
+}
 
 fn persist_backlight(state: KeyboardBacklightState) {
     let value = match state {
@@ -33,29 +40,43 @@ fn load_backlight() -> KeyboardBacklightState {
     }
 }
 
-fn persist_desired_primary(primary: &str) {
-    let json = serde_json::json!({"desired_primary": primary});
+fn load_display_state() -> PersistedDisplayState {
+    let path = Path::new(DISPLAY_STATE_FILE);
+    if !path.exists() {
+        return PersistedDisplayState::default();
+    }
+
+    match fs::read_to_string(path) {
+        Ok(content) => serde_json::from_str::<PersistedDisplayState>(&content).unwrap_or_default(),
+        Err(_) => PersistedDisplayState::default(),
+    }
+}
+
+fn persist_display_state(state: &PersistedDisplayState) {
     let _ = fs::create_dir_all(STATE_DIR);
-    let _ = fs::write(DISPLAY_STATE_FILE, json.to_string());
+    if let Ok(json) = serde_json::to_string(state) {
+        let _ = fs::write(DISPLAY_STATE_FILE, json);
+    }
+}
+
+fn persist_desired_primary(primary: &str) {
+    let mut state = load_display_state();
+    state.desired_primary = Some(primary.to_string());
+    persist_display_state(&state);
+}
+
+fn persist_desired_secondary(enabled: bool) {
+    let mut state = load_display_state();
+    state.desired_secondary_enabled = Some(enabled);
+    persist_display_state(&state);
 }
 
 fn load_desired_primary() -> Option<String> {
-    let path = Path::new(DISPLAY_STATE_FILE);
-    if !path.exists() {
-        return None;
-    }
-    match fs::read_to_string(path) {
-        Ok(content) => {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                json.get("desired_primary")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            } else {
-                None
-            }
-        }
-        Err(_) => None,
-    }
+    load_display_state().desired_primary
+}
+
+fn load_desired_secondary() -> Option<bool> {
+    load_display_state().desired_secondary_enabled
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -88,6 +109,7 @@ struct InnerState {
     /// when idle, only backlight is disabled
     is_idle: bool,
     is_usb_attached: bool,
+    desired_secondary_display_enabled: bool,
     is_secondary_display_enabled: bool,
 }
 
@@ -100,6 +122,14 @@ pub struct KeyboardStateManager {
 
 impl KeyboardStateManager {
     pub fn new(is_usb_attached: bool, sender: broadcast::Sender<Event>) -> Self {
+        let desired_secondary_display_enabled =
+            load_desired_secondary().unwrap_or(!is_usb_attached);
+        let is_secondary_display_enabled = if is_usb_attached {
+            false
+        } else {
+            desired_secondary_display_enabled
+        };
+
         Self {
             state: Arc::new(RwLock::new(InnerState {
                 backlight: load_backlight(),
@@ -107,7 +137,8 @@ impl KeyboardStateManager {
                 is_suspended: false,
                 is_idle: false,
                 is_usb_attached,
-                is_secondary_display_enabled: !is_usb_attached,
+                desired_secondary_display_enabled,
+                is_secondary_display_enabled,
             })),
             sender,
         }
@@ -205,11 +236,9 @@ impl KeyboardStateManager {
 
     pub fn set_secondary_display(&self, enabled: bool) {
         let mut state = self.state.write().unwrap();
-        state.is_secondary_display_enabled = enabled;
-
-        if state.is_usb_attached {
-            state.is_secondary_display_enabled = false;
-        }
+        state.desired_secondary_display_enabled = enabled;
+        state.is_secondary_display_enabled = if state.is_usb_attached { false } else { enabled };
+        persist_desired_secondary(enabled);
 
         self.sender
             .send(Event::SecondaryDisplay(state.is_secondary_display_enabled))
@@ -218,20 +247,20 @@ impl KeyboardStateManager {
 
     pub fn set_secondary_display_tracked(&self, enabled: bool) {
         let mut state = self.state.write().unwrap();
-        state.is_secondary_display_enabled = enabled;
-
-        if state.is_usb_attached {
-            state.is_secondary_display_enabled = false;
-        }
+        state.desired_secondary_display_enabled = enabled;
+        state.is_secondary_display_enabled = if state.is_usb_attached { false } else { enabled };
+        persist_desired_secondary(enabled);
     }
 
     pub fn toggle_secondary_display(&self) {
         let mut state = self.state.write().unwrap();
-        state.is_secondary_display_enabled = !state.is_secondary_display_enabled;
-
-        if state.is_usb_attached {
-            state.is_secondary_display_enabled = false;
-        }
+        state.desired_secondary_display_enabled = !state.desired_secondary_display_enabled;
+        state.is_secondary_display_enabled = if state.is_usb_attached {
+            false
+        } else {
+            state.desired_secondary_display_enabled
+        };
+        persist_desired_secondary(state.desired_secondary_display_enabled);
 
         self.sender
             .send(Event::SecondaryDisplay(state.is_secondary_display_enabled))
@@ -241,12 +270,11 @@ impl KeyboardStateManager {
     pub fn set_usb_keyboard_attached(&self, attached: bool) {
         let mut state = self.state.write().unwrap();
         state.is_usb_attached = attached;
-
-        if attached {
-            state.is_secondary_display_enabled = false;
+        state.is_secondary_display_enabled = if attached {
+            false
         } else {
-            state.is_secondary_display_enabled = true;
-        }
+            state.desired_secondary_display_enabled
+        };
 
         self.sender.send(Event::KeyboardAttached(attached)).ok();
         self.sender
@@ -257,6 +285,23 @@ impl KeyboardStateManager {
     pub fn is_secondary_display_enabled(&self) -> bool {
         let state = self.state.read().unwrap();
         state.is_secondary_display_enabled
+    }
+
+    pub fn is_usb_keyboard_attached(&self) -> bool {
+        let state = self.state.read().unwrap();
+        state.is_usb_attached
+    }
+
+    pub fn is_secondary_display_desired_enabled(&self) -> bool {
+        let state = self.state.read().unwrap();
+        state.desired_secondary_display_enabled
+    }
+
+    pub fn emit_secondary_display_state(&self) {
+        let state = self.state.read().unwrap();
+        self.sender
+            .send(Event::SecondaryDisplay(state.is_secondary_display_enabled))
+            .ok();
     }
 
     pub fn set_desired_primary(&self, primary: &str) {

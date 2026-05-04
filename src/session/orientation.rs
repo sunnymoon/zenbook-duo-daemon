@@ -17,6 +17,17 @@ trait SensorProxy {
     fn accelerometer_orientation(&self) -> zbus::Result<String>;
 }
 
+pub async fn current_orientation() -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let conn = Connection::system().await?;
+    let sensor = SensorProxyProxy::new(&conn).await?;
+
+    if !sensor.has_accelerometer().await? {
+        return Ok(None);
+    }
+
+    Ok(Some(sensor.accelerometer_orientation().await?))
+}
+
 /// Connect to the system D-Bus, claim the accelerometer, and stream orientation changes.
 /// Sends each new orientation string to `orient_tx`. Returns when the property stream ends.
 ///

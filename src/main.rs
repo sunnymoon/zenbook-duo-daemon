@@ -220,7 +220,7 @@ async fn run_daemon(config_path: PathBuf) {
                             if let Err(e) = state_tx.send(daemon_socket::DaemonMsg::KeyboardAttached { value: attached }) {
                                 warn!("KeyboardAttached: failed to notify session daemon over daemon socket: {}", e);
                                 secondary_display::arm_sysfs_fallback_once();
-                                state_manager_clone.set_secondary_display(!attached);
+                                state_manager_clone.emit_secondary_display_state();
                             } else {
                                 let acked = tokio::time::timeout(Duration::from_secs(5), async {
                                     loop {
@@ -239,13 +239,13 @@ async fn run_daemon(config_path: PathBuf) {
                                 } else {
                                     warn!("KeyboardAttached: no session daemon ack, falling back to sysfs");
                                     secondary_display::arm_sysfs_fallback_once();
-                                    state_manager_clone.set_secondary_display(!attached);
+                                    state_manager_clone.emit_secondary_display_state();
                                 }
                             }
                         } else {
                             warn!("KeyboardAttached: daemon socket channels not initialized");
                             secondary_display::arm_sysfs_fallback_once();
-                            state_manager_clone.set_secondary_display(!attached);
+                            state_manager_clone.emit_secondary_display_state();
                         }
                     }
                     Ok(_) => {}

@@ -35,11 +35,24 @@ struct SlotState {
     x: i32,
     y: i32,
     tool_type: i32,
+    pressure: i32,
+    touch_major: i32,
+    touch_minor: i32,
+    orientation: i32,
 }
 
 impl Default for SlotState {
     fn default() -> Self {
-        Self { tracking_id: -1, x: 0, y: 0, tool_type: 0 }
+        Self {
+            tracking_id: -1,
+            x: 0,
+            y: 0,
+            tool_type: 0,
+            pressure: 0,
+            touch_major: 0,
+            touch_minor: 0,
+            orientation: 0,
+        }
     }
 }
 
@@ -93,6 +106,18 @@ impl TouchState {
             }
             EventCode::EV_ABS(EV_ABS::ABS_MT_TOOL_TYPE) => {
                 self.slots[self.current_slot].tool_type = ev.value;
+            }
+            EventCode::EV_ABS(EV_ABS::ABS_MT_PRESSURE) => {
+                self.slots[self.current_slot].pressure = ev.value;
+            }
+            EventCode::EV_ABS(EV_ABS::ABS_MT_TOUCH_MAJOR) => {
+                self.slots[self.current_slot].touch_major = ev.value;
+            }
+            EventCode::EV_ABS(EV_ABS::ABS_MT_TOUCH_MINOR) => {
+                self.slots[self.current_slot].touch_minor = ev.value;
+            }
+            EventCode::EV_ABS(EV_ABS::ABS_MT_ORIENTATION) => {
+                self.slots[self.current_slot].orientation = ev.value;
             }
             EventCode::EV_ABS(EV_ABS::ABS_X) => self.abs_x = ev.value,
             EventCode::EV_ABS(EV_ABS::ABS_Y) => self.abs_y = ev.value,
@@ -190,60 +215,37 @@ fn release_all_virtual_touches(virt: &UInputDevice, virt_state: &mut TouchState)
     }
 }
 
-/// At DWT unsuppression: bring the virtual device's touch state in sync with
-/// the real device by emitting only the *diff* (slot opens/closes and button
-/// changes).  Crucially, if the same tracking ID is already active on the
-/// virtual device, we skip re-establishing it — avoiding the double-TID error
-/// that was preventing libinput from resuming pointer motion without a
-/// lift+retouch.
-fn reconcile_virt_with_real(
+fn sync_virtual_frame(
     virt_state: &mut TouchState,
+    virt_real_tracking_ids: &mut [i32; MAX_SLOTS],
     real_state: &TouchState,
     virt: &UInputDevice,
     next_virtual_tracking_id: &mut i32,
 ) {
-    let mut close_state = virt_state.clone();
-    let before_close = virt_state.clone();
-    for i in 0..MAX_SLOTS {
-        let v_active = virt_state.slots[i].tracking_id >= 0;
-        let r_active = real_state.slots[i].tracking_id >= 0;
-        if v_active && !r_active {
-            close_state.slots[i].tracking_id = -1;
-        }
-    }
-    apply_slot_derived_buttons(&mut close_state);
+    let before_sync = virt_state.clone();
+    let before_real_ids = *virt_real_tracking_ids;
+    let mut changed = false;
 
-    let mut close_changed = false;
     for i in 0..MAX_SLOTS {
-        let v_active = virt_state.slots[i].tracking_id >= 0;
+        let v_active = before_sync.slots[i].tracking_id >= 0;
         let r_active = real_state.slots[i].tracking_id >= 0;
-        if v_active && !r_active {
+        let same_contact = r_active && before_real_ids[i] == real_state.slots[i].tracking_id;
+        if v_active && (!r_active || !same_contact) {
             write_state_event(virt, virt_state, EventCode::EV_ABS(EV_ABS::ABS_MT_SLOT), i as i32);
             write_state_event(virt, virt_state, EventCode::EV_ABS(EV_ABS::ABS_MT_TRACKING_ID), -1);
-            close_changed = true;
+            virt_real_tracking_ids[i] = -1;
+            changed = true;
         }
     }
-    close_changed |= sync_button_delta(virt, virt_state, &before_close, &close_state);
-    if close_changed {
-        write_state_event(virt, virt_state, EventCode::EV_SYN(EV_SYN::SYN_REPORT), 0);
-    }
 
-    let mut reopen_changed = false;
     for i in 0..MAX_SLOTS {
-        let v_slot = &close_state.slots[i];
         let r_slot = &real_state.slots[i];
-
         if r_slot.tracking_id < 0 {
             continue;
         }
 
-        let tracking_changed = v_slot.tracking_id < 0;
-        let pos_changed = v_slot.x != r_slot.x || v_slot.y != r_slot.y;
-        let tool_changed = v_slot.tool_type != r_slot.tool_type;
-
-        if !(tracking_changed || pos_changed || tool_changed) {
-            continue;
-        }
+        let v_slot = virt_state.slots[i];
+        let tracking_changed = v_slot.tracking_id < 0 || virt_real_tracking_ids[i] != r_slot.tracking_id;
 
         write_state_event(virt, virt_state, EventCode::EV_ABS(EV_ABS::ABS_MT_SLOT), i as i32);
         if tracking_changed {
@@ -254,50 +256,54 @@ fn reconcile_virt_with_real(
                 *next_virtual_tracking_id,
             );
             *next_virtual_tracking_id += 1;
+            virt_real_tracking_ids[i] = r_slot.tracking_id;
+            changed = true;
         }
         if tracking_changed || v_slot.x != r_slot.x {
             write_state_event(virt, virt_state, EventCode::EV_ABS(EV_ABS::ABS_MT_POSITION_X), r_slot.x);
+            changed = true;
         }
         if tracking_changed || v_slot.y != r_slot.y {
             write_state_event(virt, virt_state, EventCode::EV_ABS(EV_ABS::ABS_MT_POSITION_Y), r_slot.y);
+            changed = true;
         }
-        if tracking_changed || tool_changed {
+        if tracking_changed || v_slot.tool_type != r_slot.tool_type {
             write_state_event(virt, virt_state, EventCode::EV_ABS(EV_ABS::ABS_MT_TOOL_TYPE), r_slot.tool_type);
+            changed = true;
         }
-        reopen_changed = true;
+        if tracking_changed || v_slot.pressure != r_slot.pressure {
+            write_state_event(virt, virt_state, EventCode::EV_ABS(EV_ABS::ABS_MT_PRESSURE), r_slot.pressure);
+            changed = true;
+        }
+        if tracking_changed || v_slot.touch_major != r_slot.touch_major {
+            write_state_event(virt, virt_state, EventCode::EV_ABS(EV_ABS::ABS_MT_TOUCH_MAJOR), r_slot.touch_major);
+            changed = true;
+        }
+        if tracking_changed || v_slot.touch_minor != r_slot.touch_minor {
+            write_state_event(virt, virt_state, EventCode::EV_ABS(EV_ABS::ABS_MT_TOUCH_MINOR), r_slot.touch_minor);
+            changed = true;
+        }
+        if tracking_changed || v_slot.orientation != r_slot.orientation {
+            write_state_event(virt, virt_state, EventCode::EV_ABS(EV_ABS::ABS_MT_ORIENTATION), r_slot.orientation);
+            changed = true;
+        }
     }
 
-    if close_state.abs_x != real_state.abs_x {
+    if before_sync.abs_x != real_state.abs_x {
         write_state_event(virt, virt_state, EventCode::EV_ABS(EV_ABS::ABS_X), real_state.abs_x);
-        reopen_changed = true;
+        changed = true;
     }
-    if close_state.abs_y != real_state.abs_y {
+    if before_sync.abs_y != real_state.abs_y {
         write_state_event(virt, virt_state, EventCode::EV_ABS(EV_ABS::ABS_Y), real_state.abs_y);
-        reopen_changed = true;
+        changed = true;
     }
 
     let mut target_state = virt_state.clone();
-    for i in 0..MAX_SLOTS {
-        if real_state.slots[i].tracking_id < 0 {
-            target_state.slots[i].tracking_id = -1;
-        }
-        target_state.slots[i].x = real_state.slots[i].x;
-        target_state.slots[i].y = real_state.slots[i].y;
-        target_state.slots[i].tool_type = real_state.slots[i].tool_type;
-    }
-    target_state.abs_x = real_state.abs_x;
-    target_state.abs_y = real_state.abs_y;
     apply_slot_derived_buttons(&mut target_state);
 
-    reopen_changed |= sync_button_delta(virt, virt_state, &close_state, &target_state);
-    if reopen_changed {
+    changed |= sync_button_delta(virt, virt_state, &before_sync, &target_state);
+    if changed {
         write_state_event(virt, virt_state, EventCode::EV_SYN(EV_SYN::SYN_REPORT), 0);
-    }
-
-    if close_changed || reopen_changed {
-        debug!("DWT: touch state reconciled at unsuppression");
-    } else {
-        debug!("DWT: touch state already in sync at unsuppression — resuming forwarding");
     }
 }
 
@@ -417,6 +423,31 @@ fn is_fake_finger_key(key: EV_KEY) -> bool {
     )
 }
 
+fn is_tracked_touch_event(code: &EventCode) -> bool {
+    matches!(
+        code,
+        EventCode::EV_ABS(EV_ABS::ABS_MT_SLOT)
+            | EventCode::EV_ABS(EV_ABS::ABS_MT_TRACKING_ID)
+            | EventCode::EV_ABS(EV_ABS::ABS_MT_POSITION_X)
+            | EventCode::EV_ABS(EV_ABS::ABS_MT_POSITION_Y)
+            | EventCode::EV_ABS(EV_ABS::ABS_MT_TOOL_TYPE)
+            | EventCode::EV_ABS(EV_ABS::ABS_MT_PRESSURE)
+            | EventCode::EV_ABS(EV_ABS::ABS_MT_TOUCH_MAJOR)
+            | EventCode::EV_ABS(EV_ABS::ABS_MT_TOUCH_MINOR)
+            | EventCode::EV_ABS(EV_ABS::ABS_MT_ORIENTATION)
+            | EventCode::EV_ABS(EV_ABS::ABS_X)
+            | EventCode::EV_ABS(EV_ABS::ABS_Y)
+            | EventCode::EV_KEY(EV_KEY::BTN_TOUCH)
+            | EventCode::EV_KEY(EV_KEY::BTN_TOOL_FINGER)
+            | EventCode::EV_KEY(EV_KEY::BTN_TOOL_DOUBLETAP)
+            | EventCode::EV_KEY(EV_KEY::BTN_TOOL_TRIPLETAP)
+            | EventCode::EV_KEY(EV_KEY::BTN_TOOL_QUADTAP)
+            | EventCode::EV_KEY(EV_KEY::BTN_TOOL_QUINTTAP)
+            | EventCode::EV_MSC(EV_MSC::MSC_TIMESTAMP)
+            | EventCode::EV_SYN(EV_SYN::SYN_REPORT)
+    )
+}
+
 /// Spawn a blocking thread that signals `tx` on every keypress from the BT keyboard.
 /// Exits when the device is removed or the receiver is dropped.
 fn spawn_kb_reader(path: PathBuf, tx: mpsc::Sender<()>) {
@@ -482,6 +513,12 @@ enum InnerExit {
     DeviceGone,
     UsbAttached,
     Shutdown,
+}
+
+#[derive(Clone, Copy)]
+enum QuiescenceBlock {
+    Startup,
+    Desync,
 }
 
 async fn run_dwt_session(
@@ -565,9 +602,10 @@ async fn run_dwt_session(
     spawn_kb_reader(kb_path, key_tx);
 
     let mut suppressed = false;
-    let mut startup_blocked = true;
+    let mut quiescence_block = Some(QuiescenceBlock::Startup);
     let mut touch_state = TouchState::new(); // mirrors real device state
     let mut virt_state = TouchState::new();  // mirrors what we've forwarded to virtual device
+    let mut virt_real_tracking_ids = [-1; MAX_SLOTS];
     let mut next_virtual_tracking_id = 1;
     let dwt_sleep = tokio::time::sleep(INACTIVE);
     tokio::pin!(dwt_sleep);
@@ -582,14 +620,23 @@ async fn run_dwt_session(
                         // Always track the real device's state so we can reconcile later.
                         touch_state.update(&ev);
 
-                        if startup_blocked {
+                        if let Some(reason) = quiescence_block {
                             if ev.event_code == EventCode::EV_SYN(EV_SYN::SYN_REPORT)
                                 && touch_state_is_quiescent(&touch_state)
                             {
-                                startup_blocked = false;
+                                quiescence_block = None;
                                 touch_state = TouchState::new();
                                 virt_state = TouchState::new();
-                                debug!("DWT: startup quiescence reached — enabling forwarding");
+                                virt_real_tracking_ids = [-1; MAX_SLOTS];
+                                next_virtual_tracking_id = 1;
+                                match reason {
+                                    QuiescenceBlock::Startup => {
+                                        debug!("DWT: startup quiescence reached — enabling forwarding");
+                                    }
+                                    QuiescenceBlock::Desync => {
+                                        warn!("DWT: touch stream re-synchronized after quiescent frame");
+                                    }
+                                }
                             }
                             continue;
                         }
@@ -597,41 +644,52 @@ async fn run_dwt_session(
                         if suppressed {
                             // Suppress: don't forward, just track.
                         } else {
-                            let slot_idx = touch_state.current_slot as usize;
-                            let maybe_event = match ev.event_code {
-                                EventCode::EV_KEY(key) if is_fake_finger_key(key) => None,
-                                EventCode::EV_ABS(EV_ABS::ABS_MT_TRACKING_ID) if ev.value >= 0 => {
-                                    if virt_state.slots.get(slot_idx).map(|s| s.tracking_id >= 0).unwrap_or(false) {
-                                        None
-                                    } else {
-                                        let time = std::time::SystemTime::now().try_into().unwrap();
-                                        let value = next_virtual_tracking_id;
-                                        next_virtual_tracking_id += 1;
-                                        Some(InputEvent::new(&time, &ev.event_code, value))
-                                    }
-                                }
-                                EventCode::EV_ABS(EV_ABS::ABS_MT_TRACKING_ID) if ev.value < 0 => {
-                                    if virt_state.slots.get(slot_idx).map(|s| s.tracking_id >= 0).unwrap_or(false) {
-                                        Some(ev)
-                                    } else {
-                                        None
-                                    }
-                                }
-                                _ => Some(ev),
-                            };
+                            if ev.event_code == EventCode::EV_ABS(EV_ABS::ABS_MT_TRACKING_ID)
+                                && ev.value >= 0
+                            {
+                                let slot_idx = touch_state.current_slot as usize;
+                                let virt_active = virt_state
+                                    .slots
+                                    .get(slot_idx)
+                                    .map(|s| s.tracking_id >= 0)
+                                    .unwrap_or(false);
+                                let same_contact = virt_real_tracking_ids
+                                    .get(slot_idx)
+                                    .map(|id| *id == ev.value)
+                                    .unwrap_or(false);
 
-                            if let Some(out_ev) = maybe_event {
-                                if out_ev.event_code == EventCode::EV_SYN(EV_SYN::SYN_REPORT) {
-                                    let before_sync = virt_state.clone();
-                                    let mut target_state = virt_state.clone();
-                                    apply_slot_derived_buttons(&mut target_state);
-                                    let _ = sync_button_delta(&virt, &mut virt_state, &before_sync, &target_state);
+                                if virt_active && !same_contact {
+                                    warn!(
+                                        "DWT: unexpected tracking-id transition on active slot {} (real={}, last_real={}, virt={}); forcing re-sync",
+                                        slot_idx,
+                                        ev.value,
+                                        virt_real_tracking_ids[slot_idx],
+                                        virt_state.slots[slot_idx].tracking_id,
+                                    );
+                                    release_all_virtual_touches(&virt, &mut virt_state);
+                                    virt_real_tracking_ids = [-1; MAX_SLOTS];
+                                    quiescence_block = Some(QuiescenceBlock::Desync);
+                                    continue;
                                 }
+                            }
 
-                                if let Err(e) = virt.write_event(&out_ev) {
+                            if ev.event_code == EventCode::EV_SYN(EV_SYN::SYN_REPORT) {
+                                sync_virtual_frame(
+                                    &mut virt_state,
+                                    &mut virt_real_tracking_ids,
+                                    &touch_state,
+                                    &virt,
+                                    &mut next_virtual_tracking_id,
+                                );
+                            } else if matches!(ev.event_code, EventCode::EV_KEY(key) if is_fake_finger_key(key))
+                                || is_tracked_touch_event(&ev.event_code)
+                            {
+                                // Touch events are synthesized from state on SYN_REPORT.
+                            } else {
+                                if let Err(e) = virt.write_event(&ev) {
                                     warn!("DWT: write_event failed: {e}");
                                 } else {
-                                    virt_state.update(&out_ev);
+                                    virt_state.update(&ev);
                                 }
                             }
                         }
@@ -650,6 +708,7 @@ async fn run_dwt_session(
                             suppressed = true;
                             debug!("DWT: suppressing touchpad");
                             release_all_virtual_touches(&virt, &mut virt_state);
+                            virt_real_tracking_ids = [-1; MAX_SLOTS];
                         }
                         dwt_sleep.as_mut().reset(Instant::now() + DWT_TIMEOUT);
                     }
@@ -662,8 +721,16 @@ async fn run_dwt_session(
             _ = &mut dwt_sleep => {
                 if suppressed {
                     suppressed = false;
-                    debug!("DWT: touchpad unsuppressed — reconciling state");
-                    reconcile_virt_with_real(&mut virt_state, &touch_state, &virt, &mut next_virtual_tracking_id);
+                    if quiescence_block.is_none() {
+                        debug!("DWT: touchpad unsuppressed — reconciling state");
+                        sync_virtual_frame(
+                            &mut virt_state,
+                            &mut virt_real_tracking_ids,
+                            &touch_state,
+                            &virt,
+                            &mut next_virtual_tracking_id,
+                        );
+                    }
                 }
                 dwt_sleep.as_mut().reset(Instant::now() + INACTIVE);
             }

@@ -40,10 +40,23 @@ pub async fn run(mut kb_rx: broadcast::Receiver<bool>) {
     };
 
     let mut replaces_id = 0u32;
+    let mut initialized = false;
+    let mut last_attached: Option<bool> = None;
 
     loop {
         match kb_rx.recv().await {
             Ok(attached) => {
+                if !initialized {
+                    initialized = true;
+                    last_attached = Some(attached);
+                    continue;
+                }
+
+                if last_attached == Some(attached) {
+                    continue;
+                }
+                last_attached = Some(attached);
+
                 let (summary, body, icon) = if attached {
                     ("Keyboard Connected", "Zenbook Duo keyboard is now attached", "input-keyboard")
                 } else {

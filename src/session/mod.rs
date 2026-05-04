@@ -27,20 +27,21 @@ pub async fn run() {
 
     let (kb_tx, _) = broadcast::channel::<bool>(8);
     let (orient_tx, _) = broadcast::channel::<String>(8);
-    let (toggle_tx, _) = broadcast::channel::<bool>(8);
+    let (desired_secondary_tx, _) = broadcast::channel::<bool>(8);
     let (desired_primary_tx, _) = broadcast::channel::<String>(8);
     
     // Channel for keyboard attach/detach result - shared by all connections
     let (kb_result_tx, kb_result_rx) = tokio::sync::mpsc::channel(8);
     let kb_result_rx = Arc::new(tokio::sync::Mutex::new(kb_result_rx));
     
-    // Channel for toggle secondary display result - shared by all connections
-    let (toggle_result_tx, toggle_result_rx) = tokio::sync::mpsc::channel(8);
-    let toggle_result_rx = Arc::new(tokio::sync::Mutex::new(toggle_result_rx));
+    // Channel for desired secondary display application result
+    let (secondary_result_tx, secondary_result_rx) = tokio::sync::mpsc::channel(8);
+    let secondary_result_rx = Arc::new(tokio::sync::Mutex::new(secondary_result_rx));
     
     // Persistent desired_primary state (in memory, initially eDP-1)
     // Will be updated by root daemon on connect via daemon socket
     let desired_primary = Arc::new(tokio::sync::RwLock::new(String::from("eDP-1")));
+    let desired_secondary = Arc::new(tokio::sync::RwLock::new(true));
     
     // Unique session ID to detect when session daemon restarts
     let session_id = std::time::SystemTime::now()
@@ -65,20 +66,23 @@ pub async fn run() {
     tokio::spawn(display::run(
         orient_tx.subscribe(),
         kb_tx.subscribe(),
-        toggle_tx.subscribe(),
+        desired_secondary_tx.subscribe(),
         desired_primary_tx.subscribe(),
-        toggle_result_tx.clone(),
+        secondary_result_tx.clone(),
         kb_result_tx.clone(),
         desired_primary.clone(),
+        desired_secondary.clone(),
     ));
     tokio::spawn(notifications::run(kb_tx.subscribe()));
 
     // Start connecting to root daemon socket to get desired_primary updates
     {
         let desired_primary_clone = Arc::clone(&desired_primary);
+        let desired_secondary_clone = Arc::clone(&desired_secondary);
         let desired_primary_tx = desired_primary_tx.clone();
+        let desired_secondary_tx = desired_secondary_tx.clone();
         let kb_tx_for_root = kb_tx.clone();
-        let toggle_tx_for_root = toggle_tx.clone();
+        let secondary_result_rx_for_root = Arc::clone(&secondary_result_rx);
         tokio::spawn(async move {
             loop {
                 info!("SESSION: Attempting to connect to root daemon socket...");
@@ -87,9 +91,11 @@ pub async fn run() {
                         if let Err(e) = crate::daemon_socket::listen_from_root_and_update(
                             stream,
                             desired_primary_clone.clone(),
+                            desired_secondary_clone.clone(),
                             desired_primary_tx.clone(),
+                            desired_secondary_tx.clone(),
                             kb_tx_for_root.clone(),
-                            toggle_tx_for_root.clone(),
+                            secondary_result_rx_for_root.clone(),
                         ).await {
                             error!("SESSION: Error listening to root daemon: {}", e);
                         }
@@ -124,9 +130,9 @@ pub async fn run() {
         };
 
         let kb_tx = kb_tx.clone();
-        let toggle_tx = toggle_tx.clone();
+        let desired_secondary_tx = desired_secondary_tx.clone();
         let kb_result_rx = Arc::clone(&kb_result_rx);
-        let toggle_result_rx = Arc::clone(&toggle_result_rx);
+        let secondary_result_rx = Arc::clone(&secondary_result_rx);
         let desired_primary = Arc::clone(&desired_primary);
         let desired_primary_tx = desired_primary_tx.clone();
         let session_id_str = session_id_str.clone();
@@ -179,11 +185,11 @@ pub async fn run() {
                     }
                     Ok(RootCmd::ToggleSecondaryDisplay { enable }) => {
                         info!("Received toggle_secondary_display enable={enable}");
-                        toggle_tx.send(enable).ok();
+                        desired_secondary_tx.send(enable).ok();
                         // Wait for display module to handle and ack with 5s timeout
                         match tokio::time::timeout(
                             std::time::Duration::from_secs(5),
-                            toggle_result_rx.lock().await.recv()
+                            secondary_result_rx.lock().await.recv()
                         ).await {
                             Ok(Some(_)) => {
                                 if let Err(e) = writer.write_all(b"ok\n").await {
