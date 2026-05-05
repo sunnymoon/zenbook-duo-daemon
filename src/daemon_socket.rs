@@ -83,6 +83,13 @@ pub async fn start_server(
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
+                        // Allow only one session daemon connection at a time.
+                        // If a connection exists, reject the new one.
+                        if SESSION_CONNECTIONS.load(Ordering::SeqCst) > 0 {
+                            warn!("Session daemon already connected, rejecting duplicate connection");
+                            continue;
+                        }
+                        
                         let state_mgr = state_manager.clone();
                         let update_tx = state_update_tx.clone();
                         let ack_tx = ack_tx.clone();

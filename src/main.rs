@@ -187,7 +187,7 @@ async fn run_daemon(config_path: PathBuf) {
 
     start_listen_mute_state_thread(state_manager.clone());
 
-    start_receive_commands_task(&config, state_manager.clone(), activity_notifier.clone());
+    start_receive_commands_task(&config, state_manager.clone(), activity_notifier.clone(), event_sender.clone());
 
     dwt::start_task(initial_usb_attached, event_sender.clone());
 
