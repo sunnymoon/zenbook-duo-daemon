@@ -196,39 +196,100 @@ async fn apply_rotation(
     display: &DisplayConfigProxy<'_>,
     orientation: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    const MAX_ATTEMPTS: usize = 2;
     let transform = orientation_to_transform(orientation);
-    let (serial, physical, logical, _): CurrentState = display.get_current_state().await?;
 
-    let all_modes = extract_all_modes(&physical);
+    for attempt in 1..=MAX_ATTEMPTS {
+        info!("Rotation: attempt {}/{} for orientation={}", attempt, MAX_ATTEMPTS, orientation);
 
-    let primary_lm = logical.iter().find(|lm| lm.4);
-    let scale = primary_lm.map(|lm| lm.2).unwrap_or(DEFAULT_DUO_SCALE);
-    let primary_connector = primary_lm
-        .and_then(|lm| lm.5.first())
-        .map(|r| r.0.as_str())
-        .unwrap_or("eDP-1");
-    let primary_mode = all_modes.get(primary_connector).ok_or("no mode for primary")?;
+        // Step 1: Rebuild full config
+        let (serial, physical, logical, _): CurrentState = display.get_current_state().await?;
+        let all_modes = extract_all_modes(&physical);
 
-    // Only include secondary if it's currently active in logical monitors (avoids disabled eDP-2).
-    // Guard: secondary must differ from primary — Mutter can return the primary connector in the
-    // non-primary slot during a mid-rebuild transitional state. Passing primary=X, secondary=X
-    // causes the input mapper to crash (SIGSEGV in mapper_input_info_set_output).
-    let secondary_connector: Option<String> = logical.iter()
-        .find(|lm| !lm.4)
-        .and_then(|lm| lm.5.first())
-        .map(|r| r.0.clone())
-        .filter(|c| c != primary_connector);
-    let secondary = secondary_connector.as_deref()
-        .and_then(|c| all_modes.get(c).map(|m| (c, m)));
+        let primary_lm = logical.iter().find(|lm| lm.4);
+        let scale = primary_lm.map(|lm| lm.2).unwrap_or(DEFAULT_DUO_SCALE);
+        let primary_connector = primary_lm
+            .and_then(|lm| lm.5.first())
+            .map(|r| r.0.as_str())
+            .unwrap_or("eDP-1");
+        let primary_mode = all_modes.get(primary_connector).ok_or("no mode for primary")?;
 
-    info!(
-        "Rotation: orientation={orientation} transform={transform} primary={primary_connector} secondary={:?}",
-        secondary_connector
-    );
+        // Only include secondary if it's currently active in logical monitors (avoids disabled eDP-2).
+        // Guard: secondary must differ from primary — Mutter can return the primary connector in the
+        // non-primary slot during a mid-rebuild transitional state. Passing primary=X, secondary=X
+        // causes the input mapper to crash (SIGSEGV in mapper_input_info_set_output).
+        let secondary_connector: Option<String> = logical.iter()
+            .find(|lm| !lm.4)
+            .and_then(|lm| lm.5.first())
+            .map(|r| r.0.clone())
+            .filter(|c| c != primary_connector);
+        let secondary = secondary_connector.as_deref()
+            .and_then(|c| all_modes.get(c).map(|m| (c, m)));
 
-    let lms = build_duo_lms(primary_connector, primary_mode, secondary, transform, scale);
-    display.apply_monitors_config(serial, 1, lms, HashMap::new()).await?;
-    Ok(())
+        info!(
+            "Rotation: building config with primary={} secondary={:?} transform={}",
+            primary_connector, secondary_connector, transform
+        );
+
+        let lms = build_duo_lms(primary_connector, primary_mode, secondary, transform, scale);
+
+        // Step 2: Apply config
+        display.apply_monitors_config(serial, 1, lms.clone(), HashMap::new()).await?;
+
+        // Step 3: Verify applied state matches desired state
+        let (_, _, logical_after, _): CurrentState = display.get_current_state().await?;
+        let (config_after, is_corrupted) = read_current_config(&logical_after);
+
+        if is_corrupted {
+            warn!("Rotation: config is corrupted (duplicate connector), retrying...");
+            if attempt < MAX_ATTEMPTS {
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                continue;
+            } else {
+                return Err("Rotation: config remains corrupted after retries".into());
+            }
+        }
+
+        // Verify all requested logical monitors are present with correct transforms
+        let mut all_match = true;
+        for (i, lm_request) in lms.iter().enumerate() {
+            let (x, y, scale, transform, is_primary, connectors) = lm_request;
+            if let Some(connector) = connectors.first().map(|c| c.0.as_str()) {
+                if let Some((actual_x, actual_y, actual_scale, actual_transform, actual_is_primary)) = config_after.get(connector) {
+                    let matches = x == actual_x && y == actual_y 
+                        && (scale - actual_scale).abs() < 0.01
+                        && transform == actual_transform
+                        && is_primary == actual_is_primary;
+                    if !matches {
+                        warn!(
+                            "Rotation: LM[{}] {} mismatch: requested ({},{},{},{},{}), got ({},{},{},{},{})",
+                            i, connector, x, y, scale, transform, is_primary,
+                            actual_x, actual_y, actual_scale, actual_transform, actual_is_primary
+                        );
+                        all_match = false;
+                    }
+                } else {
+                    warn!("Rotation: LM[{}] connector {} not in applied config", i, connector);
+                    all_match = false;
+                }
+            }
+        }
+
+        if all_match {
+            info!("Rotation: applied config matches desired state");
+            return Ok(());
+        } else {
+            warn!("Rotation: applied config doesn't match desired, retrying...");
+            if attempt < MAX_ATTEMPTS {
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                continue;
+            } else {
+                return Err("Rotation: config mismatch persists after retries".into());
+            }
+        }
+    }
+
+    Err("Rotation: failed after all attempts".into())
 }
 
 /// Read current display config from logical monitors.
