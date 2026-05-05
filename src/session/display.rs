@@ -603,6 +603,9 @@ async fn handle_keyboard_attached(
         // After restoring secondary display, sync orientation with sensor to prevent
         // applying stale transforms (can happen if device was rotated while secondary was disabled)
         if should_enable_secondary && result.is_ok() {
+            // Wait for Mutter to recognize the secondary display before syncing rotation
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            
             if let Ok(Some(current_orientation)) = super::orientation::current_orientation().await {
                 if current_orientation != "normal" {
                     info!("Keyboard detached: syncing rotation to sensor orientation after secondary restore");
