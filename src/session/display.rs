@@ -21,31 +21,50 @@ const DEFAULT_DUO_SCALE: f64 = 5.0 / 3.0;
 
 // ── Helper functions ─────────────────────────────────────────────────────────
 
-async fn control_secondary_sysfs(enable: bool) {
-    // Try to find and control eDP-2 status file (typically card1-eDP-2)
-    for card in &["card1", "card0"] {
-        let path = format!("/sys/class/drm/{}-eDP-2/status", card);
-        let data = if enable { "on" } else { "off" };
-        
-        // Check if file exists first
-        match fs::try_exists(&path).await {
-            Ok(true) => {
-                if let Err(e) = fs::write(&path, data).await {
-                    warn!("control_secondary_sysfs({}): Failed to write to {} - {}", enable, path, e);
-                } else {
-                    info!("control_secondary_sysfs({}): {} successful", enable, path);
+async fn find_edp_status_path(connector: &str) -> Option<String> {
+    // Scan /sys/class/drm/ for the correct card that has this connector
+    match tokio::fs::read_dir("/sys/class/drm").await {
+        Ok(mut entries) => {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                let file_name = entry.file_name();
+                let name = file_name.to_string_lossy();
+                
+                // Look for pattern like "cardX-eDP-Y"
+                if name.ends_with(&format!("-{}", connector)) && name.contains("-eDP-") {
+                    let status_path = path.join("status");
+                    match fs::try_exists(&status_path).await {
+                        Ok(true) => {
+                            let path_str = status_path.to_string_lossy().to_string();
+                            debug!("Found {} at {}", connector, path_str);
+                            return Some(path_str);
+                        }
+                        _ => {}
+                    }
                 }
-                return;
-            }
-            Ok(false) => {
-                debug!("control_secondary_sysfs({}): {} does not exist", enable, path);
-            }
-            Err(e) => {
-                debug!("control_secondary_sysfs({}): Failed to check {} - {}", enable, path, e);
             }
         }
+        Err(e) => {
+            warn!("Failed to scan /sys/class/drm: {}", e);
+        }
     }
-    warn!("control_secondary_sysfs({}): Could not find eDP-2 status file in any card", enable);
+    None
+}
+
+async fn control_secondary_sysfs(enable: bool) {
+    if let Some(path) = find_edp_status_path("eDP-2").await {
+        let data = if enable { "on" } else { "off" };
+        match fs::write(&path, data).await {
+            Ok(_) => {
+                info!("control_secondary_sysfs({}): {} successful", enable, path);
+            }
+            Err(e) => {
+                warn!("control_secondary_sysfs({}): Failed to write to {} - {}", enable, path, e);
+            }
+        }
+    } else {
+        warn!("control_secondary_sysfs({}): Could not find eDP-2 status file", enable);
+    }
 }
 
 
