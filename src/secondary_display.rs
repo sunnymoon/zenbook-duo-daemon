@@ -25,6 +25,13 @@ fn now_secs() -> u64 {
 }
 
 async fn control_secondary_display(status_path: &str, enable: bool, last_change: &Arc<AtomicU64>) {
+    // Check current state first to avoid redundant sysfs writes (which cause flicker)
+    let actual_enabled = is_secondary_display_enabled_actual(status_path).await;
+    if actual_enabled == enable {
+        // Already in the desired state, no need to write
+        return;
+    }
+    
     let data: &[u8] = if enable { b"on" } else { b"off" };
     last_change.store(now_secs(), Ordering::Relaxed);
     if let Err(e) = fs::write(status_path, data).await {
