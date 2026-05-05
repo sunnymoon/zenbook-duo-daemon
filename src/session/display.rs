@@ -520,14 +520,27 @@ async fn handle_keyboard_attached(
             "Keyboard detached: restoring desired secondary state enable={}",
             should_enable_secondary
         );
-        apply_toggle_secondary_display(
+        let result = apply_toggle_secondary_display(
             display,
             should_enable_secondary,
             cached_secondary,
             desired_primary,
             desired_transform,
         )
-        .await
+        .await;
+        
+        // After restoring secondary display, sync orientation with sensor to prevent
+        // applying stale transforms (can happen if device was rotated while secondary was disabled)
+        if should_enable_secondary && result.is_ok() {
+            if let Ok(Some(current_orientation)) = super::orientation::current_orientation().await {
+                if current_orientation != "normal" {
+                    info!("Keyboard detached: syncing rotation to sensor orientation after secondary restore");
+                    let _ = apply_rotation(display, &current_orientation).await;
+                }
+            }
+        }
+        
+        result
     }
 }
 
