@@ -4,6 +4,7 @@ use log::{debug, error, info, warn};
 use tokio::sync::broadcast;
 use zbus::{Connection, proxy, zvariant::OwnedValue};
 use futures::stream::StreamExt;
+use tokio::fs;
 
 // ── Mutter D-Bus type aliases ─────────────────────────────────────────────────
 
@@ -17,6 +18,25 @@ type ApplyMonSpec = (String, String, HashMap<String, OwnedValue>);
 type ApplyLm = (i32, i32, f64, u32, bool, Vec<ApplyMonSpec>);
 
 const DEFAULT_DUO_SCALE: f64 = 5.0 / 3.0;
+
+// ── Helper functions ─────────────────────────────────────────────────────────
+
+async fn control_secondary_sysfs(enable: bool) {
+    // Try both possible card paths for eDP-2 status file
+    for card in &["card0", "card1"] {
+        let path = format!("/sys/class/drm/{}-eDP-2/status", card);
+        let data = if enable { "on" } else { "off" };
+        if let Err(e) = fs::write(&path, data).await {
+            debug!("control_secondary_sysfs({}): {} - {}", enable, path, e);
+        } else {
+            info!("control_secondary_sysfs({}): {} successful", enable, path);
+            return;
+        }
+    }
+    warn!("control_secondary_sysfs({}): Could not find eDP-2 status file", enable);
+}
+
+
 
 #[proxy(
     interface = "org.gnome.Mutter.DisplayConfig",
@@ -931,6 +951,9 @@ async fn apply_toggle_secondary_display(
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
         }
+        
+        // If disabling, write "off" to sysfs after the display config is removed
+        info!("Disabling secondary display: will write 'off' to sysfs for eDP-2 after config applied");
     }
     
     // Now proceed with actual toggle
@@ -946,6 +969,14 @@ async fn apply_toggle_secondary_display(
     } else {
         "eDP-1"
     };
+    
+    // If enabling, write "on" to sysfs to wake up the secondary display
+    if enable {
+        info!("Enabling secondary display: writing 'on' to sysfs for {}", expected_secondary_hint);
+        control_secondary_sysfs(true).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    
     if enable && !extract_all_modes(&state.1).contains_key(expected_secondary_hint) {
         if let Some(waited_state) = wait_for_connector_mode(display, expected_secondary_hint).await? {
             state = waited_state;
@@ -1120,6 +1151,13 @@ async fn apply_toggle_secondary_display(
     info!("Applying toggle secondary display (enable={}), monitors count={}", enable, new_monitors.len());
     display.apply_monitors_config(serial, 1, new_monitors.clone(), HashMap::new()).await?;
     info!("Secondary display toggle completed");
+    
+    // If disabling, write "off" to sysfs to power down the secondary display
+    if !enable {
+        info!("Disabling secondary display: writing 'off' to sysfs for eDP-2");
+        control_secondary_sysfs(false).await;
+    }
+    
     Ok(())
 }
 
