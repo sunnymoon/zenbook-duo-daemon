@@ -4,7 +4,7 @@ use log::{debug, error, info, warn};
 use tokio::sync::broadcast;
 use zbus::{Connection, proxy, zvariant::OwnedValue};
 use futures::stream::StreamExt;
-use tokio::fs;
+
 
 // ── Mutter D-Bus type aliases ─────────────────────────────────────────────────
 
@@ -18,55 +18,6 @@ type ApplyMonSpec = (String, String, HashMap<String, OwnedValue>);
 type ApplyLm = (i32, i32, f64, u32, bool, Vec<ApplyMonSpec>);
 
 const DEFAULT_DUO_SCALE: f64 = 5.0 / 3.0;
-
-// ── Helper functions ─────────────────────────────────────────────────────────
-
-async fn find_edp_status_path(connector: &str) -> Option<String> {
-    // Scan /sys/class/drm/ for the correct card that has this connector
-    match tokio::fs::read_dir("/sys/class/drm").await {
-        Ok(mut entries) => {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let path = entry.path();
-                let file_name = entry.file_name();
-                let name = file_name.to_string_lossy();
-                
-                // Look for pattern like "cardX-eDP-Y"
-                if name.ends_with(&format!("-{}", connector)) && name.contains("-eDP-") {
-                    let status_path = path.join("status");
-                    match fs::try_exists(&status_path).await {
-                        Ok(true) => {
-                            let path_str = status_path.to_string_lossy().to_string();
-                            debug!("Found {} at {}", connector, path_str);
-                            return Some(path_str);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            warn!("Failed to scan /sys/class/drm: {}", e);
-        }
-    }
-    None
-}
-
-async fn control_secondary_sysfs(enable: bool) {
-    if let Some(path) = find_edp_status_path("eDP-2").await {
-        let data = if enable { "on" } else { "off" };
-        match fs::write(&path, data).await {
-            Ok(_) => {
-                info!("control_secondary_sysfs({}): {} successful", enable, path);
-            }
-            Err(e) => {
-                warn!("control_secondary_sysfs({}): Failed to write to {} - {}", enable, path, e);
-            }
-        }
-    } else {
-        warn!("control_secondary_sysfs({}): Could not find eDP-2 status file", enable);
-    }
-}
-
 
 
 #[proxy(
@@ -991,8 +942,9 @@ async fn apply_toggle_secondary_display(
             }
         }
         
-        // If disabling, write "off" to sysfs after the display config is removed
-        info!("Disabling secondary display: will write 'off' to sysfs for eDP-2 after config applied");
+        // Note: sysfs control (on/off) is handled by root daemon's secondary_display task,
+        // not by session daemon (which runs as user and lacks sysfs write permissions).
+        // Root daemon monitors desired_secondary state and manages sysfs accordingly.
     }
     
     // Now proceed with actual toggle
@@ -1009,18 +961,15 @@ async fn apply_toggle_secondary_display(
         "eDP-1"
     };
     
-    // If enabling, write "on" to sysfs to wake up the secondary display
-    if enable {
-        info!("Enabling secondary display: writing 'on' to sysfs for {}", expected_secondary_hint);
-        control_secondary_sysfs(true).await;
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
-    
+    // When enabling, wait for Mutter to recognize the connector
+    // (root daemon's sysfs control should enable it via secondary_display task)
     if enable && !extract_all_modes(&state.1).contains_key(expected_secondary_hint) {
+        info!("Enabling secondary: waiting for root daemon sysfs control to make connector available");
         if let Some(waited_state) = wait_for_connector_mode(display, expected_secondary_hint).await? {
             state = waited_state;
         }
     }
+
 
     let (serial, physical, logical, _): CurrentState = state;
     let all_modes = extract_all_modes(&physical);
@@ -1191,11 +1140,8 @@ async fn apply_toggle_secondary_display(
     display.apply_monitors_config(serial, 1, new_monitors.clone(), HashMap::new()).await?;
     info!("Secondary display toggle completed");
     
-    // If disabling, write "off" to sysfs to power down the secondary display
-    if !enable {
-        info!("Disabling secondary display: writing 'off' to sysfs for eDP-2");
-        control_secondary_sysfs(false).await;
-    }
+    // Note: sysfs control (on/off) for eDP-2 is handled by root daemon's secondary_display task
+    // based on desired_secondary_enabled state, not by this session daemon.
     
     Ok(())
 }
