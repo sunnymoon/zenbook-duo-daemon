@@ -22,18 +22,30 @@ const DEFAULT_DUO_SCALE: f64 = 5.0 / 3.0;
 // ── Helper functions ─────────────────────────────────────────────────────────
 
 async fn control_secondary_sysfs(enable: bool) {
-    // Try both possible card paths for eDP-2 status file
-    for card in &["card0", "card1"] {
+    // Try to find and control eDP-2 status file (typically card1-eDP-2)
+    for card in &["card1", "card0"] {
         let path = format!("/sys/class/drm/{}-eDP-2/status", card);
         let data = if enable { "on" } else { "off" };
-        if let Err(e) = fs::write(&path, data).await {
-            debug!("control_secondary_sysfs({}): {} - {}", enable, path, e);
-        } else {
-            info!("control_secondary_sysfs({}): {} successful", enable, path);
-            return;
+        
+        // Check if file exists first
+        match fs::try_exists(&path).await {
+            Ok(true) => {
+                if let Err(e) = fs::write(&path, data).await {
+                    warn!("control_secondary_sysfs({}): Failed to write to {} - {}", enable, path, e);
+                } else {
+                    info!("control_secondary_sysfs({}): {} successful", enable, path);
+                }
+                return;
+            }
+            Ok(false) => {
+                debug!("control_secondary_sysfs({}): {} does not exist", enable, path);
+            }
+            Err(e) => {
+                debug!("control_secondary_sysfs({}): Failed to check {} - {}", enable, path, e);
+            }
         }
     }
-    warn!("control_secondary_sysfs({}): Could not find eDP-2 status file", enable);
+    warn!("control_secondary_sysfs({}): Could not find eDP-2 status file in any card", enable);
 }
 
 
@@ -245,6 +257,14 @@ async fn apply_rotation(
             .filter(|c| c != primary_connector);
         let secondary = secondary_connector.as_deref()
             .and_then(|c| all_modes.get(c).map(|m| (c, m)));
+
+        debug!("Rotation: physical monitors available: {:?}", all_modes.keys().collect::<Vec<_>>());
+        debug!("Rotation: logical monitors count: {}", logical.len());
+        for (i, lm) in logical.iter().enumerate() {
+            if let Some(conn) = lm.5.first() {
+                debug!("  LM[{}]: connector={} primary={}", i, conn.0, lm.4);
+            }
+        }
 
         info!(
             "Rotation: building config with primary={} secondary={:?} transform={}",
