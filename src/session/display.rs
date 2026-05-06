@@ -243,6 +243,12 @@ async fn apply_rotation(
 
         let lms = build_duo_lms(primary_connector, primary_mode, secondary, transform, scale);
 
+        let (config_before, is_corrupted_before) = read_current_config(&logical);
+        if !is_corrupted_before && requested_layout_matches_config(&lms, &config_before) {
+            info!("Rotation: current config already matches desired state");
+            return Ok(());
+        }
+
         // Step 2: Apply config
         display.apply_monitors_config(serial, 1, lms.clone(), HashMap::new()).await?;
 
@@ -260,32 +266,7 @@ async fn apply_rotation(
             }
         }
 
-        // Verify all requested logical monitors are present with correct transforms
-        let mut all_match = true;
-        for (i, lm_request) in lms.iter().enumerate() {
-            let (x, y, scale, transform, is_primary, connectors) = lm_request;
-            if let Some(connector) = connectors.first().map(|c| c.0.as_str()) {
-                if let Some((actual_x, actual_y, actual_scale, actual_transform, actual_is_primary)) = config_after.get(connector) {
-                    let matches = x == actual_x && y == actual_y 
-                        && (scale - actual_scale).abs() < 0.01
-                        && transform == actual_transform
-                        && is_primary == actual_is_primary;
-                    if !matches {
-                        warn!(
-                            "Rotation: LM[{}] {} mismatch: requested ({},{},{},{},{}), got ({},{},{},{},{})",
-                            i, connector, x, y, scale, transform, is_primary,
-                            actual_x, actual_y, actual_scale, actual_transform, actual_is_primary
-                        );
-                        all_match = false;
-                    }
-                } else {
-                    warn!("Rotation: LM[{}] connector {} not in applied config", i, connector);
-                    all_match = false;
-                }
-            }
-        }
-
-        if all_match {
+        if requested_layout_matches_config(&lms, &config_after) {
             info!("Rotation: applied config matches desired state");
             return Ok(());
         } else {
@@ -321,6 +302,49 @@ pub fn read_current_config(logical: &[LogicalMonitor]) -> (HashMap<String, (i32,
     }
     
     (config, is_corrupted)
+}
+
+fn requested_layout_matches_config(
+    requested: &[ApplyLm],
+    actual: &HashMap<String, (i32, i32, f64, u32, bool)>,
+) -> bool {
+    for (i, lm_request) in requested.iter().enumerate() {
+        let (x, y, scale, transform, is_primary, connectors) = lm_request;
+        if let Some(connector) = connectors.first().map(|c| c.0.as_str()) {
+            if let Some((actual_x, actual_y, actual_scale, actual_transform, actual_is_primary)) =
+                actual.get(connector)
+            {
+                let matches = x == actual_x
+                    && y == actual_y
+                    && (scale - actual_scale).abs() < 0.01
+                    && transform == actual_transform
+                    && is_primary == actual_is_primary;
+                if !matches {
+                    warn!(
+                        "Rotation: LM[{}] {} mismatch: requested ({},{},{},{},{}), got ({},{},{},{},{})",
+                        i,
+                        connector,
+                        x,
+                        y,
+                        scale,
+                        transform,
+                        is_primary,
+                        actual_x,
+                        actual_y,
+                        actual_scale,
+                        actual_transform,
+                        actual_is_primary
+                    );
+                    return false;
+                }
+            } else {
+                warn!("Rotation: LM[{}] connector {} not in applied config", i, connector);
+                return false;
+            }
+        }
+    }
+
+    true
 }
 
 /// Ensure both displays exist. If one is missing, mirror the other.
@@ -461,44 +485,78 @@ fn matches_expected_duo_layout(
             .all(|(connector, expected_entry)| config.get(connector) == Some(expected_entry))
 }
 
+fn matches_expected_single_layout(
+    config: &HashMap<String, (i32, i32, f64, u32, bool)>,
+    target_primary: &str,
+    desired_transform: u32,
+) -> bool {
+    if config.len() != 1 {
+        return false;
+    }
+
+    matches!(
+        config.get(target_primary),
+        Some((0, 0, _, transform, true)) if *transform == desired_transform
+    )
+}
+
 async fn repair_layout_for_primary(
     display: &DisplayConfigProxy<'_>,
     target_primary: &str,
     desired_transform: u32,
+    require_secondary: bool,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let (serial, physical, logical, _): CurrentState = display.get_current_state().await?;
     let all_modes = extract_all_modes(&physical);
     let (mut config, _) = read_current_config(&logical);
 
-    ensure_both_displays(display, serial, &physical, &all_modes, &mut config)
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    let new_monitors = if require_secondary {
+        ensure_both_displays(display, serial, &physical, &all_modes, &mut config)
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
 
-    if matches_expected_duo_layout(&config, &all_modes, target_primary, desired_transform) {
-        return Ok(true);
-    }
+        if matches_expected_duo_layout(&config, &all_modes, target_primary, desired_transform) {
+            return Ok(true);
+        }
 
-    normalize_duo_layout(&mut config, &all_modes, target_primary, desired_transform);
-    let mut new_monitors = Vec::new();
-    for connector in &["eDP-1", "eDP-2"] {
-        if let Some(&(x, y, scale, transform, is_primary)) = config.get(*connector) {
-            if let Some((mode_id, _, _)) = all_modes.get(*connector) {
-                new_monitors.push((
-                    x,
-                    y,
-                    scale,
-                    transform,
-                    is_primary,
-                    vec![(connector.to_string(), mode_id.clone(), HashMap::new())],
-                ));
+        normalize_duo_layout(&mut config, &all_modes, target_primary, desired_transform);
+        let mut new_monitors = Vec::new();
+        for connector in &["eDP-1", "eDP-2"] {
+            if let Some(&(x, y, scale, transform, is_primary)) = config.get(*connector) {
+                if let Some((mode_id, _, _)) = all_modes.get(*connector) {
+                    new_monitors.push((
+                        x,
+                        y,
+                        scale,
+                        transform,
+                        is_primary,
+                        vec![(connector.to_string(), mode_id.clone(), HashMap::new())],
+                    ));
+                }
             }
         }
-    }
+        new_monitors
+    } else {
+        if matches_expected_single_layout(&config, target_primary, desired_transform) {
+            return Ok(true);
+        }
+
+        let scale = config
+            .get(target_primary)
+            .map(|(_, _, scale, _, _)| *scale)
+            .or_else(|| logical.iter().find(|lm| lm.4).map(|lm| lm.2))
+            .unwrap_or(DEFAULT_DUO_SCALE);
+        let primary_mode = all_modes
+            .get(target_primary)
+            .ok_or_else(|| format!("No mode for {target_primary}"))?;
+        build_duo_lms(target_primary, primary_mode, None, desired_transform, scale)
+    };
 
     info!(
-        "DesiredPrimary: repairing layout for primary={} with {} logical monitors",
+        "DesiredPrimary: repairing layout for primary={} with {} logical monitors (require_secondary={})",
         target_primary,
-        new_monitors.len()
+        new_monitors.len(),
+        require_secondary
     );
     display.apply_monitors_config(serial, 1, new_monitors, HashMap::new()).await?;
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -506,12 +564,17 @@ async fn repair_layout_for_primary(
     let (_, physical, logical, _): CurrentState = display.get_current_state().await?;
     let all_modes = extract_all_modes(&physical);
     let (verify_config, verify_corrupted) = read_current_config(&logical);
-    Ok(!verify_corrupted && matches_expected_duo_layout(
-        &verify_config,
-        &all_modes,
-        target_primary,
-        desired_transform,
-    ))
+    Ok(!verify_corrupted
+        && if require_secondary {
+            matches_expected_duo_layout(
+                &verify_config,
+                &all_modes,
+                target_primary,
+                desired_transform,
+            )
+        } else {
+            matches_expected_single_layout(&verify_config, target_primary, desired_transform)
+        })
 }
 
 /// Swap which monitor is primary. Keeps physical positions unchanged.
@@ -921,7 +984,7 @@ async fn apply_toggle_secondary_display(
     display: &DisplayConfigProxy<'_>,
     enable: bool,
     cached_secondary: &mut Option<(String, String, i32, i32, f64)>,
-    _desired_primary: &Arc<tokio::sync::RwLock<String>>,
+    desired_primary: &Arc<tokio::sync::RwLock<String>>,
     desired_transform: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // If disabling and eDP-2 is primary, swap to eDP-1 first to prevent crash
@@ -1092,15 +1155,32 @@ async fn apply_toggle_secondary_display(
                 };
 
                 if let Some((connector, mode_id, scale, source, secondary_mode)) = restore {
+                    let desired_primary_value = desired_primary.read().await.clone();
+                    let restore_primary_connector = if desired_primary_value == connector {
+                        connector.as_str()
+                    } else {
+                        primary_connector.as_str()
+                    };
+                    let (restore_primary_mode, restore_secondary_connector, restore_secondary_mode) =
+                        if restore_primary_connector == connector.as_str() {
+                            (&secondary_mode, primary_connector.as_str(), primary_mode)
+                        } else {
+                            (primary_mode, connector.as_str(), &secondary_mode)
+                        };
+
                     info!(
-                        "Restoring secondary display from {} primary={} transform={} (current single-monitor transform={})",
-                        source, primary_connector, desired_transform, primary_transform
+                        "Restoring secondary display from {} primary={} desired_primary={} transform={} (current single-monitor transform={})",
+                        source,
+                        restore_primary_connector,
+                        desired_primary_value,
+                        desired_transform,
+                        primary_transform
                     );
 
                     new_monitors = build_duo_lms(
-                        primary_connector.as_str(),
-                        primary_mode,
-                        Some((connector.as_str(), &secondary_mode)),
+                        restore_primary_connector,
+                        restore_primary_mode,
+                        Some((restore_secondary_connector, restore_secondary_mode)),
                         desired_transform,
                         scale,
                     )
@@ -1201,38 +1281,71 @@ async fn apply_desired_primary_if_possible(
     display: &DisplayConfigProxy<'_>,
     desired: &str,
     desired_transform: u32,
+    require_secondary: bool,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let (_serial, _physical, logical, _) = display.get_current_state().await?;
     let (logical_map, _) = read_current_config(&logical);
 
     match logical_map.get(desired) {
         Some((_, _, _, _, is_primary)) if *is_primary => {
-            let (serial, physical, logical, _): CurrentState = display.get_current_state().await?;
+            let (_serial, physical, logical, _): CurrentState = display.get_current_state().await?;
             let all_modes = extract_all_modes(&physical);
-            let mut config = read_current_config(&logical).0;
-            ensure_both_displays(display, serial, &physical, &all_modes, &mut config)
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-            if matches_expected_duo_layout(&config, &all_modes, desired, desired_transform) {
+            let config = read_current_config(&logical).0;
+            let secondary_connector = if desired == "eDP-1" { "eDP-2" } else { "eDP-1" };
+            if require_secondary && !all_modes.contains_key(secondary_connector) {
+                info!(
+                    "DesiredPrimary: {} is primary but {} has no available mode yet; accepting temporary single-display layout",
+                    desired, secondary_connector
+                );
+                return if matches_expected_single_layout(&config, desired, desired_transform) {
+                    Ok(true)
+                } else {
+                    repair_layout_for_primary(display, desired, desired_transform, false).await
+                };
+            }
+            let layout_matches = if require_secondary {
+                matches_expected_duo_layout(&config, &all_modes, desired, desired_transform)
+            } else {
+                matches_expected_single_layout(&config, desired, desired_transform)
+            };
+            if layout_matches {
                 info!("DesiredPrimary: {} already primary", desired);
                 Ok(true)
             } else {
                 warn!("DesiredPrimary: {} is primary but layout is wrong, repairing", desired);
-                repair_layout_for_primary(display, desired, desired_transform).await
+                repair_layout_for_primary(display, desired, desired_transform, require_secondary).await
             }
         }
         Some(_) => {
-            info!("DesiredPrimary: {} available and not primary, applying now", desired);
-            let new_primary = apply_display_swap(display, desired_transform).await?;
-            if new_primary == desired {
-                info!("DesiredPrimary: switched primary to {}", desired);
-                Ok(true)
+            let (_serial, physical, _logical, _): CurrentState = display.get_current_state().await?;
+            let all_modes = extract_all_modes(&physical);
+            let secondary_connector = if desired == "eDP-1" { "eDP-2" } else { "eDP-1" };
+            if require_secondary {
+                if !all_modes.contains_key(secondary_connector) {
+                    info!(
+                        "DesiredPrimary: {} available but {} has no available mode yet; applying temporary single-display layout",
+                        desired, secondary_connector
+                    );
+                    return repair_layout_for_primary(display, desired, desired_transform, false).await;
+                }
+                info!("DesiredPrimary: {} available and not primary, applying now", desired);
+                let new_primary = apply_display_swap(display, desired_transform).await?;
+                if new_primary == desired {
+                    info!("DesiredPrimary: switched primary to {}", desired);
+                    Ok(true)
+                } else {
+                    warn!(
+                        "DesiredPrimary: swap completed but primary is {} instead of {}",
+                        new_primary, desired
+                    );
+                    Ok(false)
+                }
             } else {
-                warn!(
-                    "DesiredPrimary: swap completed but primary is {} instead of {}",
-                    new_primary, desired
+                info!(
+                    "DesiredPrimary: {} available but secondary is inactive, repairing single-display layout",
+                    desired
                 );
-                Ok(false)
+                repair_layout_for_primary(display, desired, desired_transform, false).await
             }
         }
         None => {
@@ -1240,6 +1353,10 @@ async fn apply_desired_primary_if_possible(
             Ok(false)
         }
     }
+}
+
+fn effective_secondary_enabled(desired_secondary_enabled: bool, keyboard_attached: bool) -> bool {
+    desired_secondary_enabled && !keyboard_attached
 }
 
 fn stop_availability_monitor(
@@ -1298,6 +1415,167 @@ fn update_availability_monitor_for_edp2(
         ensure_availability_monitor(availability_task, conn, availability_tx, desired_primary);
     } else {
         stop_availability_monitor(availability_task);
+    }
+}
+
+async fn current_desired_transform(
+    display: &DisplayConfigProxy<'_>,
+) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
+    match super::orientation::current_orientation().await {
+        Ok(Some(orientation)) => Ok(orientation_to_transform(&orientation)),
+        Ok(None) => Ok(display
+            .get_current_state()
+            .await?
+            .2
+            .iter()
+            .find(|lm| lm.4)
+            .map(|lm| lm.3)
+            .unwrap_or(0)),
+        Err(e) => {
+            warn!("Display recovery: failed to read current orientation: {e}");
+            Ok(display
+                .get_current_state()
+                .await?
+                .2
+                .iter()
+                .find(|lm| lm.4)
+                .map(|lm| lm.3)
+                .unwrap_or(0))
+        }
+    }
+}
+
+async fn attempt_display_recovery(
+    conn: &Connection,
+    desired_primary: &Arc<tokio::sync::RwLock<String>>,
+    desired_secondary: &Arc<tokio::sync::RwLock<bool>>,
+    keyboard_attached: &Arc<tokio::sync::RwLock<bool>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let display = DisplayConfigProxy::new(conn).await?;
+    let desired_transform = current_desired_transform(&display).await?;
+    let desired_primary_value = desired_primary.read().await.clone();
+    let desired_secondary_enabled = *desired_secondary.read().await;
+    let keyboard_attached = *keyboard_attached.read().await;
+    let effective_secondary = effective_secondary_enabled(desired_secondary_enabled, keyboard_attached);
+    let effective_primary = if effective_secondary {
+        desired_primary_value.as_str()
+    } else {
+        "eDP-1"
+    };
+
+    let mut cached_secondary = None;
+    let (_, _, logical, _) = display.get_current_state().await?;
+    let current_secondary_present = read_current_config(&logical).0.contains_key("eDP-2");
+
+    if effective_secondary != current_secondary_present {
+        apply_toggle_secondary_display(
+            &display,
+            effective_secondary,
+            &mut cached_secondary,
+            desired_primary,
+            desired_transform,
+        )
+        .await?;
+    }
+
+    match apply_desired_primary_if_possible(
+        &display,
+        effective_primary,
+        desired_transform,
+        effective_secondary,
+    )
+    .await?
+    {
+        true => {}
+        false => {
+            return Err(format!(
+                "Display recovery: effective primary {effective_primary} still unavailable after apply"
+            )
+            .into());
+        }
+    }
+
+    if let Ok(Some(orientation)) = super::orientation::current_orientation().await {
+        apply_rotation(&display, &orientation).await?;
+    }
+
+    Ok(())
+}
+
+fn ensure_display_recovery_task(
+    recovery_task: &mut Option<tokio::task::JoinHandle<()>>,
+    conn: &Connection,
+    desired_primary: &Arc<tokio::sync::RwLock<String>>,
+    desired_secondary: &Arc<tokio::sync::RwLock<bool>>,
+    keyboard_attached: &Arc<tokio::sync::RwLock<bool>>,
+    reason: &'static str,
+) {
+    let already_running = recovery_task
+        .as_ref()
+        .is_some_and(|task| !task.is_finished());
+    if already_running {
+        return;
+    }
+
+    let conn = conn.clone();
+    let desired_primary = Arc::clone(desired_primary);
+    let desired_secondary = Arc::clone(desired_secondary);
+    let keyboard_attached = Arc::clone(keyboard_attached);
+    *recovery_task = Some(tokio::spawn(async move {
+        const MAX_ATTEMPTS: usize = 20;
+        const DELAY_SECS: u64 = 10;
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            match attempt_display_recovery(
+                &conn,
+                &desired_primary,
+                &desired_secondary,
+                &keyboard_attached,
+            )
+            .await
+            {
+                Ok(()) => {
+                    info!(
+                        "Display recovery: converged successfully on attempt {}/{} after {}",
+                        attempt, MAX_ATTEMPTS, reason
+                    );
+                    return;
+                }
+                Err(e) => {
+                    warn!(
+                        "Display recovery: attempt {}/{} failed after {}: {}",
+                        attempt, MAX_ATTEMPTS, reason, e
+                    );
+                }
+            }
+
+            if attempt < MAX_ATTEMPTS {
+                tokio::time::sleep(std::time::Duration::from_secs(DELAY_SECS)).await;
+            }
+        }
+
+        if let Err(e) = super::notifications::send_notification(
+            "Display Recovery Failed",
+            "Zenbook Duo daemon could not restore the desired display layout after repeated retries.",
+            "video-display",
+            6000,
+        )
+        .await
+        {
+            warn!("Display recovery: failed to send desktop notification: {e}");
+        }
+    }));
+}
+
+fn cancel_display_recovery_task(
+    recovery_task: &mut Option<tokio::task::JoinHandle<()>>,
+    reason: &str,
+) {
+    if let Some(task) = recovery_task.take() {
+        if !task.is_finished() {
+            info!("Display recovery: cancelling in-flight recovery after {}", reason);
+            task.abort();
+        }
     }
 }
 
@@ -1363,20 +1641,31 @@ pub async fn run(
     };
     let mut availability_rx = availability_tx.subscribe();
     let mut availability_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut recovery_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut keyboard_attached = false;
+    let keyboard_attached_state = Arc::new(tokio::sync::RwLock::new(false));
     let mut keyboard_state_initialized = false;
 
     // Do not apply any desired_primary at startup from the local default.
-    // Root daemon is the authority and will immediately send the real desired_primary
-    // over the daemon socket; acting before that causes visible primary-display flips.
+    // Root daemon is the authority and will publish the real desired_primary
+    // over D-Bus; acting before that causes visible primary-display flips.
 
     loop {
         tokio::select! {
             msg = orient_rx.recv() => match msg {
                 Ok(orientation) => {
+                    cancel_display_recovery_task(&mut recovery_task, "orientation update");
                     desired_transform = orientation_to_transform(&orientation);
                     if let Err(e) = apply_rotation(&display, &orientation).await {
                         warn!("Rotation failed for '{orientation}': {e}");
+                        ensure_display_recovery_task(
+                            &mut recovery_task,
+                            &conn,
+                            &desired_primary,
+                            &desired_secondary,
+                            &keyboard_attached_state,
+                            "rotation failure",
+                        );
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => warn!("Display handler lagged by {n}"),
@@ -1384,6 +1673,7 @@ pub async fn run(
             },
             msg = desired_secondary_rx.recv() => match msg {
                 Ok(enable) => {
+                    cancel_display_recovery_task(&mut recovery_task, "desired secondary update");
                     info!("Display: desired_secondary update received enable={enable}");
                     let start = std::time::Instant::now();
                     let current_state = display.get_current_state().await.ok();
@@ -1411,12 +1701,22 @@ pub async fn run(
 
                     if let Err(e) = result {
                         warn!("Desired secondary application failed: {e}");
+                        ensure_display_recovery_task(
+                            &mut recovery_task,
+                            &conn,
+                            &desired_primary,
+                            &desired_secondary,
+                            &keyboard_attached_state,
+                            "desired secondary failure",
+                        );
                     } else {
                         let desired = desired_primary.read().await.clone();
                         let desired_secondary_enabled = *desired_secondary.read().await;
-                        let should_wait_for_edp2 = desired == "eDP-2" && desired_secondary_enabled;
+                        let should_wait_for_edp2 =
+                            desired == "eDP-2"
+                                && effective_secondary_enabled(desired_secondary_enabled, keyboard_attached);
                         if enable && should_wait_for_edp2 {
-                            match apply_desired_primary_if_possible(&display, &desired, desired_transform).await {
+                            match apply_desired_primary_if_possible(&display, &desired, desired_transform, true).await {
                                 Ok(true) => stop_availability_monitor(&mut availability_task),
                                 Ok(false) => update_availability_monitor_for_edp2(
                                     &mut availability_task,
@@ -1454,8 +1754,10 @@ pub async fn run(
             },
             msg = kb_rx.recv() => match msg {
                 Ok(attached) => {
+                    cancel_display_recovery_task(&mut recovery_task, "keyboard attach state update");
                     let previous_keyboard_attached = keyboard_attached;
                     keyboard_attached = attached;
+                    *keyboard_attached_state.write().await = attached;
                     info!("Display: keyboard_attached={attached}");
                     if !keyboard_state_initialized {
                         keyboard_state_initialized = true;
@@ -1479,10 +1781,20 @@ pub async fn run(
                         desired_transform,
                     ).await {
                         warn!("Handle keyboard attached failed: {e}");
+                        ensure_display_recovery_task(
+                            &mut recovery_task,
+                            &conn,
+                            &desired_primary,
+                            &desired_secondary,
+                            &keyboard_attached_state,
+                            "keyboard attach or detach failure",
+                        );
                     } else {
                         let desired = desired_primary.read().await.clone();
                         let desired_secondary_enabled = *desired_secondary.read().await;
-                        let should_wait_for_edp2 = desired == "eDP-2" && desired_secondary_enabled;
+                        let should_wait_for_edp2 =
+                            desired == "eDP-2"
+                                && effective_secondary_enabled(desired_secondary_enabled, keyboard_attached);
                         update_availability_monitor_for_edp2(
                             &mut availability_task,
                             &conn,
@@ -1500,18 +1812,52 @@ pub async fn run(
             },
             msg = desired_primary_rx.recv() => match msg {
                 Ok(desired) => {
+                    cancel_display_recovery_task(&mut recovery_task, "desired primary update");
                     info!("Display: desired_primary update received: {}", desired);
-                    let desired_secondary_enabled = *desired_secondary.read().await;
-                    if !desired_secondary_enabled {
+                    if keyboard_attached {
                         stop_availability_monitor(&mut availability_task);
-                        debug!("DesiredPrimary update deferred because secondary display is disabled");
+                        debug!(
+                            "DesiredPrimary update for {} deferred because keyboard is attached; keeping eDP-1 primary",
+                            desired
+                        );
                         continue;
                     }
-                    match apply_desired_primary_if_possible(&display, &desired, desired_transform).await {
+                    let desired_secondary_enabled = *desired_secondary.read().await;
+                    let current_secondary_present = display
+                        .get_current_state()
+                        .await
+                        .ok()
+                        .map(|(_, _, logical, _)| read_current_config(&logical).0.contains_key("eDP-2"))
+                        .unwrap_or(false);
+                    let effective_secondary = if keyboard_state_initialized {
+                        effective_secondary_enabled(desired_secondary_enabled, keyboard_attached)
+                    } else {
+                        desired_secondary_enabled && current_secondary_present
+                    };
+                    if !effective_secondary {
+                        stop_availability_monitor(&mut availability_task);
+                        if desired == "eDP-1" {
+                            debug!("DesiredPrimary: applying single-display eDP-1 layout while secondary is inactive");
+                        } else {
+                            debug!(
+                                "DesiredPrimary update for {} deferred because secondary display is inactive; keeping eDP-1 primary",
+                                desired
+                            );
+                        }
+                    }
+                    let effective_primary = if effective_secondary { desired.as_str() } else { "eDP-1" };
+                    match apply_desired_primary_if_possible(
+                        &display,
+                        effective_primary,
+                        desired_transform,
+                        effective_secondary,
+                    )
+                    .await
+                    {
                         Ok(true) => {
                             stop_availability_monitor(&mut availability_task);
                         }
-                        Ok(false) if desired == "eDP-2" => {
+                        Ok(false) if effective_secondary && desired == "eDP-2" => {
                             ensure_availability_monitor(
                                 &mut availability_task,
                                 &conn,
@@ -1522,9 +1868,25 @@ pub async fn run(
                         Ok(false) => {
                             stop_availability_monitor(&mut availability_task);
                             warn!("DesiredPrimary: {} could not be applied immediately", desired);
+                            ensure_display_recovery_task(
+                                &mut recovery_task,
+                                &conn,
+                                &desired_primary,
+                                &desired_secondary,
+                                &keyboard_attached_state,
+                                "desired primary mismatch",
+                            );
                         }
                         Err(e) => {
                             warn!("DesiredPrimary update failed for {}: {e}", desired);
+                            ensure_display_recovery_task(
+                                &mut recovery_task,
+                                &conn,
+                                &desired_primary,
+                                &desired_secondary,
+                                &keyboard_attached_state,
+                                "desired primary failure",
+                            );
                         }
                     }
                 }
@@ -1533,16 +1895,38 @@ pub async fn run(
             },
             msg = availability_rx.recv() => match msg {
                 Ok(_) => {
-                    if !*desired_secondary.read().await {
+                    cancel_display_recovery_task(&mut recovery_task, "display availability update");
+                    let desired_secondary_enabled = *desired_secondary.read().await;
+                    if !effective_secondary_enabled(desired_secondary_enabled, keyboard_attached) {
                         stop_availability_monitor(&mut availability_task);
                         debug!("Availability check skipped because secondary display is disabled");
                         continue;
                     }
                     let desired = desired_primary.read().await.clone();
-                    match apply_desired_primary_if_possible(&display, &desired, desired_transform).await {
+                    match apply_desired_primary_if_possible(&display, &desired, desired_transform, true).await {
                         Ok(true) => stop_availability_monitor(&mut availability_task),
-                        Ok(false) => debug!("Availability check: {} still not ready", desired),
-                        Err(e) => warn!("Failed to restore desired_primary {}: {}", desired, e),
+                        Ok(false) => {
+                            debug!("Availability check: {} still not ready", desired);
+                            ensure_display_recovery_task(
+                                &mut recovery_task,
+                                &conn,
+                                &desired_primary,
+                                &desired_secondary,
+                                &keyboard_attached_state,
+                                "availability mismatch",
+                            );
+                        }
+                        Err(e) => {
+                            warn!("Failed to restore desired_primary {}: {}", desired, e);
+                            ensure_display_recovery_task(
+                                &mut recovery_task,
+                                &conn,
+                                &desired_primary,
+                                &desired_secondary,
+                                &keyboard_attached_state,
+                                "availability restore failure",
+                            );
+                        }
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {} // Ignore lag on availability checks

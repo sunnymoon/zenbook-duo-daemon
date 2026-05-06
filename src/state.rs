@@ -13,6 +13,8 @@ const DISPLAY_STATE_FILE: &str = "/var/lib/zenbook-duo-daemon/display-state";
 struct PersistedDisplayState {
     desired_primary: Option<String>,
     desired_secondary_enabled: Option<bool>,
+    display_brightness: Option<u32>,
+    ambient_light_enabled: Option<bool>,
 }
 
 fn persist_backlight(state: KeyboardBacklightState) {
@@ -79,6 +81,26 @@ fn load_desired_secondary() -> Option<bool> {
     load_display_state().desired_secondary_enabled
 }
 
+fn persist_display_brightness(brightness: u32) {
+    let mut state = load_display_state();
+    state.display_brightness = Some(brightness);
+    persist_display_state(&state);
+}
+
+fn load_display_brightness() -> Option<u32> {
+    load_display_state().display_brightness
+}
+
+fn persist_ambient_light_enabled(enabled: bool) {
+    let mut state = load_display_state();
+    state.ambient_light_enabled = Some(enabled);
+    persist_display_state(&state);
+}
+
+fn load_ambient_light_enabled() -> Option<bool> {
+    load_display_state().ambient_light_enabled
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum KeyboardBacklightState {
     Off,
@@ -111,6 +133,7 @@ struct InnerState {
     is_usb_attached: bool,
     desired_secondary_display_enabled: bool,
     is_secondary_display_enabled: bool,
+    ambient_light_enabled: bool,
 }
 
 /// Shared state manager that maintains keyboard state across attach/detach cycles
@@ -124,11 +147,16 @@ impl KeyboardStateManager {
     pub fn new(is_usb_attached: bool, sender: broadcast::Sender<Event>) -> Self {
         let desired_secondary_display_enabled =
             load_desired_secondary().unwrap_or(!is_usb_attached);
+        let ambient_light_enabled = load_ambient_light_enabled().unwrap_or(false);
         let is_secondary_display_enabled = if is_usb_attached {
             false
         } else {
             desired_secondary_display_enabled
         };
+
+        if load_ambient_light_enabled().is_none() {
+            persist_ambient_light_enabled(ambient_light_enabled);
+        }
 
         Self {
             state: Arc::new(RwLock::new(InnerState {
@@ -139,6 +167,7 @@ impl KeyboardStateManager {
                 is_usb_attached,
                 desired_secondary_display_enabled,
                 is_secondary_display_enabled,
+                ambient_light_enabled,
             })),
             sender,
         }
@@ -310,5 +339,24 @@ impl KeyboardStateManager {
 
     pub fn get_desired_primary(&self) -> Option<String> {
         load_desired_primary()
+    }
+
+    pub fn set_display_brightness_value(&self, brightness: u32) {
+        persist_display_brightness(brightness);
+    }
+
+    pub fn get_display_brightness_value(&self) -> Option<u32> {
+        load_display_brightness()
+    }
+
+    pub fn set_ambient_light_enabled(&self, enabled: bool) {
+        let mut state = self.state.write().unwrap();
+        state.ambient_light_enabled = enabled;
+        persist_ambient_light_enabled(enabled);
+    }
+
+    pub fn get_ambient_light_enabled(&self) -> bool {
+        let state = self.state.read().unwrap();
+        state.ambient_light_enabled
     }
 }

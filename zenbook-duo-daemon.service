@@ -1,6 +1,6 @@
 [Unit]
 Description=Zenbook Duo Daemon
-After=sysinit.target
+After=sysinit.target dbus.service
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
@@ -16,4 +16,3 @@ StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
-

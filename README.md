@@ -1,79 +1,170 @@
 # ASUS Zenbook Duo Daemon
 
-This is a daemon that runs on the Zenbook Duo laptop to handle the keyboard and secondary display under linux.
+Daemon and session companion for ASUS Zenbook Duo laptops on Linux.
+
+It handles the detachable keyboard in both USB-attached and Bluetooth-detached modes, manages the secondary display policy, and integrates with GNOME for display/orientation behavior.
 
 AI Generated Wiki: [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/PegasisForever/zenbook-duo-daemon)
 
-## Device Support
+## Supported hardware
 
-- ✅ Zenbook Duo 2025 (UX8406CA)
-- ✅ Zenbook Duo 2024 (UX8406MA)
+- ✅ Zenbook Duo 2025 (`UX8406CA`)
+- ✅ Zenbook Duo 2024 (`UX8406MA`)
 
-## Distribution Support
+## Tested distributions
 
-- ✅ Ubuntu 25.10 6.17.0-8-generic
-- ✅ Fedora 42 6.17.13-200.fc42.x86_64
+- ✅ Fedora 42
+- ✅ Ubuntu 25.10
 - ⚠️ NixOS: see this [fork](https://github.com/0Tick/zenbook-duo-daemon/tree/copilot/convert-to-nix-flake)
-- ⚠️ Other distributions may work, but are not tested
+- ⚠️ Other distributions may work but are not regularly tested
 
-## Features
+## Current architecture
 
-- ✅ Enable secondary display when keyboard is detached
-- ✅ Disable keyboard backlight when idle
-- ✅ Brightness sync between primary and secondary display
-- ✅ Remap keys to run custom commands or key combinations
+The project currently installs multiple components:
 
-| Keyboard Function               | Wired Mode | Bluetooth Mode | Default Mapping              | Remappable via config file? |
-| ------------------------------- | ---------- | -------------- | ---------------------------- | --------------------------- |
-| Mute Key                        | ✅         | ✅             | `KEY_MUTE`                   | ❌                          |
-| Volume Down Key                 | ✅         | ✅             | `KEY_VOLUMEDOWN`             | ❌                          |
-| Volume Up Key                   | ✅         | ✅             | `KEY_VOLUMEUP`               | ❌                          |
-| Keyboard Backlight Key          | ✅         | ✅             | `KEY_BACKLIGHT`              | ✅                          |
-| Keyboard Backlight Control      | ✅         | ❌ (1)         | N/A                          | ✅                          |
-| Brightness Down Key             | ✅         | ✅             | `KEY_BRIGHTNESSDOWN`         | ✅                          |
-| Brightness Up Key               | ✅         | ✅             | `KEY_BRIGHTNESSUP`           | ✅                          |
-| Extended Display Mode Key       | ✅         | ✅             | `KEY_LEFT_META + KEY_P`      | ❌                          |
-| Swap Up Down Display Key        | ✅         | ✅             | None                         | ✅                          |
-| Microphone Mute Key             | ✅         | ✅             | `KEY_MICMUTE`                | ✅                          |
-| Microphone Mute Key LED Control | ✅         | ❌ (2)         | N/A                          | ✅                          |
-| Emoji Picker Key                | ✅         | ✅             | `KEY_LEFTCTRL + KEY_DOT` (3) | ✅                          |
-| MyASUS Key                      | ✅         | ✅             | None                         | ✅                          |
-| Toggle Secondary Display Key    | ✅         | ✅             | Toggle Secondary Display     | ✅                          |
-| Fn + Function Keys              | ✅         | ✅             | F1 - F12                     | ❌                          |
+- **Root daemon** (`zenbook-duo-daemon.service`)
+  - handles USB keyboard access
+  - handles Bluetooth keyboard vendor GATT control
+  - exposes authoritative state on the system D-Bus
+  - manages keyboard backlight, mic-mute LED, pipe commands, and secondary-display sysfs fallback
+- **Session daemon** (`zenbook-duo-session.service`)
+  - runs inside the graphical user session
+  - applies display/orientation changes through GNOME/Mutter
+  - monitors GNOME ambient light setting
+  - acknowledges root requests over D-Bus
+- **Sleep hook services**
+  - `zenbook-duo-daemon-pre-sleep.service`
+  - `zenbook-duo-daemon-post-sleep.service`
+  - send suspend lifecycle events to the daemon through the control pipe
 
-1. Should be possible, the packet capture file under windows is at `pcap/bt_change_backlight.pcapng`
-2. Should be possible, the packet capture file under windows is at `pcap/bt_micmute_led.pcapng`
-3. This key combination only works for GTK apps in GNOME.
+## What currently works
+
+- ✅ USB-attached keyboard handling
+- ✅ Bluetooth-detached keyboard handling
+- ✅ Fn-lock state restore in USB and Bluetooth mode
+- ✅ Keyboard backlight control in USB and Bluetooth mode
+- ✅ Microphone-mute LED control in USB and Bluetooth mode
+- ✅ Secondary display policy based on keyboard attachment
+- ✅ Secondary display brightness mirroring from the primary display
+- ✅ Display orientation integration through the session daemon
+- ✅ Native libinput disable-while-typing (DWT) in **USB mode**
+- ✅ Native libinput disable-while-typing (DWT) in **Bluetooth mode**
+- ✅ Configurable remapping of the proprietary special keys exposed by the Zenbook keyboard
+- ✅ Persistence of keyboard/display/ambient-related daemon state
+
+## Current known limitations
+
+- ⚠️ The project currently targets **GNOME** as the supported desktop environment for session-side display behavior
+- ⚠️ Display recovery/startup edge cases are improved but still an active area of refinement
+- ⚠️ The daemon only remaps the **Zenbook-specific special keys** that require vendor handling; standard keys that already arrive as normal evdev keys are not remapped by the daemon
+
+## Keyboard function support
+
+| Keyboard Function               | Wired Mode | Bluetooth Mode | Default Mapping              | Remappable via config |
+| ------------------------------- | ---------- | -------------- | ---------------------------- | --------------------- |
+| Mute Key                        | ✅         | ✅             | Native standard key          | ❌                    |
+| Volume Down Key                 | ✅         | ✅             | Native standard key          | ❌                    |
+| Volume Up Key                   | ✅         | ✅             | Native standard key          | ❌                    |
+| Keyboard Backlight Key          | ✅         | ✅             | Toggle keyboard backlight    | ✅                    |
+| Keyboard Backlight Control      | ✅         | ✅             | Device state restore/control | ✅                    |
+| Brightness Down Key             | ✅         | ✅             | `KEY_BRIGHTNESSDOWN`         | ✅                    |
+| Brightness Up Key               | ✅         | ✅             | `KEY_BRIGHTNESSUP`           | ✅                    |
+| Swap Up/Down Display Key        | ✅         | ✅             | Swap primary display         | ✅                    |
+| Microphone Mute Key             | ✅         | ✅             | `KEY_MICMUTE`                | ✅                    |
+| Microphone Mute LED Control     | ✅         | ✅             | Device state restore/control | ✅                    |
+| Emoji Picker Key                | ✅         | ✅             | `KEY_LEFTCTRL + KEY_DOT`     | ✅                    |
+| MyASUS Key                      | ✅         | ✅             | No-op by default             | ✅                    |
+| Toggle Secondary Display Key    | ✅         | ✅             | Toggle secondary display     | ✅                    |
+| Fn + Function Keys              | ✅         | ✅             | Controlled by fn-lock state  | ❌                    |
+
+## libinput quirks
+
+Native DWT now depends on a small set of Zenbook-specific libinput quirks:
+
+- USB keyboard marked as `AttrKeyboardIntegration=internal`
+- Bluetooth keyboard marked as `AttrKeyboardIntegration=internal`
+- Bluetooth touchpad marked as `AttrTPKComboLayout=below`
+
+These quirks live in the repository as:
+
+- `local-overrides.quirks`
+
+The install script **merges only the missing Zenbook sections** into:
+
+- `/etc/libinput/local-overrides.quirks`
+
+It does **not** replace unrelated user quirks already present in that file.
 
 ## Installation
 
+### Install from a local checkout
+
 ```bash
-# Upgrade or install the latest release from GitHub
-curl -fsSL https://raw.githubusercontent.com/PegasisForever/zenbook-duo-daemon/refs/heads/master/install.sh | sudo bash -s install
-
-# Uninstall
-curl -fsSL https://raw.githubusercontent.com/PegasisForever/zenbook-duo-daemon/refs/heads/master/install.sh | sudo bash -s uninstall
-
-# Check logs
-systemctl status zenbook-duo-daemon
+cargo build --release
+sudo ./install local-install target/release/zenbook-duo-daemon
 ```
 
-The install script will:
+### Install from the latest release
 
-1. Download the latest release from GitHub and install it to `/opt/zenbook-duo-daemon`.
-2. Create a systemd service file in `/etc/systemd/system/zenbook-duo-daemon.service`
-3. Create a backup of the old config file if it is not compatible with the new config file.
-4. Enable and start the service
+```bash
+curl -fsSL https://raw.githubusercontent.com/PegasisForever/zenbook-duo-daemon/refs/heads/master/install | sudo bash -s install
+```
+
+### Uninstall
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/PegasisForever/zenbook-duo-daemon/refs/heads/master/install | sudo bash -s uninstall
+```
+
+### Useful status commands
+
+```bash
+systemctl status zenbook-duo-daemon.service
+systemctl --user status zenbook-duo-session.service
+```
+
+## What the install script does
+
+The install script currently:
+
+1. installs the daemon binary into `/opt/zenbook-duo-daemon`
+2. installs the root service, session service, and sleep hook services
+3. installs the D-Bus policy file into `/etc/dbus-1/system.d/zenbook-duo-daemon-dbus.conf`
+4. reloads D-Bus if possible
+5. merges the Zenbook libinput quirks into `/etc/libinput/local-overrides.quirks`
+6. runs config migration if needed
+7. enables the root service, the sleep hook services, and the user session service
+8. restarts the session service for active logged-in users when possible
+
+### D-Bus policy note
+
+The D-Bus policy is installed as its **own file**:
+
+- `/etc/dbus-1/system.d/zenbook-duo-daemon-dbus.conf`
+
+It is **copied into place**, not XML-merged into another file. That is the correct model for D-Bus policy deployment here.
 
 ## Configuration
 
-By default, the config file is located at `/etc/zenbook-duo-daemon/config.toml`. You can edit the fn lock, idle timeout, key mappings and keyboard VID:PID in the config file. The instructions are provided in the config file.
+The config file lives at:
 
-## Control Pipe
+- `/etc/zenbook-duo-daemon/config.toml`
 
-The daemon creates a named pipe for receiving commands at `/tmp/zenbook-duo-daemon.pipe` by default (configurable via `pipe_path` in the config file). The pipe is accessible by all users.
+You can configure:
 
-Send commands using echo example:
+- fn-lock default
+- idle timeout
+- special-key remappings
+- keyboard USB VID:PID if needed
+- brightness/status/pipe paths
+
+## Control pipe
+
+The daemon creates a named pipe at:
+
+- `/tmp/zenbook-duo-daemon.pipe`
+
+Example:
 
 ```bash
 echo mic_mute_led_toggle > /tmp/zenbook-duo-daemon.pipe
@@ -81,26 +172,30 @@ echo mic_mute_led_toggle > /tmp/zenbook-duo-daemon.pipe
 
 Available commands:
 
-| Command                    | Description                               |
-| -------------------------- | ----------------------------------------- |
-| `mic_mute_led_toggle`      | Toggle microphone mute LED                |
-| `mic_mute_led_on`          | Turn on microphone mute LED               |
-| `mic_mute_led_off`         | Turn off microphone mute LED              |
-| `backlight_toggle`         | Cycle keyboard backlight                  |
-| `backlight_off`            | Turn off keyboard backlight               |
-| `backlight_low`            | Set keyboard backlight to low             |
-| `backlight_medium`         | Set keyboard backlight to medium          |
-| `backlight_high`           | Set keyboard backlight to high            |
-| `secondary_display_toggle` | Toggle secondary display                  |
-| `secondary_display_on`     | Turn on secondary display                 |
-| `secondary_display_off`    | Turn off secondary display                |
-| `suspend_start`            | Signal suspend start (disables backlight) |
-| `suspend_end`              | Signal suspend end (restores backlight)   |
+| Command                    | Description |
+| -------------------------- | ----------- |
+| `mic_mute_led_toggle`      | Toggle microphone mute LED |
+| `mic_mute_led_on`          | Turn on microphone mute LED |
+| `mic_mute_led_off`         | Turn off microphone mute LED |
+| `backlight_toggle`         | Cycle keyboard backlight |
+| `backlight_off`            | Set keyboard backlight off |
+| `backlight_low`            | Set keyboard backlight low |
+| `backlight_medium`         | Set keyboard backlight medium |
+| `backlight_high`           | Set keyboard backlight high |
+| `secondary_display_toggle` | Toggle the secondary display desired state |
+| `secondary_display_on`     | Enable the secondary display desired state |
+| `secondary_display_off`    | Disable the secondary display desired state |
+| `suspend_start`            | Notify the daemon that suspend is starting |
+| `suspend_end`              | Notify the daemon that suspend has ended |
 
-Notes:
+## Why the sleep hook services still exist
 
-1. The `suspend_start` and `suspend_end` commands are sent automatically by the systemd services `zenbook-duo-daemon-pre-sleep` and `zenbook-duo-daemon-post-sleep` to disable keyboard backlight during suspend.
-2. The secondary display commands are no-op when the keyboard is attached.
+Yes, they are still needed.
+
+- **Pre-sleep** is used to put the daemon into suspended state before the machine sleeps
+- **Post-sleep** restores state after resume and also triggers a **keyboard attachment rescan**, which is needed if the keyboard was attached or detached while the machine was asleep
+
+So those services are not obsolete.
 
 ## Development
 
@@ -112,18 +207,13 @@ sudo apt install build-essential libevdev-dev libdbus-1-dev pkg-config autoconf
 
 ### Build
 
-This is a standard Rust project, you can run the project with:
-
 ```bash
-# Stop the systemctl service to prevent two instances running
-sudo systemctl stop zenbook-duo-daemon
-
-cargo run
+cargo build
 ```
 
-Or you can build and install the binary to your system with:
+### Local install for testing
 
 ```bash
-cargo build --release
-sudo ./install.sh local-install target/release/zenbook-duo-daemon
+cargo build
+sudo ./install local-install target/debug/zenbook-duo-daemon
 ```

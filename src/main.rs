@@ -1,8 +1,6 @@
 use std::panic;
 use std::time::Duration;
 use std::{path::PathBuf, process, sync::Arc};
-use std::sync::OnceLock;
-
 use tokio::fs;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{Mutex, broadcast};
@@ -41,9 +39,8 @@ enum Args {
 }
 
 mod config;
-mod daemon_socket;
-mod dwt;
-mod events;
+mod dbus_state;
+ mod events;
 mod idle_detection;
 mod keyboard_bt;
 mod keyboard_usb;
@@ -53,10 +50,6 @@ mod session;
 mod state;
 mod unix_pipe;
 mod virtual_keyboard;
-
-// Global daemon-message broadcast sender - initialized in run_daemon and used by config.rs
-static STATE_BROADCAST: OnceLock<Mutex<Option<broadcast::Sender<daemon_socket::DaemonMsg>>>> = OnceLock::new();
-static ACK_BROADCAST: OnceLock<Mutex<Option<broadcast::Sender<String>>>> = OnceLock::new();
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -118,14 +111,6 @@ async fn run_daemon(config_path: PathBuf) {
     // Create event channel
     let (event_sender, _) = broadcast::channel::<Event>(64);
     
-    // Create state update broadcast channel (for desired_primary changes)
-    let (state_update_tx, _) = broadcast::channel::<daemon_socket::DaemonMsg>(16);
-    let (ack_tx, _) = broadcast::channel::<String>(16);
-    
-    // Store the broadcast sender globally so config.rs can access it
-    let _ = STATE_BROADCAST.get_or_init(|| Mutex::new(Some(state_update_tx.clone())));
-    let _ = ACK_BROADCAST.get_or_init(|| Mutex::new(Some(ack_tx.clone())));
-
     // Create virtual keyboard
     let virtual_keyboard = Arc::new(Mutex::new(VirtualKeyboard::new(&config)));
 
@@ -151,20 +136,17 @@ async fn run_daemon(config_path: PathBuf) {
             (state_manager, activity_notifier, None)
         };
 
-    // Start bidirectional daemon socket server (root daemon listens for session daemon connections)
-    let state_mgr = state_manager.clone();
-    let update_tx = state_update_tx.clone();
-    let ack_tx_clone = ack_tx.clone();
-    tokio::spawn(async move {
-        daemon_socket::start_server(&state_mgr, update_tx, ack_tx_clone).await;
-    });
-
     start_secondary_display_task(
         config.clone(),
         state_manager.clone(),
         event_sender.subscribe(),
     )
     .await;
+
+    if let Err(e) = dbus_state::start_root_service(state_manager.clone()).await {
+        error!("Failed to start root D-Bus service: {e}");
+        process::exit(1);
+    }
 
     start_bt_keyboard_monitor_task(
         &config,
@@ -174,8 +156,6 @@ async fn run_daemon(config_path: PathBuf) {
         activity_notifier.clone(),
     );
 
-    // Software disable-while-typing for BT mode (needs root to grab /dev/input).
-    let initial_usb_attached = current_usb_keyboard.is_some();
     start_usb_keyboard_monitor_task(
         &config,
         current_usb_keyboard,
@@ -189,10 +169,8 @@ async fn run_daemon(config_path: PathBuf) {
 
     start_receive_commands_task(&config, state_manager.clone(), activity_notifier.clone(), event_sender.clone());
 
-    dwt::start_task(initial_usb_attached, event_sender.clone());
-
-    // Forward keyboard attachment state changes to the session daemon
-    // Try to let session daemon handle it gracefully first, fall back to sysfs if needed
+    // Forward keyboard attachment state changes over D-Bus.
+    // If no session is registered, or if it does not acknowledge in time, fall back to sysfs.
     {
         let mut event_rx = event_sender.subscribe();
         let state_manager_clone = state_manager.clone();
@@ -201,49 +179,30 @@ async fn run_daemon(config_path: PathBuf) {
                 match event_rx.recv().await {
                     Ok(Event::KeyboardAttached(attached)) => {
                         info!("KeyboardAttached event: {}", attached);
-
-                        let state_tx = if let Some(mutex) = STATE_BROADCAST.get() {
-                            mutex.lock().await.clone()
-                        } else {
-                            None
-                        };
-                        let ack_tx = if let Some(mutex) = ACK_BROADCAST.get() {
-                            mutex.lock().await.clone()
-                        } else {
-                            None
+                        secondary_display::pause_brightness_sync_for(Duration::from_secs(4));
+                        let session_registered = match dbus_state::notify_keyboard_attached_changed().await {
+                            Ok(registered) => registered,
+                            Err(e) => {
+                                warn!("KeyboardAttached: failed to publish D-Bus state update: {e}");
+                                false
+                            }
                         };
 
-                        if let (Some(state_tx), Some(ack_tx)) = (state_tx, ack_tx) {
-                            let expected_ack = format!("keyboard_attached_received:{attached}");
-                            let mut ack_rx = ack_tx.subscribe();
-
-                            if let Err(e) = state_tx.send(daemon_socket::DaemonMsg::KeyboardAttached { value: attached }) {
-                                warn!("KeyboardAttached: failed to notify session daemon over daemon socket: {}", e);
+                        if session_registered {
+                            let acked = dbus_state::wait_for_keyboard_attached_ack(
+                                attached,
+                                Duration::from_secs(5),
+                            )
+                            .await;
+                            if acked {
+                                info!("KeyboardAttached: session daemon acknowledged request");
+                            } else {
+                                warn!("KeyboardAttached: no session daemon ack, falling back to sysfs");
                                 secondary_display::arm_sysfs_fallback_once();
                                 state_manager_clone.emit_secondary_display_state();
-                            } else {
-                                let acked = tokio::time::timeout(Duration::from_secs(5), async {
-                                    loop {
-                                        match ack_rx.recv().await {
-                                            Ok(msg) if msg == expected_ack => break true,
-                                            Ok(_) => continue,
-                                            Err(_) => break false,
-                                        }
-                                    }
-                                })
-                                .await
-                                .unwrap_or(false);
-
-                                if acked {
-                                    info!("KeyboardAttached: session daemon acknowledged request");
-                                } else {
-                                    warn!("KeyboardAttached: no session daemon ack, falling back to sysfs");
-                                    secondary_display::arm_sysfs_fallback_once();
-                                    state_manager_clone.emit_secondary_display_state();
-                                }
                             }
                         } else {
-                            warn!("KeyboardAttached: daemon socket channels not initialized");
+                            warn!("KeyboardAttached: no registered session daemon, falling back to sysfs");
                             secondary_display::arm_sysfs_fallback_once();
                             state_manager_clone.emit_secondary_display_state();
                         }

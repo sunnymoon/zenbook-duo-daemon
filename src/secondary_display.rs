@@ -16,12 +16,22 @@ use crate::state::KeyboardStateManager;
 const ENFORCER_COOLDOWN_SECS: u64 = 8;
 static FORCE_SYSFS_FALLBACK_ONCE: AtomicBool = AtomicBool::new(false);
 static SECONDARY_STATUS_PATH: OnceLock<String> = OnceLock::new();
+static BRIGHTNESS_SYNC_PAUSED_UNTIL: AtomicU64 = AtomicU64::new(0);
 
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn brightness_sync_paused() -> bool {
+    now_secs() < BRIGHTNESS_SYNC_PAUSED_UNTIL.load(Ordering::Relaxed)
+}
+
+pub fn pause_brightness_sync_for(duration: Duration) {
+    let until = now_secs().saturating_add(duration.as_secs().max(1));
+    BRIGHTNESS_SYNC_PAUSED_UNTIL.store(until, Ordering::Relaxed);
 }
 
 async fn control_secondary_display(status_path: &str, enable: bool, last_change: &Arc<AtomicU64>) {
@@ -142,6 +152,10 @@ fn sync_secondary_brightness_once(
     status_path: &str,
     state_manager: &KeyboardStateManager,
 ) {
+    if brightness_sync_paused() {
+        return;
+    }
+
     if !state_manager.is_secondary_display_desired_enabled() {
         return;
     }
@@ -154,8 +168,28 @@ fn sync_secondary_brightness_once(
         return;
     };
 
+    if let Ok(value) = brightness.trim().parse::<u32>() {
+        state_manager.set_display_brightness_value(value);
+    }
+
     if let Err(e) = std::fs::write(target_path, brightness.trim()) {
         warn!("Failed to sync secondary display brightness: {}", e);
+    }
+}
+
+fn apply_persisted_display_brightness(
+    primary_path: &str,
+    secondary_path: &str,
+    state_manager: &KeyboardStateManager,
+) {
+    let Some(brightness) = state_manager.get_display_brightness_value() else {
+        return;
+    };
+
+    for path in [primary_path, secondary_path] {
+        if let Err(e) = std::fs::write(path, brightness.to_string()) {
+            warn!("Failed to restore persisted display brightness on {}: {}", path, e);
+        }
     }
 }
 
@@ -229,6 +263,11 @@ pub async fn start_secondary_display_task(
     let last_change = Arc::new(AtomicU64::new(0));
 
     control_secondary_display(&status_path, state_manager.is_secondary_display_enabled(), &last_change).await;
+    apply_persisted_display_brightness(
+        &config.primary_backlight_path,
+        &config.secondary_backlight_path,
+        &state_manager,
+    );
 
     // Task to handle events
     {
@@ -239,7 +278,7 @@ pub async fn start_secondary_display_task(
                 match event_receiver.recv().await {
                     Ok(Event::SecondaryDisplay(new_state)) => {
                         let forced_fallback = FORCE_SYSFS_FALLBACK_ONCE.swap(false, Ordering::SeqCst);
-                        if crate::daemon_socket::is_session_connected() && !forced_fallback {
+                        if crate::dbus_state::is_session_registered() && !forced_fallback {
                             warn!(
                                 "Skipping sysfs secondary display change because session daemon is connected; session path owns display state"
                             );
@@ -269,7 +308,7 @@ pub async fn start_secondary_display_task(
             let mut interval = tokio::time::interval(Duration::from_millis(500));
             loop {
                 interval.tick().await;
-                if crate::daemon_socket::is_session_connected() {
+                if crate::dbus_state::is_session_registered() {
                     continue;
                 }
                 if now_secs().saturating_sub(last_change.load(Ordering::Relaxed)) < ENFORCER_COOLDOWN_SECS {

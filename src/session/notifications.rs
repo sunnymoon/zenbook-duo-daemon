@@ -22,6 +22,29 @@ trait Notifications {
     ) -> zbus::Result<u32>;
 }
 
+pub async fn send_notification(
+    summary: &str,
+    body: &str,
+    icon: &str,
+    expire_timeout: i32,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let conn = Connection::session().await?;
+    let notif = NotificationsProxy::new(&conn).await?;
+    let _ = notif
+        .notify(
+            "zenbook-duo-daemon",
+            0,
+            icon,
+            summary,
+            body,
+            vec![],
+            HashMap::new(),
+            expire_timeout,
+        )
+        .await?;
+    Ok(())
+}
+
 pub async fn run(mut kb_rx: broadcast::Receiver<bool>) {
     let conn = match Connection::session().await {
         Ok(c) => c,

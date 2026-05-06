@@ -41,6 +41,7 @@ impl KeyFunction {
                 state_manager.toggle_keyboard_backlight();
             }
             KeyFunction::ToggleSecondaryDisplay(true) => {
+                crate::secondary_display::pause_brightness_sync_for(Duration::from_secs(4));
                 let new_state = !state_manager.is_secondary_display_desired_enabled();
                 info!("KeyFunction: executing ToggleSecondaryDisplay -> {}", new_state);
                 state_manager.set_secondary_display_tracked(new_state);
@@ -55,36 +56,20 @@ impl KeyFunction {
                     }
                 }
 
-                let state_tx = if let Some(mutex) = crate::STATE_BROADCAST.get() {
-                    mutex.lock().await.clone()
-                } else {
-                    None
-                };
-                let ack_tx = if let Some(mutex) = crate::ACK_BROADCAST.get() {
-                    mutex.lock().await.clone()
-                } else {
-                    None
-                };
-
-                if let (Some(state_tx), Some(ack_tx)) = (state_tx, ack_tx) {
-                    let expected_ack = format!("desired_secondary_applied:{new_state}");
-                    let mut ack_rx = ack_tx.subscribe();
-
-                    if let Err(e) = state_tx.send(crate::daemon_socket::DaemonMsg::DesiredSecondaryUpdate { value: new_state }) {
-                        warn!("ToggleSecondaryDisplay: failed to broadcast desired secondary update: {}", e);
+                let session_registered = match crate::dbus_state::notify_desired_secondary_changed().await {
+                    Ok(registered) => registered,
+                    Err(e) => {
+                        warn!("ToggleSecondaryDisplay: failed to publish desired secondary D-Bus update: {}", e);
+                        false
                     }
+                };
 
-                    let acked = tokio::time::timeout(Duration::from_secs(8), async {
-                        loop {
-                            match ack_rx.recv().await {
-                                Ok(msg) if msg == expected_ack => break true,
-                                Ok(_) => continue,
-                                Err(_) => break false,
-                            }
-                        }
-                    })
-                    .await
-                    .unwrap_or(false);
+                if session_registered {
+                    let acked = crate::dbus_state::wait_for_desired_secondary_ack(
+                        new_state,
+                        Duration::from_secs(8),
+                    )
+                    .await;
 
                     if acked {
                         info!("ToggleSecondaryDisplay: session daemon applied desired secondary state");
@@ -100,13 +85,14 @@ impl KeyFunction {
                         state_manager.emit_secondary_display_state();
                     }
                 } else {
-                    warn!("ToggleSecondaryDisplay: daemon socket channels not initialized");
+                    warn!("ToggleSecondaryDisplay: no registered session daemon, falling back to sysfs");
                     crate::secondary_display::arm_sysfs_fallback_once();
                     state_manager.emit_secondary_display_state();
                 }
             }
             KeyFunction::SwapDisplays(true) => {
                 info!("KeyFunction: executing SwapDisplays");
+                crate::secondary_display::pause_brightness_sync_for(Duration::from_secs(4));
                 
                 // Read current desired state to determine what we want
                 let current_desired = state_manager.get_desired_primary();
@@ -121,17 +107,11 @@ impl KeyFunction {
                 info!("User intention: swap to {}", new_desired);
                 
                 // Desired primary is now persisted to state file.
-                // Broadcast the update to daemon socket so session daemon gets notified immediately
-                if let Some(mutex) = crate::STATE_BROADCAST.get() {
-                    if let Some(tx) = mutex.lock().await.as_ref() {
-                        if let Err(e) = tx.send(crate::daemon_socket::DaemonMsg::DesiredPrimaryUpdate {
-                            value: new_desired.to_string(),
-                        }) {
-                            warn!("Failed to broadcast desired_primary update: {}", e);
-                        } else {
-                            info!("Broadcasted desired_primary={} to daemon socket", new_desired);
-                        }
-                    }
+                // Publish the update over D-Bus so the session daemon reacts immediately.
+                if let Err(e) = crate::dbus_state::notify_desired_primary_changed().await {
+                    warn!("Failed to publish desired_primary update over D-Bus: {}", e);
+                } else {
+                    info!("Published desired_primary={} over D-Bus", new_desired);
                 }
             }
             _ => {
