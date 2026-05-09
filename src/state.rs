@@ -131,6 +131,7 @@ struct InnerState {
     /// when idle, only backlight is disabled
     is_idle: bool,
     is_usb_attached: bool,
+    bt_connected_count: usize,
     desired_secondary_display_enabled: bool,
     is_secondary_display_enabled: bool,
     ambient_light_enabled: bool,
@@ -146,7 +147,7 @@ pub struct KeyboardStateManager {
 impl KeyboardStateManager {
     pub fn new(is_usb_attached: bool, sender: broadcast::Sender<Event>) -> Self {
         let desired_secondary_display_enabled =
-            load_desired_secondary().unwrap_or(!is_usb_attached);
+            load_desired_secondary().unwrap_or(true);
         let ambient_light_enabled = load_ambient_light_enabled().unwrap_or(false);
         let is_secondary_display_enabled = if is_usb_attached {
             false
@@ -165,6 +166,7 @@ impl KeyboardStateManager {
                 is_suspended: false,
                 is_idle: false,
                 is_usb_attached,
+                bt_connected_count: 0,
                 desired_secondary_display_enabled,
                 is_secondary_display_enabled,
                 ambient_light_enabled,
@@ -321,6 +323,45 @@ impl KeyboardStateManager {
         state.is_usb_attached
     }
 
+    pub fn bluetooth_connection_started(&self) {
+        let mut state = self.state.write().unwrap();
+        let was_connected = state.bt_connected_count > 0;
+        state.bt_connected_count = state.bt_connected_count.saturating_add(1);
+        let is_connected = state.bt_connected_count > 0;
+        drop(state);
+        if was_connected != is_connected {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    if let Err(e) = crate::dbus_state::notify_bluetooth_connected_changed().await {
+                        log::warn!("Failed to publish bluetooth_connected update over D-Bus: {}", e);
+                    }
+                });
+            }
+        }
+    }
+
+    pub fn bluetooth_connection_stopped(&self) {
+        let mut state = self.state.write().unwrap();
+        let was_connected = state.bt_connected_count > 0;
+        state.bt_connected_count = state.bt_connected_count.saturating_sub(1);
+        let is_connected = state.bt_connected_count > 0;
+        drop(state);
+        if was_connected != is_connected {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    if let Err(e) = crate::dbus_state::notify_bluetooth_connected_changed().await {
+                        log::warn!("Failed to publish bluetooth_connected update over D-Bus: {}", e);
+                    }
+                });
+            }
+        }
+    }
+
+    pub fn is_bluetooth_connected(&self) -> bool {
+        let state = self.state.read().unwrap();
+        state.bt_connected_count > 0
+    }
+
     pub fn is_secondary_display_desired_enabled(&self) -> bool {
         let state = self.state.read().unwrap();
         state.desired_secondary_display_enabled
@@ -342,7 +383,17 @@ impl KeyboardStateManager {
     }
 
     pub fn set_display_brightness_value(&self, brightness: u32) {
+        if load_display_brightness() == Some(brightness) {
+            return;
+        }
         persist_display_brightness(brightness);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(e) = crate::dbus_state::notify_display_brightness_changed().await {
+                    log::warn!("Failed to publish display_brightness update over D-Bus: {}", e);
+                }
+            });
+        }
     }
 
     pub fn get_display_brightness_value(&self) -> Option<u32> {

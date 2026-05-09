@@ -18,6 +18,30 @@ BINARY_PATH="${INSTALL_DIR}/zenbook-duo-daemon"
 GITHUB_REPO="https://github.com/PegasisForever/zenbook-duo-daemon/releases/latest/download"
 QUIRKS_FILE="/etc/libinput/local-overrides.quirks"
 QUIRKS_ASSET_NAME="local-overrides.quirks"
+DAEMON_GROUP="zenbook-duo"
+
+ensure_daemon_group() {
+    if ! getent group "${DAEMON_GROUP}" > /dev/null 2>&1; then
+        echo "Creating group ${DAEMON_GROUP}..."
+        groupadd --system "${DAEMON_GROUP}"
+    fi
+
+    # Add every active loginctl user to the group if not already a member
+    while read -r uid user _; do
+        if [ -n "${user}" ] && ! id -nG "${user}" 2>/dev/null | grep -qw "${DAEMON_GROUP}"; then
+            echo "Adding ${user} to group ${DAEMON_GROUP}..."
+            usermod -aG "${DAEMON_GROUP}" "${user}"
+            echo "Note: ${user} must log out and back in (or reboot) for the group change to take effect."
+        fi
+    done < <(loginctl list-users --no-legend 2>/dev/null || true)
+}
+
+remove_daemon_group() {
+    if getent group "${DAEMON_GROUP}" > /dev/null 2>&1; then
+        echo "Removing group ${DAEMON_GROUP}..."
+        groupdel "${DAEMON_GROUP}" 2>/dev/null || true
+    fi
+}
 
 ensure_quirk_stanza() {
     local target_file="$1"
@@ -299,6 +323,8 @@ uninstall() {
         echo "Removing installation directory..."
         rm -rf "${INSTALL_DIR}"
     fi
+
+    remove_daemon_group
     
     echo "Uninstallation complete."
 }
@@ -315,6 +341,9 @@ install() {
     # Create installation directory
     echo "Creating installation directory..."
     mkdir -p "${INSTALL_DIR}"
+    
+    # Ensure group exists and active users are members
+    ensure_daemon_group
     
     # Download binary
     echo "Downloading binary from ${GITHUB_REPO}/zenbook-duo-daemon..."
@@ -482,6 +511,9 @@ local_install() {
     # Create installation directory
     echo "Creating installation directory..."
     mkdir -p "${INSTALL_DIR}"
+    
+    # Ensure group exists and active users are members
+    ensure_daemon_group
     
     # Copy binary
     echo "Copying binary from ${binary_path}..."

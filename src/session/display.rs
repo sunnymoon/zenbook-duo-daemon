@@ -16,6 +16,7 @@ type LogicalMonitor = (i32, i32, f64, u32, bool, Vec<LmRef>, HashMap<String, Own
 type CurrentState = (u32, Vec<PhysicalMonitor>, Vec<LogicalMonitor>, HashMap<String, OwnedValue>);
 type ApplyMonSpec = (String, String, HashMap<String, OwnedValue>);
 type ApplyLm = (i32, i32, f64, u32, bool, Vec<ApplyMonSpec>);
+type BacklightState = (u32, Vec<HashMap<String, OwnedValue>>);
 
 const DEFAULT_DUO_SCALE: f64 = 5.0 / 3.0;
 
@@ -27,6 +28,7 @@ const DEFAULT_DUO_SCALE: f64 = 5.0 / 3.0;
 )]
 pub trait DisplayConfig {
     fn get_current_state(&self) -> zbus::Result<CurrentState>;
+    fn set_backlight(&self, serial: u32, connector: String, value: i32) -> zbus::Result<()>;
     fn apply_monitors_config(
         &self,
         serial: u32,
@@ -37,13 +39,20 @@ pub trait DisplayConfig {
     
     #[zbus(signal)]
     fn monitors_changed(&self) -> zbus::Result<()>;
+
+    #[zbus(property)]
+    fn backlight(&self) -> zbus::Result<BacklightState>;
 }
 
 // ── Layout helpers ────────────────────────────────────────────────────────────
 
 fn logical_size(pw: i32, ph: i32, scale: f64, transform: u32) -> (i32, i32) {
-    let lw = (pw as f64 / scale).round() as i32;
-    let lh = (ph as f64 / scale).round() as i32;
+    // Use floor() not round(): Mutter validates adjacency using floor division internally.
+    // Using round() can produce a position 1px past the edge, causing "displays not adjacent" errors
+    // at non-integer scales (e.g. scale=5/3: 2880/1.6667 rounds to 1728, floor also gives 1728,
+    // but at other scales they can diverge).
+    let lw = (pw as f64 / scale).floor() as i32;
+    let lh = (ph as f64 / scale).floor() as i32;
     if transform == 1 || transform == 3 { (lh, lw) } else { (lw, lh) }
 }
 
@@ -109,6 +118,32 @@ async fn wait_for_connector_mode(
     }
 
     Ok(None)
+}
+
+pub async fn apply_display_brightness_value(
+    value: u32,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let conn = Connection::session().await?;
+    let display = DisplayConfigProxy::new(&conn).await?;
+    let (serial, entries) = display.backlight().await?;
+
+    for entry in entries {
+        let connector = entry
+            .get("connector")
+            .and_then(|value| String::try_from(value.clone()).ok());
+        let active = entry
+            .get("active")
+            .and_then(|value| bool::try_from(value.clone()).ok())
+            .unwrap_or(false);
+        let Some(connector) = connector else {
+            continue;
+        };
+        if active && matches!(connector.as_str(), "eDP-1" | "eDP-2") {
+            display.set_backlight(serial, connector, value as i32).await?;
+        }
+    }
+
+    Ok(())
 }
 
 /// iio orientation string → Mutter transform u32.
@@ -197,6 +232,8 @@ fn build_duo_lms(
 async fn apply_rotation(
     display: &DisplayConfigProxy<'_>,
     orientation: &str,
+    keyboard_attached: bool,
+    desired_secondary_enabled: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     const MAX_ATTEMPTS: usize = 2;
     let transform = orientation_to_transform(orientation);
@@ -208,25 +245,27 @@ async fn apply_rotation(
         let (serial, physical, logical, _): CurrentState = display.get_current_state().await?;
         let all_modes = extract_all_modes(&physical);
 
+        // Scale always comes from eDP-1 (stable reference, never changes mode on its own).
+        let scale = read_edp1_scale(&logical);
+
         let primary_lm = logical.iter().find(|lm| lm.4);
-        let scale = primary_lm.map(|lm| lm.2).unwrap_or(DEFAULT_DUO_SCALE);
         let primary_connector = primary_lm
             .and_then(|lm| lm.5.first())
             .map(|r| r.0.as_str())
             .unwrap_or("eDP-1");
         let primary_mode = all_modes.get(primary_connector).ok_or("no mode for primary")?;
 
-        // Only include secondary if it's currently active in logical monitors (avoids disabled eDP-2).
-        // Guard: secondary must differ from primary — Mutter can return the primary connector in the
-        // non-primary slot during a mid-rebuild transitional state. Passing primary=X, secondary=X
-        // causes the input mapper to crash (SIGSEGV in mapper_input_info_set_output).
-        let secondary_connector: Option<String> = logical.iter()
-            .find(|lm| !lm.4)
-            .and_then(|lm| lm.5.first())
-            .map(|r| r.0.clone())
-            .filter(|c| c != primary_connector);
-        let secondary = secondary_connector.as_deref()
-            .and_then(|c| all_modes.get(c).map(|m| (c, m)));
+        // Determine secondary from desired state (not current logical).
+        // If GNOME reverted our dual-monitor config between events, current logical state may
+        // show only one display — using desired state prevents permanent loss of eDP-2.
+        let include_secondary = desired_secondary_enabled && !keyboard_attached;
+        let sec_connector_name = if primary_connector == "eDP-1" { "eDP-2" } else { "eDP-1" };
+        let secondary = if include_secondary {
+            all_modes.get(sec_connector_name).map(|m| (sec_connector_name, m))
+        } else {
+            None
+        };
+        let secondary_connector: Option<String> = secondary.map(|(c, _)| c.to_string());
 
         debug!("Rotation: physical monitors available: {:?}", all_modes.keys().collect::<Vec<_>>());
         debug!("Rotation: logical monitors count: {}", logical.len());
@@ -249,8 +288,22 @@ async fn apply_rotation(
             return Ok(());
         }
 
-        // Step 2: Apply config
-        display.apply_monitors_config(serial, 1, lms.clone(), HashMap::new()).await?;
+        // Step 2: Apply config (with non-adjacent pixel fix for dual-monitor configs)
+        if lms.len() > 1 {
+            match apply_duo_config_with_adjacency_fix(display, serial, lms.clone(), transform).await? {
+                true => {}
+                false => {
+                    // Non-adjacent unrecoverable: can't fix adjacency, let recovery handle
+                    if attempt < MAX_ATTEMPTS {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
+                    return Err("Rotation: non-adjacent error unrecoverable after ±1px adjustment".into());
+                }
+            }
+        } else {
+            display.apply_monitors_config(serial, 1, lms.clone(), HashMap::new()).await?;
+        }
 
         // Step 3: Verify applied state matches desired state
         let (_, _, logical_after, _): CurrentState = display.get_current_state().await?;
@@ -302,6 +355,69 @@ pub fn read_current_config(logical: &[LogicalMonitor]) -> (HashMap<String, (i32,
     }
     
     (config, is_corrupted)
+}
+
+/// Read scale from eDP-1 logical monitor. Falls back to primary logical monitor then DEFAULT.
+/// eDP-1 is the reference: it never changes mode on its own and is always active.
+fn read_edp1_scale(logical: &[LogicalMonitor]) -> f64 {
+    if let Some(lm) = logical.iter().find(|lm| lm.5.first().map(|r| r.0.as_str()) == Some("eDP-1")) {
+        return lm.2;
+    }
+    logical.iter().find(|lm| lm.4).map(|lm| lm.2).unwrap_or(DEFAULT_DUO_SCALE)
+}
+
+/// Returns true if the error is a Mutter "displays not adjacent" error.
+fn is_non_adjacent_error<E: std::fmt::Display>(e: &E) -> bool {
+    let s = e.to_string().to_lowercase();
+    s.contains("adjacent")
+}
+
+/// Adjust the non-origin monitor's offset by `delta` pixels along the correct axis.
+/// For left/right orientations (transforms 1,3): X axis. For normal/bottom-up (0,2): Y axis.
+fn adjust_offset_pixel(lms: &[ApplyLm], transform: u32, delta: i32) -> Vec<ApplyLm> {
+    lms.iter().cloned().map(|(x, y, scale, tr, primary, monitors)| {
+        let (nx, ny) = match transform {
+            1 | 3 => (if x != 0 { x + delta } else { x }, y),
+            _     => (x, if y != 0 { y + delta } else { y }),
+        };
+        (nx, ny, scale, tr, primary, monitors)
+    }).collect()
+}
+
+/// Apply a dual-monitor configuration with automatic ±1 pixel adjacency correction.
+/// Returns Ok(true) = applied, Ok(false) = non-adjacent and unrecoverable after ±1px, Err = other error.
+async fn apply_duo_config_with_adjacency_fix(
+    display: &DisplayConfigProxy<'_>,
+    serial: u32,
+    lms: Vec<ApplyLm>,
+    transform: u32,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    match display.apply_monitors_config(serial, 1, lms.clone(), HashMap::new()).await {
+        Ok(()) => return Ok(true),
+        Err(ref e) if is_non_adjacent_error(e) => {
+            warn!("DisplayConfig: non-adjacent error on original config, trying +1px on offset axis");
+        }
+        Err(e) => return Err(e.into()),
+    }
+
+    let lms_p1 = adjust_offset_pixel(&lms, transform, 1);
+    match display.apply_monitors_config(serial, 1, lms_p1, HashMap::new()).await {
+        Ok(()) => return Ok(true),
+        Err(ref e) if is_non_adjacent_error(e) => {
+            warn!("DisplayConfig: +1px still non-adjacent, trying -1px from original");
+        }
+        Err(e) => return Err(e.into()),
+    }
+
+    let lms_m1 = adjust_offset_pixel(&lms, transform, -1);
+    match display.apply_monitors_config(serial, 1, lms_m1, HashMap::new()).await {
+        Ok(()) => Ok(true),
+        Err(ref e) if is_non_adjacent_error(e) => {
+            warn!("DisplayConfig: -1px also non-adjacent — unrecoverable adjacency failure");
+            Ok(false)
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 fn requested_layout_matches_config(
@@ -407,7 +523,11 @@ fn normalize_duo_layout(
 ) -> bool {
     let secondary_connector = if target_primary == "eDP-1" { "eDP-2" } else { "eDP-1" };
 
-    let Some(&(_, _, scale, _, _)) = config.get(target_primary) else {
+    // Always source scale from eDP-1 (the stable reference display).
+    let scale = config.get("eDP-1")
+        .map(|(_, _, s, _, _)| *s)
+        .or_else(|| config.get(target_primary).map(|(_, _, s, _, _)| *s));
+    let Some(scale) = scale else {
         return false;
     };
     let Some(primary_mode) = all_modes.get(target_primary) else {
@@ -456,7 +576,11 @@ fn matches_expected_duo_layout(
     }
 
     let secondary_connector = if target_primary == "eDP-1" { "eDP-2" } else { "eDP-1" };
-    let Some(&(_, _, scale, _, _)) = config.get(target_primary) else {
+    // Always source scale from eDP-1 (the stable reference display).
+    let scale = config.get("eDP-1")
+        .map(|(_, _, s, _, _)| *s)
+        .or_else(|| config.get(target_primary).map(|(_, _, s, _, _)| *s));
+    let Some(scale) = scale else {
         return false;
     };
     let Some(primary_mode) = all_modes.get(target_primary) else {
@@ -508,14 +632,16 @@ async fn repair_layout_for_primary(
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let (serial, physical, logical, _): CurrentState = display.get_current_state().await?;
     let all_modes = extract_all_modes(&physical);
-    let (mut config, _) = read_current_config(&logical);
+    let (mut config, was_corrupted) = read_current_config(&logical);
 
     let new_monitors = if require_secondary {
         ensure_both_displays(display, serial, &physical, &all_modes, &mut config)
             .await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
 
-        if matches_expected_duo_layout(&config, &all_modes, target_primary, desired_transform) {
+        // Only skip the apply if the GNOME state was already clean AND matches the expected
+        // layout. When was_corrupted is true, the fix is only in-memory; we must push it to GNOME.
+        if !was_corrupted && matches_expected_duo_layout(&config, &all_modes, target_primary, desired_transform) {
             return Ok(true);
         }
 
@@ -541,11 +667,7 @@ async fn repair_layout_for_primary(
             return Ok(true);
         }
 
-        let scale = config
-            .get(target_primary)
-            .map(|(_, _, scale, _, _)| *scale)
-            .or_else(|| logical.iter().find(|lm| lm.4).map(|lm| lm.2))
-            .unwrap_or(DEFAULT_DUO_SCALE);
+        let scale = read_edp1_scale(&logical);
         let primary_mode = all_modes
             .get(target_primary)
             .ok_or_else(|| format!("No mode for {target_primary}"))?;
@@ -577,6 +699,129 @@ async fn repair_layout_for_primary(
         })
 }
 
+/// Unified display state application - replaces scattered apply calls
+/// Reads current → calculates desired → applies once → verifies
+/// Special case: disable secondary while eDP-2 primary requires two sequential applies
+async fn apply_desired_display_state(
+    display: &DisplayConfigProxy<'_>,
+    keyboard_attached: bool,
+    desired_secondary_enabled: bool,
+    desired_primary: &str,
+    desired_transform: u32,
+    cached_secondary: &mut Option<(String, String, i32, i32, f64)>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Read current state
+    let (serial, physical, logical, _props) = display.get_current_state().await?;
+    let all_modes = extract_all_modes(&physical);
+    let (current_config, current_corrupted) = read_current_config(&logical);
+    
+    // Determine physical availability
+    let edp2_physically_available = all_modes.contains_key("eDP-2");
+    
+    // Calculate desired: eDP-2 enabled if physically available AND desired AND keyboard not attached
+    let edp2_should_be_enabled = edp2_physically_available && desired_secondary_enabled && !keyboard_attached;
+    
+    // Get current state
+    let edp2_current = current_config.get("eDP-2");
+    let edp1_scale = read_edp1_scale(&logical);
+    
+    // Determine current/desired primary
+    let current_primary = current_config
+        .iter()
+        .find(|(_, (_, _, _, _, is_primary))| *is_primary)
+        .map(|(conn, _)| conn.clone())
+        .unwrap_or_else(|| "eDP-1".to_string());
+    
+    let desired_primary_effective = if keyboard_attached && desired_primary == "eDP-2" {
+        "eDP-1".to_string()
+    } else {
+        desired_primary.to_string()
+    };
+    
+    // Check if state already matches
+    let edp2_currently_enabled = edp2_current.is_some();
+    if current_primary == desired_primary_effective 
+        && edp2_currently_enabled == edp2_should_be_enabled 
+        && !current_corrupted {
+        info!("Display state already matches desired (no change needed)");
+        return Ok(());
+    }
+    
+    // Special case: disabling eDP-2 while it's primary - must swap first
+    if !edp2_should_be_enabled && edp2_currently_enabled && current_primary == "eDP-2" {
+        info!("Disabling secondary: eDP-2 is primary, swapping to eDP-1 first");
+        
+        match apply_display_swap(display, desired_transform).await {
+            Ok(_) => {
+                info!("Swapped to eDP-1 successfully");
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            Err(e) => {
+                warn!("Failed to swap to eDP-1: {}", e);
+                return Err(format!("Cannot disable secondary - swap failed: {}", e).into());
+            }
+        }
+        
+        // Now disable eDP-2
+        let desired_primary_arc = Arc::new(tokio::sync::RwLock::new("eDP-1".to_string()));
+        return apply_toggle_secondary_display(
+            display,
+            false,
+            cached_secondary,
+            &desired_primary_arc,
+            desired_transform,
+        )
+        .await;
+    }
+    
+    // Normal case: single atomic apply
+    // Build desired config
+    let mut new_monitors = Vec::new();
+    
+    // Add eDP-1
+    if let Some((mode_id, _w, _h)) = all_modes.get("eDP-1") {
+        let is_primary = desired_primary_effective == "eDP-1";
+        let apply_mon = ("eDP-1".to_string(), mode_id.clone(), HashMap::new());
+        let apply_lm = (0, 0, edp1_scale, desired_transform, is_primary, vec![apply_mon]);
+        new_monitors.push(apply_lm);
+    }
+    
+    // Add eDP-2 if enabled
+    if edp2_should_be_enabled {
+        if let Some((mode_id, w, h)) = all_modes.get("eDP-2") {
+            let (_, lh) = logical_size(*w, *h, edp1_scale, desired_transform);
+            let is_primary = desired_primary_effective == "eDP-2";
+            let apply_mon = ("eDP-2".to_string(), mode_id.clone(), HashMap::new());
+            let apply_lm = (0, lh, edp1_scale, desired_transform, is_primary, vec![apply_mon]);
+            new_monitors.push(apply_lm);
+        }
+    }
+    
+    // Apply once
+    display.apply_monitors_config(serial, 1, new_monitors, HashMap::new()).await?;
+    
+    // Verify
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let (_, _, logical_after, _) = display.get_current_state().await?;
+    let (after_config, _) = read_current_config(&logical_after);
+    
+    let after_primary = after_config
+        .iter()
+        .find(|(_, (_, _, _, _, is_primary))| *is_primary)
+        .map(|(c, _)| c.clone());
+    
+    if after_primary.as_ref() != Some(&desired_primary_effective) {
+        return Err(format!("Primary mismatch after apply").into());
+    }
+    
+    if after_config.contains_key("eDP-2") != edp2_should_be_enabled {
+        return Err(format!("Secondary mismatch after apply").into());
+    }
+    
+    info!("Display state applied successfully");
+    Ok(())
+}
+
 /// Swap which monitor is primary. Keeps physical positions unchanged.
 /// Implements display_swap_working_v3.py logic:
 /// - Read current state
@@ -598,88 +843,23 @@ async fn handle_keyboard_attached(
     desired_secondary: &Arc<tokio::sync::RwLock<bool>>,
     desired_transform: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if attached {
-        // When attached: force eDP-1 primary (overriding user choice temporarily)
-        info!("Keyboard attached: checking if swap needed");
-        
-        let (_serial, _physical, logical, _props) = display.get_current_state().await?;
-        let (logical_map, _) = read_current_config(&logical);
-        
-        // Check if eDP-2 is currently primary
-        if let Some((_, _, _, _, is_primary)) = logical_map.get("eDP-2") {
-            info!("eDP-2 status: is_primary={}", is_primary);
-            if *is_primary {
-                info!("eDP-2 is primary, swapping to eDP-1 before disabling");
-                match apply_display_swap(display, desired_transform).await {
-                    Ok(new_primary) => {
-                        info!("Swapped to: {}", new_primary);
-                    }
-                    Err(e) => {
-                        warn!("Swap failed during keyboard attach: {}", e);
-                        return Err(e);
-                    }
-                }
-                // Sleep to let state settle
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                
-                // Verify eDP-1 is now primary before disabling eDP-2
-                if let Ok((_, _, logical2, _)) = display.get_current_state().await {
-                    let (logical_map2, _) = read_current_config(&logical2);
-                    if let Some((_, _, _, _, is_primary_now)) = logical_map2.get("eDP-1") {
-                        if !*is_primary_now {
-                            warn!("After swap, eDP-1 is still not primary! Aborting disable");
-                            return Err("eDP-1 not primary after swap".into());
-                        }
-                        info!("Verified eDP-1 is now primary, safe to disable eDP-2");
-                    }
-                }
-            } else {
-                info!("eDP-2 is not primary, safe to disable");
-            }
-        }
-        
-        // Now disable eDP-2 (should be safe since eDP-1 should be primary)
-        info!("Disabling eDP-2");
-        apply_toggle_secondary_display(
-            display,
-            false,
-            cached_secondary,
-            desired_primary,
-            desired_transform,
-        )
-        .await
-    } else {
-        let should_enable_secondary = *desired_secondary.read().await;
-        info!(
-            "Keyboard detached: restoring desired secondary state enable={}",
-            should_enable_secondary
-        );
-        let result = apply_toggle_secondary_display(
-            display,
-            should_enable_secondary,
-            cached_secondary,
-            desired_primary,
-            desired_transform,
-        )
-        .await;
-        
-        // After restoring secondary display, sync orientation with sensor to prevent
-        // applying stale transforms (can happen if device was rotated while secondary was disabled)
-        if should_enable_secondary && result.is_ok() {
-            // Wait for Mutter to recognize the secondary display before syncing rotation
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            
-            if let Ok(Some(current_orientation)) = super::orientation::current_orientation().await {
-                if current_orientation != "normal" {
-                    info!("Keyboard detached: syncing rotation to sensor orientation after secondary restore");
-                    let _ = apply_rotation(display, &current_orientation).await;
-                }
-            }
-        }
-        
-        result
-    }
+    let desired_primary_val = desired_primary.read().await.clone();
+    let desired_secondary_val = *desired_secondary.read().await;
+    
+    info!("Display: keyboard_attached={}, applying desired state", attached);
+    
+    // Use unified function - handles everything in one path
+    apply_desired_display_state(
+        display,
+        attached,
+        desired_secondary_val,
+        &desired_primary_val,
+        desired_transform,
+        cached_secondary,
+    )
+    .await
 }
+
 
 pub async fn apply_display_swap(
     display: &DisplayConfigProxy<'_>,
@@ -743,7 +923,7 @@ pub async fn apply_display_swap(
             })
             .unwrap_or_else(|| "eDP-1".to_string());
         let transform_hint = desired_transform;
-        let scale_hint = logical.first().map(|lm| lm.2).unwrap_or(1.0);
+        let scale_hint = read_edp1_scale(&logical);
 
         // On first attempt, determine what we want to swap TO. On retries, use the same goal.
         if desired_primary.is_none() {
@@ -990,24 +1170,36 @@ async fn apply_toggle_secondary_display(
     // If disabling and eDP-2 is primary, swap to eDP-1 first to prevent crash
     if !enable {
         let (_serial, _physical, logical, _props) = display.get_current_state().await?;
-        let (logical_map, _) = read_current_config(&logical);
-        
-        if let Some((_, _, _, _, is_primary)) = logical_map.get("eDP-2") {
-            if *is_primary {
-                info!("eDP-2 is primary, must swap to eDP-1 before disabling");
-                match apply_display_swap(display, desired_transform).await {
-                    Ok(new_primary) => {
-                        info!("Swapped to: {}", new_primary);
+        let (logical_map, disable_state_corrupted) = read_current_config(&logical);
+
+        if disable_state_corrupted {
+            // Corrupted state: eDP-2 may appear absent even though it's physically active.
+            // Skip ALL pre-checks and proceed directly to single-monitor apply below.
+            warn!("ToggleSecondaryDisplay: corrupted state detected on disable — skipping pre-checks, forcing single-monitor apply");
+        } else {
+            // Early exit: if secondary is already absent from logical monitors, nothing to do.
+            if !logical_map.contains_key("eDP-2") {
+                info!("ToggleSecondaryDisplay: eDP-2 already absent from logical monitors — skipping apply");
+                return Ok(());
+            }
+
+            if let Some((_, _, _, _, is_primary)) = logical_map.get("eDP-2") {
+                if *is_primary {
+                    info!("eDP-2 is primary, must swap to eDP-1 before disabling");
+                    match apply_display_swap(display, desired_transform).await {
+                        Ok(new_primary) => {
+                            info!("Swapped to: {}", new_primary);
+                        }
+                        Err(e) => {
+                            warn!("Swap failed before toggle disable: {}", e);
+                        }
                     }
-                    Err(e) => {
-                        warn!("Swap failed before toggle disable: {}", e);
-                    }
+                    // Sleep to let state settle
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
-                // Sleep to let state settle
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
         }
-        
+
         // Note: sysfs control (on/off) is handled by root daemon's secondary_display task,
         // not by session daemon (which runs as user and lacks sysfs write permissions).
         // Root daemon monitors desired_secondary state and manages sysfs accordingly.
@@ -1039,6 +1231,8 @@ async fn apply_toggle_secondary_display(
 
     let (serial, physical, logical, _): CurrentState = state;
     let all_modes = extract_all_modes(&physical);
+    // Scale always sourced from eDP-1 (stable reference display).
+    let edp1_scale = read_edp1_scale(&logical);
     let current_primary_connector = logical
         .iter()
         .find(|lm| lm.4)
@@ -1095,7 +1289,7 @@ async fn apply_toggle_secondary_display(
     // If enabling but no secondary found in logical monitors, restore from cache or
     // rebuild from the physical monitor list when eDP-2 is present but currently inactive.
     if enable && new_monitors.len() == 1 {
-        if let Some((_, _, primary_scale, primary_transform, _, monitors)) = new_monitors.first().cloned() {
+        if let Some((_, _, _primary_scale, primary_transform, _, monitors)) = new_monitors.first().cloned() {
             if let Some((primary_connector, _, _)) = monitors.first().cloned() {
                 if primary_connector != "eDP-1" {
                     warn!(
@@ -1123,7 +1317,7 @@ async fn apply_toggle_secondary_display(
                     Some((
                         connector,
                         secondary_mode.0.clone(),
-                        primary_scale,
+                        edp1_scale, // always use eDP-1 scale
                         "cache",
                         secondary_mode,
                     ))
@@ -1146,7 +1340,7 @@ async fn apply_toggle_secondary_display(
                     Some((
                         connector.clone(),
                         matched_mode.0.clone(),
-                        primary_scale,
+                        edp1_scale, // always use eDP-1 scale
                         "physical",
                         matched_mode,
                     ))
@@ -1156,17 +1350,15 @@ async fn apply_toggle_secondary_display(
 
                 if let Some((connector, mode_id, scale, source, secondary_mode)) = restore {
                     let desired_primary_value = desired_primary.read().await.clone();
-                    let restore_primary_connector = if desired_primary_value == connector {
-                        connector.as_str()
-                    } else {
-                        primary_connector.as_str()
-                    };
+                    // Always restore secondary with the current single-monitor primary (eDP-1).
+                    // Mutter silently ignores the primary flag when enabling a display for the
+                    // first time in a transition, so trying to set eDP-2 as primary in the same
+                    // call that enables it produces a verification mismatch and triggers the
+                    // recovery loop. The caller (run loop) will swap primary to eDP-2 afterwards
+                    // via apply_desired_primary_if_possible.
+                    let restore_primary_connector = primary_connector.as_str();
                     let (restore_primary_mode, restore_secondary_connector, restore_secondary_mode) =
-                        if restore_primary_connector == connector.as_str() {
-                            (&secondary_mode, primary_connector.as_str(), primary_mode)
-                        } else {
-                            (primary_mode, connector.as_str(), &secondary_mode)
-                        };
+                        (primary_mode, connector.as_str(), &secondary_mode);
 
                     info!(
                         "Restoring secondary display from {} primary={} desired_primary={} transform={} (current single-monitor transform={})",
@@ -1220,12 +1412,76 @@ async fn apply_toggle_secondary_display(
     }
 
     info!("Applying toggle secondary display (enable={}), monitors count={}", enable, new_monitors.len());
-    display.apply_monitors_config(serial, 1, new_monitors.clone(), HashMap::new()).await?;
-    info!("Secondary display toggle completed");
-    
+
+    // Apply with non-adjacent pixel adjustment when applying a dual-monitor config.
+    // On unrecoverable non-adjacent (enable only): fall back to eDP-1-only + user notification.
+    let non_adjacent_unrecoverable = if new_monitors.len() > 1 {
+        match apply_duo_config_with_adjacency_fix(display, serial, new_monitors.clone(), desired_transform).await? {
+            true  => false,
+            false => {
+                warn!("ToggleSecondaryDisplay: non-adjacent error unrecoverable after ±1px adjustment");
+                true
+            }
+        }
+    } else {
+        display.apply_monitors_config(serial, 1, new_monitors.clone(), HashMap::new()).await?;
+        false
+    };
+
+    if non_adjacent_unrecoverable && enable {
+        warn!("ToggleSecondaryDisplay: falling back to eDP-1-only due to unrecoverable non-adjacent failure");
+        if let Ok((fb_serial, fb_physical, fb_logical, _)) = display.get_current_state().await {
+            let fb_scale = read_edp1_scale(&fb_logical);
+            let fb_modes = extract_all_modes(&fb_physical);
+            if let Some(fb_mode) = fb_modes.get("eDP-1") {
+                let fb_lms = build_duo_lms("eDP-1", fb_mode, None, desired_transform, fb_scale);
+                let _ = display.apply_monitors_config(fb_serial, 1, fb_lms, HashMap::new()).await;
+            }
+        }
+        let _ = super::notifications::send_notification(
+            "Display Configuration Error",
+            "Could not arrange both displays adjacently.\u{2028}eDP-2 has been disabled. Use GNOME Display Settings to reconfigure.",
+            "dialog-error",
+            0,
+            2,
+        ).await;
+        return Ok(()); // don't trigger recovery retry
+    }
+
+    info!("Secondary display toggle applied");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let (_, _, verify_logical, _): CurrentState = display.get_current_state().await?;
+    let (verify_config, verify_corrupted) = read_current_config(&verify_logical);
+
+    if verify_corrupted {
+        return Err("ToggleSecondaryDisplay: corrupted logical monitor state after apply".into());
+    }
+
+    // Verify the full applied config matches what we requested (position, scale, transform, primary).
+    if !requested_layout_matches_config(&new_monitors, &verify_config) {
+        return Err(format!(
+            "ToggleSecondaryDisplay: applied config doesn't match desired (enable={})",
+            enable
+        ).into());
+    }
+
+    // Secondary presence check (complements requested_layout_matches_config).
+    if enable && !verify_config.contains_key(&expected_secondary_connector) {
+        return Err(format!(
+            "ToggleSecondaryDisplay: {} missing after enable (state={:?})",
+            expected_secondary_connector, verify_config
+        ).into());
+    } else if !enable && verify_config.contains_key(&expected_secondary_connector) {
+        return Err(format!(
+            "ToggleSecondaryDisplay: {} still present after disable (state={:?})",
+            expected_secondary_connector, verify_config
+        ).into());
+    }
+
     // Note: sysfs control (on/off) for eDP-2 is handled by root daemon's secondary_display task
     // based on desired_secondary_enabled state, not by this session daemon.
-    
+
     Ok(())
 }
 
@@ -1496,7 +1752,7 @@ async fn attempt_display_recovery(
     }
 
     if let Ok(Some(orientation)) = super::orientation::current_orientation().await {
-        apply_rotation(&display, &orientation).await?;
+        apply_rotation(&display, &orientation, keyboard_attached, effective_secondary).await?;
     }
 
     Ok(())
@@ -1523,7 +1779,7 @@ fn ensure_display_recovery_task(
     let keyboard_attached = Arc::clone(keyboard_attached);
     *recovery_task = Some(tokio::spawn(async move {
         const MAX_ATTEMPTS: usize = 20;
-        const DELAY_SECS: u64 = 10;
+        const DELAY_SECS: u64 = 1;
 
         for attempt in 1..=MAX_ATTEMPTS {
             match attempt_display_recovery(
@@ -1546,6 +1802,22 @@ fn ensure_display_recovery_task(
                         "Display recovery: attempt {}/{} failed after {}: {}",
                         attempt, MAX_ATTEMPTS, reason, e
                     );
+                    if attempt < MAX_ATTEMPTS {
+                        let body = format!(
+                            "Display recovery attempt {attempt}/{MAX_ATTEMPTS} did not converge yet. Retrying automatically."
+                        );
+                        if let Err(notify_err) = super::notifications::send_transient_notification(
+                            "Display recovery retrying",
+                            &body,
+                            "dialog-warning",
+                            800,
+                            1, // urgency: normal/yellow
+                        )
+                        .await
+                        {
+                            warn!("Display recovery: failed to send transient retry warning: {notify_err}");
+                        }
+                    }
                 }
             }
 
@@ -1557,8 +1829,9 @@ fn ensure_display_recovery_task(
         if let Err(e) = super::notifications::send_notification(
             "Display Recovery Failed",
             "Zenbook Duo daemon could not restore the desired display layout after repeated retries.",
-            "video-display",
-            6000,
+            "dialog-error",
+            0, // persistent — stays until dismissed
+            2, // urgency: critical
         )
         .await
         {
@@ -1656,7 +1929,8 @@ pub async fn run(
                 Ok(orientation) => {
                     cancel_display_recovery_task(&mut recovery_task, "orientation update");
                     desired_transform = orientation_to_transform(&orientation);
-                    if let Err(e) = apply_rotation(&display, &orientation).await {
+                    let desired_secondary_enabled = *desired_secondary.read().await;
+                    if let Err(e) = apply_rotation(&display, &orientation, keyboard_attached, desired_secondary_enabled).await {
                         warn!("Rotation failed for '{orientation}': {e}");
                         ensure_display_recovery_task(
                             &mut recovery_task,
@@ -1677,15 +1951,18 @@ pub async fn run(
                     info!("Display: desired_secondary update received enable={enable}");
                     let start = std::time::Instant::now();
                     let current_state = display.get_current_state().await.ok();
-                    let current_secondary_present = current_state
+                    let (current_secondary_present, current_state_corrupted) = current_state
                         .as_ref()
-                        .map(|(_, _, logical, _)| read_current_config(logical).0.contains_key("eDP-2"))
-                        .unwrap_or(false);
+                        .map(|(_, _, logical, _)| {
+                            let (cfg, corrupted) = read_current_config(logical);
+                            (cfg.contains_key("eDP-2"), corrupted)
+                        })
+                        .unwrap_or((false, false));
 
                     let result = if enable && keyboard_attached {
                         info!("Desired secondary is on, but keyboard is attached; leaving secondary logically disabled for now");
                         Ok(())
-                    } else if enable == current_secondary_present {
+                    } else if !current_state_corrupted && enable == current_secondary_present {
                         info!("Desired secondary already satisfied (enable={}, present={})", enable, current_secondary_present);
                         Ok(())
                     } else {
@@ -1718,13 +1995,23 @@ pub async fn run(
                         if enable && should_wait_for_edp2 {
                             match apply_desired_primary_if_possible(&display, &desired, desired_transform, true).await {
                                 Ok(true) => stop_availability_monitor(&mut availability_task),
-                                Ok(false) => update_availability_monitor_for_edp2(
-                                    &mut availability_task,
-                                    &conn,
-                                    &availability_tx,
-                                    &desired_primary,
-                                    true,
-                                ),
+                                Ok(false) => {
+                                    update_availability_monitor_for_edp2(
+                                        &mut availability_task,
+                                        &conn,
+                                        &availability_tx,
+                                        &desired_primary,
+                                        true,
+                                    );
+                                    ensure_display_recovery_task(
+                                        &mut recovery_task,
+                                        &conn,
+                                        &desired_primary,
+                                        &desired_secondary,
+                                        &keyboard_attached_state,
+                                        "toggle-on desired primary mismatch",
+                                    );
+                                }
                                 Err(e) => {
                                     warn!("Failed to restore desired_primary {} after toggle-on: {}", desired, e);
                                     update_availability_monitor_for_edp2(
@@ -1733,6 +2020,14 @@ pub async fn run(
                                         &availability_tx,
                                         &desired_primary,
                                         true,
+                                    );
+                                    ensure_display_recovery_task(
+                                        &mut recovery_task,
+                                        &conn,
+                                        &desired_primary,
+                                        &desired_secondary,
+                                        &keyboard_attached_state,
+                                        "toggle-on desired primary failure",
                                     );
                                 }
                             }

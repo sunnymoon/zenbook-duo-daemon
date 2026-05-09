@@ -95,6 +95,11 @@ impl RootStateInterface {
     }
 
     #[zbus(property)]
+    fn bluetooth_connected(&self) -> bool {
+        self.state_manager.is_bluetooth_connected()
+    }
+
+    #[zbus(property)]
     fn desired_primary(&self) -> String {
         self.state_manager
             .get_desired_primary()
@@ -111,16 +116,39 @@ impl RootStateInterface {
         self.state_manager.get_ambient_light_enabled()
     }
 
+    #[zbus(property)]
+    fn display_brightness(&self) -> u32 {
+        self.state_manager.get_display_brightness_value().unwrap_or(0)
+    }
+
     async fn register_session(
         &self,
         session_id: u64,
         #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
     ) -> fdo::Result<()> {
         let Some(sender) = header.sender() else {
             return Err(fdo::Error::Failed(
                 "session registration is missing sender information".into(),
             ));
         };
+
+        // Verify the caller is a real user (UID >= 1000), not a system service.
+        let dbus_proxy = DBusProxy::new(connection)
+            .await
+            .map_err(|e| fdo::Error::Failed(format!("failed to query D-Bus for caller UID: {e}")))?;
+        let bus_name = zbus::names::BusName::try_from(sender.as_str())
+            .map_err(|e| fdo::Error::Failed(format!("invalid sender bus name: {e}")))?;
+        let uid = dbus_proxy
+            .get_connection_unix_user(bus_name)
+            .await
+            .map_err(|e| fdo::Error::Failed(format!("failed to get caller UID: {e}")))?;
+        if uid < 1000 {
+            warn!("ROOT DBus: rejected register_session from UID {uid} (not a session user)");
+            return Err(fdo::Error::AccessDenied(
+                format!("UID {uid} is not permitted to register a session"),
+            ));
+        }
 
         if self.state_manager.is_secondary_display_enabled() {
             crate::secondary_display::arm_sysfs_fallback_once();
@@ -210,6 +238,9 @@ trait RootState {
     fn keyboard_attached(&self) -> zbus::Result<bool>;
 
     #[zbus(property)]
+    fn bluetooth_connected(&self) -> zbus::Result<bool>;
+
+    #[zbus(property)]
     fn desired_primary(&self) -> zbus::Result<String>;
 
     #[zbus(property)]
@@ -217,6 +248,9 @@ trait RootState {
 
     #[zbus(property)]
     fn ambient_light_enabled(&self) -> zbus::Result<bool>;
+
+    #[zbus(property)]
+    fn display_brightness(&self) -> zbus::Result<u32>;
 }
 
 async fn emit_keyboard_attached_changed() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
@@ -233,6 +267,25 @@ async fn emit_keyboard_attached_changed() -> Result<bool, Box<dyn std::error::Er
         .get()
         .await
         .keyboard_attached_changed(iface_ref.signal_emitter())
+        .await?;
+
+    Ok(handle.registered.load(Ordering::SeqCst))
+}
+
+async fn emit_bluetooth_connected_changed() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(handle) = get_root_handle().await else {
+        return Ok(false);
+    };
+
+    let iface_ref = handle
+        .connection
+        .object_server()
+        .interface::<_, RootStateInterface>(ROOT_DBUS_PATH)
+        .await?;
+    iface_ref
+        .get()
+        .await
+        .bluetooth_connected_changed(iface_ref.signal_emitter())
         .await?;
 
     Ok(handle.registered.load(Ordering::SeqCst))
@@ -271,6 +324,25 @@ async fn emit_desired_secondary_changed() -> Result<bool, Box<dyn std::error::Er
         .get()
         .await
         .desired_secondary_enabled_changed(iface_ref.signal_emitter())
+        .await?;
+
+    Ok(handle.registered.load(Ordering::SeqCst))
+}
+
+async fn emit_display_brightness_changed() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(handle) = get_root_handle().await else {
+        return Ok(false);
+    };
+
+    let iface_ref = handle
+        .connection
+        .object_server()
+        .interface::<_, RootStateInterface>(ROOT_DBUS_PATH)
+        .await?;
+    iface_ref
+        .get()
+        .await
+        .display_brightness_changed(iface_ref.signal_emitter())
         .await?;
 
     Ok(handle.registered.load(Ordering::SeqCst))
@@ -388,6 +460,11 @@ pub async fn notify_keyboard_attached_changed(
     emit_keyboard_attached_changed().await
 }
 
+pub async fn notify_bluetooth_connected_changed(
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    emit_bluetooth_connected_changed().await
+}
+
 pub async fn notify_desired_primary_changed(
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     emit_desired_primary_changed().await
@@ -396,6 +473,11 @@ pub async fn notify_desired_primary_changed(
 pub async fn notify_desired_secondary_changed(
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     emit_desired_secondary_changed().await
+}
+
+pub async fn notify_display_brightness_changed(
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    emit_display_brightness_changed().await
 }
 
 pub async fn wait_for_keyboard_attached_ack(attached: bool, timeout: Duration) -> bool {
@@ -561,6 +643,16 @@ pub async fn run_session_client(
             Err(e) => warn!("SESSION DBus: failed to read initial desired_primary property: {e}"),
         }
 
+        match proxy.display_brightness().await {
+            Ok(value) if value > 0 => {
+                if let Err(e) = crate::session::display::apply_display_brightness_value(value).await {
+                    warn!("SESSION DBus: failed to apply initial display_brightness={value}: {e}");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => warn!("SESSION DBus: failed to read initial display_brightness property: {e}"),
+        }
+
         let dbus_proxy = match DBusProxy::new(&connection).await {
             Ok(proxy) => proxy,
             Err(e) => {
@@ -588,6 +680,7 @@ pub async fn run_session_client(
             .receive_property_changed("DesiredSecondaryEnabled")
             .await;
         let mut desired_primary_changes = proxy.inner().receive_property_changed("DesiredPrimary").await;
+        let mut display_brightness_changes = proxy.inner().receive_property_changed("DisplayBrightness").await;
 
         let mut reconnect = false;
         while !reconnect {
@@ -640,6 +733,20 @@ pub async fn run_session_client(
                         Some(change) => match change.get().await {
                             Ok(value) => apply_desired_primary_update(&desired_primary, &desired_primary_tx, value).await,
                             Err(e) => warn!("SESSION DBus: failed to decode DesiredPrimary change: {e}"),
+                        },
+                        None => reconnect = true,
+                    }
+                }
+                change = display_brightness_changes.next() => {
+                    match change {
+                        Some(change) => match change.get().await {
+                            Ok(value) if value > 0 => {
+                                if let Err(e) = crate::session::display::apply_display_brightness_value(value).await {
+                                    warn!("SESSION DBus: failed to apply display_brightness={value}: {e}");
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => warn!("SESSION DBus: failed to decode DisplayBrightness change: {e}"),
                         },
                         None => reconnect = true,
                     }

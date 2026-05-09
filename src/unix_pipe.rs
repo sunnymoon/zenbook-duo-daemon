@@ -1,6 +1,6 @@
 use log::{info, warn};
 use nix::sys::stat;
-use nix::unistd;
+use nix::unistd::{self, Gid};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 use tokio::fs;
@@ -10,6 +10,15 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use crate::config::Config;
 use crate::idle_detection::ActivityNotifier;
 use crate::state::{KeyboardBacklightState, KeyboardStateManager};
+
+const DAEMON_GROUP: &str = "zenbook-duo";
+
+fn daemon_group_gid() -> Option<Gid> {
+    nix::unistd::Group::from_name(DAEMON_GROUP)
+        .ok()
+        .flatten()
+        .map(|g| g.gid)
+}
 
 pub struct UnixPipe {
     reader: BufReader<File>,
@@ -24,12 +33,19 @@ impl UnixPipe {
         }
 
         // Create the FIFO
-        unistd::mkfifo(path, stat::Mode::from_bits_truncate(0o666)).unwrap();
+        unistd::mkfifo(path, stat::Mode::from_bits_truncate(0o660)).unwrap();
+
+        // Set ownership to root:zenbook-duo so only group members can write
+        if let Some(gid) = daemon_group_gid() {
+            let _ = unistd::chown(path.as_path(), None, Some(gid));
+        } else {
+            warn!("Group '{}' not found; pipe will use default permissions", DAEMON_GROUP);
+        }
 
         // For some reason the permissions are not set correctly by mkfifo, so we set them manually
         let metadata = fs::metadata(path).await.unwrap();
         let mut permissions = metadata.permissions();
-        permissions.set_mode(0o666);
+        permissions.set_mode(0o660);
         fs::set_permissions(path, permissions).await.unwrap();
 
         let file = File::open(path).await.unwrap();
@@ -68,7 +84,6 @@ pub fn start_receive_commands_task(
     config: &Config,
     state_manager: KeyboardStateManager,
     activity_notifier: ActivityNotifier,
-    event_tx: tokio::sync::broadcast::Sender<crate::events::Event>,
 ) {
     let path = PathBuf::from(&config.pipe_path);
     let config = config.clone();
@@ -93,8 +108,8 @@ pub fn start_receive_commands_task(
                         let reported_attached = state_manager.is_usb_keyboard_attached();
                         
                         if current_usb_attached != reported_attached {
-                            info!("Post-resume keyboard state mismatch: usb_attached={}, reported={}", current_usb_attached, reported_attached);
-                            let _ = event_tx.send(crate::events::Event::KeyboardAttached(current_usb_attached));
+                            info!("Post-resume keyboard state mismatch: usb_attached={}, reported={} — updating state", current_usb_attached, reported_attached);
+                            state_manager.set_usb_keyboard_attached(current_usb_attached);
                         }
                     }
                     "mic_mute_led_toggle" => {
@@ -123,12 +138,21 @@ pub fn start_receive_commands_task(
                     }
                     "secondary_display_toggle" => {
                         state_manager.toggle_secondary_display();
+                        if let Err(e) = crate::dbus_state::notify_desired_secondary_changed().await {
+                            warn!("secondary_display_toggle: failed to notify session via D-Bus: {e}");
+                        }
                     }
                     "secondary_display_on" => {
                         state_manager.set_secondary_display(true);
+                        if let Err(e) = crate::dbus_state::notify_desired_secondary_changed().await {
+                            warn!("secondary_display_on: failed to notify session via D-Bus: {e}");
+                        }
                     }
                     "secondary_display_off" => {
                         state_manager.set_secondary_display(false);
+                        if let Err(e) = crate::dbus_state::notify_desired_secondary_changed().await {
+                            warn!("secondary_display_off: failed to notify session via D-Bus: {e}");
+                        }
                     }
                     _ => {
                         warn!("Unknown pipe command: {}", line);

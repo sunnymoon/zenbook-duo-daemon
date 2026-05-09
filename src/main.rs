@@ -167,7 +167,7 @@ async fn run_daemon(config_path: PathBuf) {
 
     start_listen_mute_state_thread(state_manager.clone());
 
-    start_receive_commands_task(&config, state_manager.clone(), activity_notifier.clone(), event_sender.clone());
+    start_receive_commands_task(&config, state_manager.clone(), activity_notifier.clone());
 
     // Forward keyboard attachment state changes over D-Bus.
     // If no session is registered, or if it does not acknowledge in time, fall back to sysfs.
@@ -180,6 +180,14 @@ async fn run_daemon(config_path: PathBuf) {
                     Ok(Event::KeyboardAttached(attached)) => {
                         info!("KeyboardAttached event: {}", attached);
                         secondary_display::pause_brightness_sync_for(Duration::from_secs(4));
+
+                        // On detach, write sysfs `on` BEFORE telling the session daemon.
+                        // The session daemon will ask GNOME to enable eDP-2 via DisplayConfig,
+                        // but GNOME can only see the connector once sysfs status = "on".
+                        if !attached {
+                            secondary_display::ensure_secondary_display_on().await;
+                        }
+
                         let session_registered = match dbus_state::notify_keyboard_attached_changed().await {
                             Ok(registered) => registered,
                             Err(e) => {

@@ -53,6 +53,23 @@ pub fn arm_sysfs_fallback_once() {
     FORCE_SYSFS_FALLBACK_ONCE.store(true, Ordering::SeqCst);
 }
 
+/// Write sysfs `on` for the secondary display connector if it is not already on.
+/// Must be called before notifying the session daemon so that GNOME can see the
+/// connector when it applies the DisplayConfig change.
+pub async fn ensure_secondary_display_on() {
+    let Some(status_path) = SECONDARY_STATUS_PATH.get() else {
+        warn!("ensure_secondary_display_on: status path not initialised yet");
+        return;
+    };
+    let actual = is_secondary_display_enabled_actual(status_path).await;
+    if actual {
+        return; // already on, nothing to write
+    }
+    if let Err(e) = fs::write(status_path, b"on").await {
+        warn!("ensure_secondary_display_on: failed to write sysfs: {e}");
+    }
+}
+
 fn is_secondary_display_enabled_actual_blocking(status_path: &str) -> bool {
     if let Ok(contents) = std::fs::read_to_string(status_path) {
         let status = contents.trim();
@@ -73,7 +90,7 @@ async fn is_secondary_display_enabled_actual(status_path: &str) -> bool {
     }
 }
 
-fn wait_for_secondary_display_state_blocking(status_path: String, enable: bool) -> bool {
+fn wait_for_secondary_display_state_blocking(status_path: String, enable: bool, cancel: Arc<AtomicBool>) -> bool {
     if is_secondary_display_enabled_actual_blocking(&status_path) == enable {
         return true;
     }
@@ -108,6 +125,9 @@ fn wait_for_secondary_display_state_blocking(status_path: String, enable: bool) 
 
     let mut buffer = [0u8; 1024];
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
         let events = match inotify.read_events_blocking(&mut buffer) {
             Ok(events) => events.collect::<Vec<_>>(),
             Err(_) => return false,
@@ -135,14 +155,20 @@ pub async fn wait_for_secondary_display_state(enable: bool, timeout: Duration) -
         return true;
     }
 
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_clone = cancel.clone();
+
     match tokio::time::timeout(
         timeout,
-        tokio::task::spawn_blocking(move || wait_for_secondary_display_state_blocking(status_path, enable)),
+        tokio::task::spawn_blocking(move || wait_for_secondary_display_state_blocking(status_path, enable, cancel_clone)),
     )
     .await
     {
         Ok(Ok(result)) => result,
-        _ => false,
+        _ => {
+            cancel.store(true, Ordering::Relaxed);
+            false
+        }
     }
 }
 
@@ -152,6 +178,10 @@ fn sync_secondary_brightness_once(
     status_path: &str,
     state_manager: &KeyboardStateManager,
 ) {
+    let Some(trimmed) = persist_primary_brightness_value(source_path, state_manager) else {
+        return;
+    };
+
     if brightness_sync_paused() {
         return;
     }
@@ -164,17 +194,20 @@ fn sync_secondary_brightness_once(
         return;
     }
 
-    let Ok(brightness) = std::fs::read_to_string(source_path) else {
-        return;
-    };
-
-    if let Ok(value) = brightness.trim().parse::<u32>() {
-        state_manager.set_display_brightness_value(value);
-    }
-
-    if let Err(e) = std::fs::write(target_path, brightness.trim()) {
+    if let Err(e) = std::fs::write(target_path, trimmed) {
         warn!("Failed to sync secondary display brightness: {}", e);
     }
+}
+
+fn persist_primary_brightness_value(
+    source_path: &str,
+    state_manager: &KeyboardStateManager,
+) -> Option<String> {
+    let brightness = std::fs::read_to_string(source_path).ok()?;
+    let trimmed = brightness.trim();
+    let value = trimmed.parse::<u32>().ok()?;
+    state_manager.set_display_brightness_value(value);
+    Some(trimmed.to_string())
 }
 
 fn apply_persisted_display_brightness(
@@ -190,6 +223,40 @@ fn apply_persisted_display_brightness(
         if let Err(e) = std::fs::write(path, brightness.to_string()) {
             warn!("Failed to restore persisted display brightness on {}: {}", path, e);
         }
+    }
+}
+
+async fn restore_secondary_brightness_after_enable(
+    primary_path: String,
+    secondary_path: String,
+    state_manager: KeyboardStateManager,
+) {
+    let brightness = tokio::task::spawn_blocking({
+        let primary_path = primary_path.clone();
+        let state_manager = state_manager.clone();
+        move || persist_primary_brightness_value(&primary_path, &state_manager)
+    })
+    .await
+    .ok()
+    .flatten();
+
+    if !wait_for_secondary_display_state(true, Duration::from_secs(8)).await {
+        return;
+    }
+
+    let Some(brightness) = brightness.or_else(|| {
+        state_manager
+            .get_display_brightness_value()
+            .map(|value| value.to_string())
+    }) else {
+        return;
+    };
+
+    if let Err(e) = fs::write(&secondary_path, brightness.to_string()).await {
+        warn!(
+            "Failed to restore secondary display brightness after enable on {}: {}",
+            secondary_path, e
+        );
     }
 }
 
@@ -273,18 +340,33 @@ pub async fn start_secondary_display_task(
     {
         let status_path = status_path.clone();
         let last_change = last_change.clone();
+        let primary_path = config.primary_backlight_path.clone();
+        let secondary_path = config.secondary_backlight_path.clone();
+        let state_manager = state_manager.clone();
         tokio::spawn(async move {
             loop {
                 match event_receiver.recv().await {
                     Ok(Event::SecondaryDisplay(new_state)) => {
                         let forced_fallback = FORCE_SYSFS_FALLBACK_ONCE.swap(false, Ordering::SeqCst);
-                        if crate::dbus_state::is_session_registered() && !forced_fallback {
+                        // For disable: session daemon owns GNOME logical state; skip sysfs unless
+                        // no session is present or a forced fallback was requested.
+                        // For enable: sysfs must always be written first (already done before the
+                        // session was notified), but we still call control here to ensure it — the
+                        // check inside means it's a no-op if already on.
+                        if !new_state && crate::dbus_state::is_session_registered() && !forced_fallback {
                             warn!(
-                                "Skipping sysfs secondary display change because session daemon is connected; session path owns display state"
+                                "Skipping sysfs secondary display disable because session daemon is connected; session path owns display state"
                             );
                             continue;
                         }
                         control_secondary_display(&status_path, new_state, &last_change).await;
+                        if new_state {
+                            tokio::spawn(restore_secondary_brightness_after_enable(
+                                primary_path.clone(),
+                                secondary_path.clone(),
+                                state_manager.clone(),
+                            ));
+                        }
                     }
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => {

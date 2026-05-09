@@ -313,6 +313,7 @@ pub fn start_bt_keyboard_task(
     active_control_macs: Arc<Mutex<HashSet<String>>>,
 ) {
     info!("Bluetooth connected on {}", path.display());
+    state_manager.bluetooth_connection_started();
     activity_notifier.notify();
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -430,6 +431,7 @@ pub fn start_bt_keyboard_task(
                 Err(e) => {
                     if let Some(libc::ENODEV) = e.raw_os_error() {
                         info!("Bluetooth device disconnected. Exiting task.");
+                        state_manager.bluetooth_connection_stopped();
                         virtual_keyboard.lock().await.release_all_keys();
                         drop(shutdown_tx);
                         return;

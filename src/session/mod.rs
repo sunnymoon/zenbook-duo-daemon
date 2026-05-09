@@ -1,5 +1,5 @@
 mod ambient;
-mod display;
+pub(crate) mod display;
 mod notifications;
 mod orientation;
 // mod osk; // OSK support not yet implemented, kept for future use
@@ -53,6 +53,7 @@ pub async fn run() {
         desired_secondary.clone(),
     ));
     tokio::spawn(notifications::run(kb_tx.subscribe()));
+    tokio::spawn(notifications::run_battery_monitor());
     tokio::spawn(ambient::run(
         desired_ambient_tx.subscribe(),
         ambient_report_tx,
