@@ -19,6 +19,8 @@ type ApplyLm = (i32, i32, f64, u32, bool, Vec<ApplyMonSpec>);
 type BacklightState = (u32, Vec<HashMap<String, OwnedValue>>);
 
 const DEFAULT_DUO_SCALE: f64 = 5.0 / 3.0;
+const RECONCILE_DEBOUNCE_MS: u64 = 1200;
+const ORIENTATION_STABILIZATION_MS: u64 = 1800;
 
 
 #[proxy(
@@ -709,7 +711,7 @@ async fn apply_desired_display_state(
     desired_primary: &str,
     desired_transform: u32,
     cached_secondary: &mut Option<(String, String, i32, i32, f64)>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     // Read current state
     let (serial, physical, logical, _props) = display.get_current_state().await?;
     let all_modes = extract_all_modes(&physical);
@@ -738,13 +740,19 @@ async fn apply_desired_display_state(
         desired_primary.to_string()
     };
     
-    // Check if state already matches
+    // Check if state already matches (including transform).
     let edp2_currently_enabled = edp2_current.is_some();
+    let current_transform = current_config
+        .iter()
+        .find(|(_, (_, _, _, _, is_primary))| *is_primary)
+        .map(|(_, (_, _, _, transform, _))| *transform)
+        .unwrap_or(0);
     if current_primary == desired_primary_effective 
         && edp2_currently_enabled == edp2_should_be_enabled 
+        && current_transform == desired_transform
         && !current_corrupted {
         info!("Display state already matches desired (no change needed)");
-        return Ok(());
+        return Ok(false);
     }
     
     // Special case: disabling eDP-2 while it's primary - must swap first
@@ -771,7 +779,8 @@ async fn apply_desired_display_state(
             &desired_primary_arc,
             desired_transform,
         )
-        .await;
+        .await
+        .map(|_| true);
     }
     
     // Normal case: single atomic apply
@@ -819,7 +828,7 @@ async fn apply_desired_display_state(
     }
     
     info!("Display state applied successfully");
-    Ok(())
+    Ok(true)
 }
 
 /// Swap which monitor is primary. Keeps physical positions unchanged.
@@ -835,32 +844,6 @@ async fn apply_desired_display_state(
 /// Handle keyboard attach/detach safely:
 /// When attached: If eDP-2 is primary, swap to eDP-1 first, then disable eDP-2
 /// When detached: Re-enable eDP-2, then restore desired_primary if needed
-async fn handle_keyboard_attached(
-    display: &DisplayConfigProxy<'_>,
-    attached: bool,
-    cached_secondary: &mut Option<(String, String, i32, i32, f64)>,
-    desired_primary: &Arc<tokio::sync::RwLock<String>>,
-    desired_secondary: &Arc<tokio::sync::RwLock<bool>>,
-    desired_transform: u32,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let desired_primary_val = desired_primary.read().await.clone();
-    let desired_secondary_val = *desired_secondary.read().await;
-    
-    info!("Display: keyboard_attached={}, applying desired state", attached);
-    
-    // Use unified function - handles everything in one path
-    apply_desired_display_state(
-        display,
-        attached,
-        desired_secondary_val,
-        &desired_primary_val,
-        desired_transform,
-        cached_secondary,
-    )
-    .await
-}
-
-
 pub async fn apply_display_swap(
     display: &DisplayConfigProxy<'_>,
     desired_transform: u32,
@@ -1701,6 +1684,43 @@ async fn current_desired_transform(
     }
 }
 
+async fn reconcile_display_state(
+    display: &DisplayConfigProxy<'_>,
+    conn: &Connection,
+    availability_task: &mut Option<tokio::task::JoinHandle<()>>,
+    availability_tx: &broadcast::Sender<()>,
+    desired_primary: &Arc<tokio::sync::RwLock<String>>,
+    desired_secondary: &Arc<tokio::sync::RwLock<bool>>,
+    keyboard_attached: bool,
+    cached_secondary: &mut Option<(String, String, i32, i32, f64)>,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let desired_transform = current_desired_transform(display).await?;
+    let desired_primary_value = desired_primary.read().await.clone();
+    let desired_secondary_enabled = *desired_secondary.read().await;
+
+    let changed = apply_desired_display_state(
+        display,
+        keyboard_attached,
+        desired_secondary_enabled,
+        &desired_primary_value,
+        desired_transform,
+        cached_secondary,
+    )
+    .await?;
+
+    let should_wait_for_edp2 =
+        desired_primary_value == "eDP-2"
+            && effective_secondary_enabled(desired_secondary_enabled, keyboard_attached);
+    update_availability_monitor_for_edp2(
+        availability_task,
+        conn,
+        availability_tx,
+        desired_primary,
+        should_wait_for_edp2,
+    );
+    Ok(changed)
+}
+
 async fn attempt_display_recovery(
     conn: &Connection,
     desired_primary: &Arc<tokio::sync::RwLock<String>>,
@@ -1852,6 +1872,33 @@ fn cancel_display_recovery_task(
     }
 }
 
+fn schedule_reconcile(
+    debounce_deadline: &mut Option<tokio::time::Instant>,
+    pending_reason: &mut &'static str,
+    new_reason: &'static str,
+    delay_ms: u64,
+) {
+    let now = tokio::time::Instant::now();
+    let new_deadline = now + std::time::Duration::from_millis(delay_ms);
+    if let Some(old_deadline) = *debounce_deadline {
+        info!(
+            "Display debounce: event='{}' rescheduling previous='{}' old_due_in={}ms new_due_in={}ms",
+            new_reason,
+            *pending_reason,
+            old_deadline.saturating_duration_since(now).as_millis(),
+            delay_ms
+        );
+    } else {
+        info!(
+            "Display debounce: event='{}' scheduling apply in {}ms",
+            new_reason,
+            delay_ms
+        );
+    }
+    *pending_reason = new_reason;
+    *debounce_deadline = Some(new_deadline);
+}
+
 pub async fn run(
     mut orient_rx: broadcast::Receiver<String>,
     mut kb_rx: broadcast::Receiver<bool>,
@@ -1885,39 +1932,22 @@ pub async fn run(
     // Broadcast channel for availability checks triggered by display state changes
     let (availability_tx, _) = broadcast::channel::<()>(8);
 
-    // Cache for secondary monitor config so we can restore it after disabling
-    let mut cached_secondary: Option<(String, String, i32, i32, f64)> = None;  // (connector, mode_id, x, y, scale)
-    let mut desired_transform = match super::orientation::current_orientation().await {
-        Ok(Some(orientation)) => {
-            let transform = orientation_to_transform(&orientation);
-            info!(
-                "Display: startup desired transform from accelerometer orientation={} transform={}",
-                orientation, transform
-            );
-            transform
-        }
-        Ok(None) => display
-            .get_current_state()
-            .await
-            .ok()
-            .and_then(|(_, _, logical, _)| logical.iter().find(|lm| lm.4).map(|lm| lm.3))
-            .unwrap_or(0),
-        Err(e) => {
-            warn!("Display: failed to read startup accelerometer orientation: {e}");
-            display
-                .get_current_state()
-                .await
-                .ok()
-                .and_then(|(_, _, logical, _)| logical.iter().find(|lm| lm.4).map(|lm| lm.3))
-                .unwrap_or(0)
-        }
-    };
+    // Cache for secondary monitor config so we can restore it after disabling.
+    let mut cached_secondary: Option<(String, String, i32, i32, f64)> = None; // (connector, mode_id, x, y, scale)
+    if let Ok(transform) = current_desired_transform(&display).await {
+        info!("Display: startup desired transform={transform}");
+    }
     let mut availability_rx = availability_tx.subscribe();
     let mut availability_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut recovery_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut keyboard_attached = false;
     let keyboard_attached_state = Arc::new(tokio::sync::RwLock::new(false));
     let mut keyboard_state_initialized = false;
+    let mut delayed_reconciles_deepness: u32 = 0;
+    let mut quiet_until: Option<tokio::time::Instant> = None;
+    let mut debounce_deadline: Option<tokio::time::Instant> = None;
+    let mut pending_reason: &'static str = "display state update";
+    let mut changed_apply_waiting_followup = false;
 
     // Do not apply any desired_primary at startup from the local default.
     // Root daemon is the authority and will publish the real desired_primary
@@ -1925,308 +1955,239 @@ pub async fn run(
 
     loop {
         tokio::select! {
-            msg = orient_rx.recv() => match msg {
-                Ok(orientation) => {
-                    cancel_display_recovery_task(&mut recovery_task, "orientation update");
-                    desired_transform = orientation_to_transform(&orientation);
-                    let desired_secondary_enabled = *desired_secondary.read().await;
-                    if let Err(e) = apply_rotation(&display, &orientation, keyboard_attached, desired_secondary_enabled).await {
-                        warn!("Rotation failed for '{orientation}': {e}");
+            _ = async {
+                if let Some(deadline) = debounce_deadline {
+                    tokio::time::sleep_until(deadline).await;
+                }
+            }, if debounce_deadline.is_some() => {
+                info!("Display debounce: applying scheduled reconcile for '{}'", pending_reason);
+                debounce_deadline = None;
+                if let Some(until) = quiet_until {
+                    if tokio::time::Instant::now() < until {
+                        info!("Display reconcile: quiet period active, skipping apply");
+                        continue;
+                    }
+                    quiet_until = None;
+                    delayed_reconciles_deepness = 0;
+                }
+
+                cancel_display_recovery_task(&mut recovery_task, pending_reason);
+                let start = std::time::Instant::now();
+                match reconcile_display_state(
+                    &display,
+                    &conn,
+                    &mut availability_task,
+                    &availability_tx,
+                    &desired_primary,
+                    &desired_secondary,
+                    keyboard_attached,
+                    &mut cached_secondary,
+                )
+                .await
+                {
+                    Ok(changed) => {
+                        if changed {
+                            changed_apply_waiting_followup = true;
+                        } else {
+                            delayed_reconciles_deepness = 0;
+                            changed_apply_waiting_followup = false;
+                        }
+                        info!(
+                            "Display reconcile completed in {:.2}ms",
+                            start.elapsed().as_secs_f64() * 1000.0
+                        );
+                    }
+                    Err(e) => {
+                        warn!("Display reconcile failed after {pending_reason}: {e}");
                         ensure_display_recovery_task(
                             &mut recovery_task,
                             &conn,
                             &desired_primary,
                             &desired_secondary,
                             &keyboard_attached_state,
-                            "rotation failure",
+                            pending_reason,
                         );
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(n)) => warn!("Display handler lagged by {n}"),
+            }
+            msg = orient_rx.recv() => match msg {
+                Ok(_orientation) => {
+                    if let Some(until) = quiet_until {
+                        if tokio::time::Instant::now() < until {
+                            info!("Display reconcile: dropping orientation signal during quiet period");
+                            continue;
+                        }
+                        quiet_until = None;
+                        delayed_reconciles_deepness = 0;
+                        changed_apply_waiting_followup = false;
+                    }
+                    if changed_apply_waiting_followup {
+                        delayed_reconciles_deepness = delayed_reconciles_deepness.saturating_add(1);
+                        changed_apply_waiting_followup = false;
+                    }
+                    schedule_reconcile(
+                        &mut debounce_deadline,
+                        &mut pending_reason,
+                        "orientation update",
+                        ORIENTATION_STABILIZATION_MS,
+                    );
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    warn!("Display handler lagged by {n}");
+                    schedule_reconcile(
+                        &mut debounce_deadline,
+                        &mut pending_reason,
+                        "orientation lag",
+                        ORIENTATION_STABILIZATION_MS,
+                    );
+                }
                 Err(broadcast::error::RecvError::Closed) => break,
             },
             msg = desired_secondary_rx.recv() => match msg {
                 Ok(enable) => {
-                    cancel_display_recovery_task(&mut recovery_task, "desired secondary update");
-                    info!("Display: desired_secondary update received enable={enable}");
-                    let start = std::time::Instant::now();
-                    let current_state = display.get_current_state().await.ok();
-                    let (current_secondary_present, current_state_corrupted) = current_state
-                        .as_ref()
-                        .map(|(_, _, logical, _)| {
-                            let (cfg, corrupted) = read_current_config(logical);
-                            (cfg.contains_key("eDP-2"), corrupted)
-                        })
-                        .unwrap_or((false, false));
-
-                    let result = if enable && keyboard_attached {
-                        info!("Desired secondary is on, but keyboard is attached; leaving secondary logically disabled for now");
-                        Ok(())
-                    } else if !current_state_corrupted && enable == current_secondary_present {
-                        info!("Desired secondary already satisfied (enable={}, present={})", enable, current_secondary_present);
-                        Ok(())
-                    } else {
-                        apply_toggle_secondary_display(
-                            &display,
-                            enable,
-                            &mut cached_secondary,
-                            &desired_primary,
-                            desired_transform,
-                        )
-                        .await
-                    };
-
-                    if let Err(e) = result {
-                        warn!("Desired secondary application failed: {e}");
-                        ensure_display_recovery_task(
-                            &mut recovery_task,
-                            &conn,
-                            &desired_primary,
-                            &desired_secondary,
-                            &keyboard_attached_state,
-                            "desired secondary failure",
-                        );
-                    } else {
-                        let desired = desired_primary.read().await.clone();
-                        let desired_secondary_enabled = *desired_secondary.read().await;
-                        let should_wait_for_edp2 =
-                            desired == "eDP-2"
-                                && effective_secondary_enabled(desired_secondary_enabled, keyboard_attached);
-                        if enable && should_wait_for_edp2 {
-                            match apply_desired_primary_if_possible(&display, &desired, desired_transform, true).await {
-                                Ok(true) => stop_availability_monitor(&mut availability_task),
-                                Ok(false) => {
-                                    update_availability_monitor_for_edp2(
-                                        &mut availability_task,
-                                        &conn,
-                                        &availability_tx,
-                                        &desired_primary,
-                                        true,
-                                    );
-                                    ensure_display_recovery_task(
-                                        &mut recovery_task,
-                                        &conn,
-                                        &desired_primary,
-                                        &desired_secondary,
-                                        &keyboard_attached_state,
-                                        "toggle-on desired primary mismatch",
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!("Failed to restore desired_primary {} after toggle-on: {}", desired, e);
-                                    update_availability_monitor_for_edp2(
-                                        &mut availability_task,
-                                        &conn,
-                                        &availability_tx,
-                                        &desired_primary,
-                                        true,
-                                    );
-                                    ensure_display_recovery_task(
-                                        &mut recovery_task,
-                                        &conn,
-                                        &desired_primary,
-                                        &desired_secondary,
-                                        &keyboard_attached_state,
-                                        "toggle-on desired primary failure",
-                                    );
-                                }
-                            }
-                        } else {
-                            update_availability_monitor_for_edp2(
-                                &mut availability_task,
-                                &conn,
-                                &availability_tx,
-                                &desired_primary,
-                                should_wait_for_edp2,
-                            );
-                        }
-                        info!("Desired secondary application completed in {:.2}ms", start.elapsed().as_secs_f64() * 1000.0);
-                    }
+                    *desired_secondary.write().await = enable;
+                    // ACK is receive-only; display apply is performed by debounced reconciler.
                     let _ = secondary_result_tx.send(()).await;
+
+                    if let Some(until) = quiet_until {
+                        if tokio::time::Instant::now() < until {
+                            info!("Display reconcile: dropping desired_secondary signal during quiet period");
+                            continue;
+                        }
+                        quiet_until = None;
+                        delayed_reconciles_deepness = 0;
+                        changed_apply_waiting_followup = false;
+                    }
+                    if changed_apply_waiting_followup {
+                        delayed_reconciles_deepness = delayed_reconciles_deepness.saturating_add(1);
+                        changed_apply_waiting_followup = false;
+                    }
+                    schedule_reconcile(
+                        &mut debounce_deadline,
+                        &mut pending_reason,
+                        "desired secondary update",
+                        RECONCILE_DEBOUNCE_MS,
+                    );
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => warn!("Desired secondary handler lagged by {n}"),
                 Err(broadcast::error::RecvError::Closed) => break,
             },
             msg = kb_rx.recv() => match msg {
                 Ok(attached) => {
-                    cancel_display_recovery_task(&mut recovery_task, "keyboard attach state update");
                     let previous_keyboard_attached = keyboard_attached;
                     keyboard_attached = attached;
                     *keyboard_attached_state.write().await = attached;
                     info!("Display: keyboard_attached={attached}");
+                    // ACK is receive-only; display apply is performed by debounced reconciler.
+                    let _ = kb_result_tx.send(()).await;
+
                     if !keyboard_state_initialized {
                         keyboard_state_initialized = true;
                         if !attached {
                             info!("Display: initial keyboard state sync is detached; skipping detach restore actions");
-                            let _ = kb_result_tx.send(()).await;
                             continue;
                         }
                     } else if attached == previous_keyboard_attached {
                         info!("Display: keyboard_attached unchanged; skipping duplicate edge handling");
-                        let _ = kb_result_tx.send(()).await;
                         continue;
                     }
-                    let start = std::time::Instant::now();
-                    if let Err(e) = handle_keyboard_attached(
-                        &display,
-                        attached,
-                        &mut cached_secondary,
-                        &desired_primary,
-                        &desired_secondary,
-                        desired_transform,
-                    ).await {
-                        warn!("Handle keyboard attached failed: {e}");
-                        ensure_display_recovery_task(
-                            &mut recovery_task,
-                            &conn,
-                            &desired_primary,
-                            &desired_secondary,
-                            &keyboard_attached_state,
-                            "keyboard attach or detach failure",
-                        );
-                    } else {
-                        let desired = desired_primary.read().await.clone();
-                        let desired_secondary_enabled = *desired_secondary.read().await;
-                        let should_wait_for_edp2 =
-                            desired == "eDP-2"
-                                && effective_secondary_enabled(desired_secondary_enabled, keyboard_attached);
-                        update_availability_monitor_for_edp2(
-                            &mut availability_task,
-                            &conn,
-                            &availability_tx,
-                            &desired_primary,
-                            should_wait_for_edp2,
-                        );
-                        info!("Handle keyboard attached completed in {:.2}ms", start.elapsed().as_secs_f64() * 1000.0);
+
+                    if let Some(until) = quiet_until {
+                        if tokio::time::Instant::now() < until {
+                            info!("Display reconcile: dropping keyboard signal during quiet period");
+                            continue;
+                        }
+                        quiet_until = None;
+                        delayed_reconciles_deepness = 0;
+                        changed_apply_waiting_followup = false;
                     }
-                    // Send ACK to root daemon
-                    let _ = kb_result_tx.send(()).await;
+                    if changed_apply_waiting_followup {
+                        delayed_reconciles_deepness = delayed_reconciles_deepness.saturating_add(1);
+                        changed_apply_waiting_followup = false;
+                    }
+                    schedule_reconcile(
+                        &mut debounce_deadline,
+                        &mut pending_reason,
+                        "keyboard attach state update",
+                        RECONCILE_DEBOUNCE_MS,
+                    );
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => warn!("Keyboard handler lagged by {n}"),
                 Err(broadcast::error::RecvError::Closed) => break,
             },
             msg = desired_primary_rx.recv() => match msg {
                 Ok(desired) => {
-                    cancel_display_recovery_task(&mut recovery_task, "desired primary update");
-                    info!("Display: desired_primary update received: {}", desired);
-                    if keyboard_attached {
-                        stop_availability_monitor(&mut availability_task);
-                        debug!(
-                            "DesiredPrimary update for {} deferred because keyboard is attached; keeping eDP-1 primary",
-                            desired
-                        );
-                        continue;
+                    *desired_primary.write().await = desired;
+                    if let Some(until) = quiet_until {
+                        if tokio::time::Instant::now() < until {
+                            info!("Display reconcile: dropping desired_primary signal during quiet period");
+                            continue;
+                        }
+                        quiet_until = None;
+                        delayed_reconciles_deepness = 0;
+                        changed_apply_waiting_followup = false;
                     }
-                    let desired_secondary_enabled = *desired_secondary.read().await;
-                    let current_secondary_present = display
-                        .get_current_state()
-                        .await
-                        .ok()
-                        .map(|(_, _, logical, _)| read_current_config(&logical).0.contains_key("eDP-2"))
-                        .unwrap_or(false);
-                    let effective_secondary = if keyboard_state_initialized {
-                        effective_secondary_enabled(desired_secondary_enabled, keyboard_attached)
-                    } else {
-                        desired_secondary_enabled && current_secondary_present
-                    };
-                    if !effective_secondary {
-                        stop_availability_monitor(&mut availability_task);
-                        if desired == "eDP-1" {
-                            debug!("DesiredPrimary: applying single-display eDP-1 layout while secondary is inactive");
-                        } else {
-                            debug!(
-                                "DesiredPrimary update for {} deferred because secondary display is inactive; keeping eDP-1 primary",
-                                desired
-                            );
-                        }
+                    if changed_apply_waiting_followup {
+                        delayed_reconciles_deepness = delayed_reconciles_deepness.saturating_add(1);
+                        changed_apply_waiting_followup = false;
                     }
-                    let effective_primary = if effective_secondary { desired.as_str() } else { "eDP-1" };
-                    match apply_desired_primary_if_possible(
-                        &display,
-                        effective_primary,
-                        desired_transform,
-                        effective_secondary,
-                    )
-                    .await
-                    {
-                        Ok(true) => {
-                            stop_availability_monitor(&mut availability_task);
-                        }
-                        Ok(false) if effective_secondary && desired == "eDP-2" => {
-                            ensure_availability_monitor(
-                                &mut availability_task,
-                                &conn,
-                                &availability_tx,
-                                &desired_primary,
-                            );
-                        }
-                        Ok(false) => {
-                            stop_availability_monitor(&mut availability_task);
-                            warn!("DesiredPrimary: {} could not be applied immediately", desired);
-                            ensure_display_recovery_task(
-                                &mut recovery_task,
-                                &conn,
-                                &desired_primary,
-                                &desired_secondary,
-                                &keyboard_attached_state,
-                                "desired primary mismatch",
-                            );
-                        }
-                        Err(e) => {
-                            warn!("DesiredPrimary update failed for {}: {e}", desired);
-                            ensure_display_recovery_task(
-                                &mut recovery_task,
-                                &conn,
-                                &desired_primary,
-                                &desired_secondary,
-                                &keyboard_attached_state,
-                                "desired primary failure",
-                            );
-                        }
-                    }
+                    schedule_reconcile(
+                        &mut debounce_deadline,
+                        &mut pending_reason,
+                        "desired primary update",
+                        RECONCILE_DEBOUNCE_MS,
+                    );
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => warn!("DesiredPrimary handler lagged by {n}"),
                 Err(broadcast::error::RecvError::Closed) => break,
             },
             msg = availability_rx.recv() => match msg {
                 Ok(_) => {
-                    cancel_display_recovery_task(&mut recovery_task, "display availability update");
-                    let desired_secondary_enabled = *desired_secondary.read().await;
-                    if !effective_secondary_enabled(desired_secondary_enabled, keyboard_attached) {
-                        stop_availability_monitor(&mut availability_task);
-                        debug!("Availability check skipped because secondary display is disabled");
-                        continue;
-                    }
-                    let desired = desired_primary.read().await.clone();
-                    match apply_desired_primary_if_possible(&display, &desired, desired_transform, true).await {
-                        Ok(true) => stop_availability_monitor(&mut availability_task),
-                        Ok(false) => {
-                            debug!("Availability check: {} still not ready", desired);
-                            ensure_display_recovery_task(
-                                &mut recovery_task,
-                                &conn,
-                                &desired_primary,
-                                &desired_secondary,
-                                &keyboard_attached_state,
-                                "availability mismatch",
-                            );
+                    if let Some(until) = quiet_until {
+                        if tokio::time::Instant::now() < until {
+                            info!("Display reconcile: dropping availability signal during quiet period");
+                            continue;
                         }
-                        Err(e) => {
-                            warn!("Failed to restore desired_primary {}: {}", desired, e);
-                            ensure_display_recovery_task(
-                                &mut recovery_task,
-                                &conn,
-                                &desired_primary,
-                                &desired_secondary,
-                                &keyboard_attached_state,
-                                "availability restore failure",
-                            );
-                        }
+                        quiet_until = None;
+                        delayed_reconciles_deepness = 0;
+                        changed_apply_waiting_followup = false;
                     }
+                    if changed_apply_waiting_followup {
+                        delayed_reconciles_deepness = delayed_reconciles_deepness.saturating_add(1);
+                        changed_apply_waiting_followup = false;
+                    }
+                    schedule_reconcile(
+                        &mut debounce_deadline,
+                        &mut pending_reason,
+                        "display availability update",
+                        RECONCILE_DEBOUNCE_MS,
+                    );
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => {} // Ignore lag on availability checks
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => break,
             },
+        }
+
+        if delayed_reconciles_deepness >= 20 {
+            let quiet_period = std::time::Duration::from_secs(60);
+            let timeout = std::cmp::max(
+                std::time::Duration::from_secs(1),
+                quiet_period.saturating_sub(std::time::Duration::from_secs(1)),
+            );
+            let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+            if let Err(e) = super::notifications::send_transient_notification(
+                "Display changes throttled",
+                "You are changing your mind too fast or hardware is sending too many display-change signals. Quieting down for 1 minute.",
+                "dialog-warning",
+                timeout_ms,
+                1,
+            ).await {
+                warn!("Display reconcile: failed to send throttling warning: {e}");
+            }
+            quiet_until = Some(tokio::time::Instant::now() + quiet_period);
+            debounce_deadline = None;
+            delayed_reconciles_deepness = 0;
+            changed_apply_waiting_followup = false;
         }
     }
 }

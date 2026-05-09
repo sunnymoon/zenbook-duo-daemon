@@ -529,17 +529,22 @@ async fn apply_desired_secondary_update(
 ) {
     *desired_secondary.write().await = value;
     desired_secondary_tx.send(value).ok();
-    if wait_for_internal_ack(
-        secondary_result_rx,
-        Duration::from_secs(8),
-        "desired secondary handler",
-    )
-    .await
-    {
-        if let Err(e) = proxy.acknowledge_desired_secondary_applied(value).await {
-            warn!("SESSION DBus: failed to acknowledge desired_secondary_enabled={value}: {e}");
-        }
+    // ACK means "received by session daemon", not "fully applied".
+    if let Err(e) = proxy.acknowledge_desired_secondary_applied(value).await {
+        warn!("SESSION DBus: failed to acknowledge desired_secondary_enabled={value}: {e}");
     }
+
+    // Keep draining internal completion ACKs for observability/backpressure, but do not
+    // block root-facing ACK flow on full display application.
+    let secondary_result_rx = Arc::clone(secondary_result_rx);
+    tokio::spawn(async move {
+        let _ = wait_for_internal_ack(
+            &secondary_result_rx,
+            Duration::from_secs(8),
+            "desired secondary handler",
+        )
+        .await;
+    });
 }
 
 async fn apply_desired_primary_update(
