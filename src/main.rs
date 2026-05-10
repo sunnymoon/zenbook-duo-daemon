@@ -36,6 +36,8 @@ enum Args {
         #[arg(short, long)]
         config_path: Option<PathBuf>,
     },
+    /// Resume display applies after root-side safety guard paused them
+    ResumeDisplayApplies,
 }
 
 mod config;
@@ -67,6 +69,15 @@ async fn main() {
         }
         Args::Run { config_path } => {
             run_daemon(config_path.unwrap_or(PathBuf::from(DEFAULT_CONFIG_PATH))).await;
+        }
+        Args::ResumeDisplayApplies => {
+            match dbus_state::resume_display_applies().await {
+                Ok(()) => info!("Display apply guard resumed"),
+                Err(e) => {
+                    error!("Failed to resume display applies: {e}");
+                    process::exit(1);
+                }
+            }
         }
     }
 }

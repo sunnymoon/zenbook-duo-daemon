@@ -58,6 +58,37 @@ The project currently installs multiple components:
 - ⚠️ Display recovery/startup edge cases are improved but still an active area of refinement
 - ⚠️ The daemon only remaps the **Zenbook-specific special keys** that require vendor handling; standard keys that already arrive as normal evdev keys are not remapped by the daemon
 
+## Dual display / Mutter apply ordering (important for Duo internals)
+
+The Zenbook Duo’s two built-in panels are both **eDP** connectors (`eDP-1`, `eDP-2`). GNOME Shell drives them through Mutter’s **`org.gnome.Mutter.DisplayConfig`** API (`apply_monitors_config`), the same path tools like **`gdctl`** use.
+
+### 1. Logical monitor order (“primary last”)
+
+Experiments on real hardware showed that the **order of logical monitors in the apply payload matters**: the monitor that should end up **primary** should be the **last** entry in the list passed to `apply_monitors_config`. The daemon’s `build_duo_lms` in `src/session/display.rs` implements this by emitting **non-primary first, primary second** (including a swap when the effective primary is `eDP-1`, because the geometric construction naturally listed `eDP-1` first for the stacked layout).
+
+Putting **primary first** can leave Mutter’s **logical monitor graph** inconsistent with what was requested: `gdctl` / D-Bus may show **duplicate connector names** on two logical rows or **two `primary: true` flags** even though the written config looked correct.
+
+### 2. Two-phase apply when going from **eDP-1 only** to **eDP-2 primary** (dual)
+
+A **single** atomic apply that both **enables the second panel** and **moves the primary to eDP-2** (from a state where only `eDP-1` had a logical monitor) was repeatedly broken on test hardware, while the **same final layout** worked if done in **two steps**:
+
+1. **Phase 1:** dual layout with **`eDP-1` still primary** and **`eDP-2` enabled** (non-primary).
+2. **Pause:** re-read Mutter state (new configuration **serial**), wait **~300 ms** (`EDPTWO_PRIMARY_PHASE1_STABILITY_MS` in `display.rs`) so KMS can settle after the first atomic commit.
+3. **Phase 2:** dual layout with **`eDP-2` primary** (again: non-primary logical first, primary last).
+
+The session daemon implements this in `apply_desired_display_state` when `requires_phase1_edp2_primary_from_edp1_solo` is true (see `src/session/display.rs`). Each phase uses a separate **root display-apply guard** attempt (`register_display_apply_attempt`), matching the cost of two compositor applies.
+
+### 3. Why not rely on one apply? (journal / plausibility)
+
+On Fedora 44 + **mutter 50.x**, logs on affected machines have shown:
+
+- `drmModeAtomicCommit: Invalid argument`, **page flip** failures, and **KMS update** errors from **gnome-shell** during aggressive output reconfiguration.
+- Prior **gnome-shell** crashes in **`meta_monitor_mode_foreach_crtc()`** (Mutter monitor / CRTC path).
+
+Those failures correlate with **too much changing in one atomic modeset**, which matches the bad “one swipe” `gdctl` behavior. The **two-phase** path is a **workaround** for compositor + kernel fragility; keep it unless upstream fixes and hardware re-testing prove a single apply is safe.
+
+**Do not remove or merge the two-phase path** without re-running manual **`gdctl`** experiments and checking `journalctl --user` during the transition.
+
 ## Keyboard function support
 
 | Keyboard Function               | Wired Mode | Bluetooth Mode | Default Mapping              | Remappable via config |

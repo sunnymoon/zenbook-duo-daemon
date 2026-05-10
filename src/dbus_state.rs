@@ -14,6 +14,17 @@ use crate::state::KeyboardStateManager;
 
 pub const ROOT_DBUS_SERVICE: &str = "asus.zenbook.duo";
 pub const ROOT_DBUS_PATH: &str = "/asus/zenbook/duo/State";
+/// Budget for apply attempts in a rolling window (see decay below). Higher than the session
+/// recovery retry count so a full recovery pass is not cut off by decay, while still
+/// bounding bursts that destabilize KMS.
+const DISPLAY_APPLY_GUARD_MAX_ATTEMPTS: u32 = 15;
+const DISPLAY_APPLY_GUARD_DECAY_SECS: u64 = 5;
+
+#[derive(Default)]
+struct DisplayApplyGuard {
+    attempts: u32,
+    paused: bool,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum AckEvent {
@@ -37,6 +48,21 @@ struct RootDbusHandle {
 
 static ROOT_DBUS_HANDLE: OnceLock<Mutex<Option<RootDbusHandle>>> = OnceLock::new();
 
+/// System bus connection and session id for `register_session` / `register_display_apply_attempt`.
+/// Reusing one connection is required so the message sender matches the registered session owner.
+/// The `u64` is the same `session_id` passed to `register_session` for self-heal retries.
+type SessionSystemBusRegistration = (Connection, u64);
+static SESSION_REGISTERED_SYSTEM_BUS: OnceLock<Mutex<Option<SessionSystemBusRegistration>>> =
+    OnceLock::new();
+
+fn session_registered_system_bus_cell() -> &'static Mutex<Option<SessionSystemBusRegistration>> {
+    SESSION_REGISTERED_SYSTEM_BUS.get_or_init(|| Mutex::new(None))
+}
+
+async fn replace_session_registered_system_bus(reg: Option<SessionSystemBusRegistration>) {
+    *session_registered_system_bus_cell().lock().await = reg;
+}
+
 fn dbus_handle_cell() -> &'static Mutex<Option<RootDbusHandle>> {
     ROOT_DBUS_HANDLE.get_or_init(|| Mutex::new(None))
 }
@@ -50,6 +76,7 @@ struct RootStateInterface {
     registration: Arc<RwLock<Option<RegisteredSession>>>,
     registered: Arc<AtomicBool>,
     ack_tx: broadcast::Sender<AckEvent>,
+    apply_guard: Arc<Mutex<DisplayApplyGuard>>,
 }
 
 impl RootStateInterface {
@@ -58,12 +85,14 @@ impl RootStateInterface {
         registration: Arc<RwLock<Option<RegisteredSession>>>,
         registered: Arc<AtomicBool>,
         ack_tx: broadcast::Sender<AckEvent>,
+        apply_guard: Arc<Mutex<DisplayApplyGuard>>,
     ) -> Self {
         Self {
             state_manager,
             registration,
             registered,
             ack_tx,
+            apply_guard,
         }
     }
 
@@ -119,6 +148,11 @@ impl RootStateInterface {
     #[zbus(property)]
     fn display_brightness(&self) -> u32 {
         self.state_manager.get_display_brightness_value().unwrap_or(0)
+    }
+
+    #[zbus(property)]
+    async fn display_apply_paused(&self) -> bool {
+        self.apply_guard.lock().await.paused
     }
 
     async fn register_session(
@@ -221,6 +255,69 @@ impl RootStateInterface {
         }
         Ok(())
     }
+
+    async fn register_display_apply_attempt(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+    ) -> fdo::Result<bool> {
+        self.ensure_registered_sender(&header).await?;
+
+        let mut guard = self.apply_guard.lock().await;
+        if guard.paused {
+            return Ok(false);
+        }
+
+        guard.attempts = guard.attempts.saturating_add(1);
+        if guard.attempts > DISPLAY_APPLY_GUARD_MAX_ATTEMPTS {
+            guard.paused = true;
+            warn!(
+                "ROOT DBus: pausing display applies (attempt counter {} exceeded max {})",
+                guard.attempts, DISPLAY_APPLY_GUARD_MAX_ATTEMPTS
+            );
+            return Ok(false);
+        }
+        drop(guard);
+
+        let apply_guard = Arc::clone(&self.apply_guard);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(DISPLAY_APPLY_GUARD_DECAY_SECS)).await;
+            let mut guard = apply_guard.lock().await;
+            guard.attempts = guard.attempts.saturating_sub(1);
+        });
+
+        Ok(true)
+    }
+
+    async fn resume_display_applies(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+    ) -> fdo::Result<()> {
+        let Some(sender) = header.sender() else {
+            return Err(fdo::Error::AccessDenied("missing D-Bus sender".into()));
+        };
+
+        let dbus_proxy = DBusProxy::new(connection)
+            .await
+            .map_err(|e| fdo::Error::Failed(format!("failed to query D-Bus for caller UID: {e}")))?;
+        let bus_name = zbus::names::BusName::try_from(sender.as_str())
+            .map_err(|e| fdo::Error::Failed(format!("invalid sender bus name: {e}")))?;
+        let uid = dbus_proxy
+            .get_connection_unix_user(bus_name)
+            .await
+            .map_err(|e| fdo::Error::Failed(format!("failed to get caller UID: {e}")))?;
+        if uid != 0 {
+            return Err(fdo::Error::AccessDenied(
+                "only root can resume display applies".into(),
+            ));
+        }
+
+        let mut guard = self.apply_guard.lock().await;
+        guard.attempts = 0;
+        guard.paused = false;
+        info!("ROOT DBus: display apply guard resumed by root command");
+        Ok(())
+    }
 }
 
 #[proxy(
@@ -233,6 +330,8 @@ trait RootState {
     fn acknowledge_keyboard_attached(&self, value: bool) -> zbus::Result<()>;
     fn acknowledge_desired_secondary_applied(&self, value: bool) -> zbus::Result<()>;
     fn report_ambient_light_enabled(&self, value: bool) -> zbus::Result<()>;
+    fn register_display_apply_attempt(&self) -> zbus::Result<bool>;
+    fn resume_display_applies(&self) -> zbus::Result<()>;
 
     #[zbus(property)]
     fn keyboard_attached(&self) -> zbus::Result<bool>;
@@ -251,6 +350,9 @@ trait RootState {
 
     #[zbus(property)]
     fn display_brightness(&self) -> zbus::Result<u32>;
+
+    #[zbus(property)]
+    fn display_apply_paused(&self) -> zbus::Result<bool>;
 }
 
 async fn emit_keyboard_attached_changed() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
@@ -398,6 +500,7 @@ pub async fn start_root_service(
     let registration = Arc::new(RwLock::new(None));
     let registered = Arc::new(AtomicBool::new(false));
     let (ack_tx, _) = broadcast::channel(16);
+    let apply_guard = Arc::new(Mutex::new(DisplayApplyGuard::default()));
 
     let connection = connection::Builder::system()?
         .name(ROOT_DBUS_SERVICE)?
@@ -408,6 +511,7 @@ pub async fn start_root_service(
                 registration.clone(),
                 registered.clone(),
                 ack_tx.clone(),
+                apply_guard,
             ),
         )?
         .build()
@@ -486,6 +590,75 @@ pub async fn wait_for_keyboard_attached_ack(attached: bool, timeout: Duration) -
 
 pub async fn wait_for_desired_secondary_ack(enabled: bool, timeout: Duration) -> bool {
     wait_for_ack(AckEvent::DesiredSecondaryApplied(enabled), timeout).await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayApplyPermit {
+    /// Root cleared this apply; session may call Mutter `apply_monitors_config`.
+    Allowed,
+    /// Root guard is paused or over budget; session must not apply.
+    Paused,
+}
+
+/// Ask the root daemon for permission before each `apply_monitors_config`.
+/// Fail-closed: if the system bus or method call fails, returns `Err` and the session must not apply.
+///
+/// Uses the same system bus connection as [`run_session_client`]'s successful `register_session`
+/// so the D-Bus sender matches the registered session owner.
+///
+/// If the root daemon still has an older unique name (e.g. identity drift without triggering our
+/// reconnect loop), we call [`RootState::register_session`] once and retry the guard call.
+pub async fn register_display_apply_attempt() -> Result<DisplayApplyPermit, String> {
+    let (connection, session_id) = {
+        let guard = session_registered_system_bus_cell().lock().await;
+        guard
+            .as_ref()
+            .map(|(c, sid)| (c.clone(), *sid))
+            .ok_or_else(|| {
+                "session system bus not registered yet (is the session daemon running and connected to root?)"
+                    .to_string()
+            })?
+    };
+
+    let mut re_registered = false;
+    loop {
+        let proxy = RootStateProxy::new(&connection)
+            .await
+            .map_err(|e| format!("root state proxy for display apply guard: {e}"))?;
+
+        match proxy.register_display_apply_attempt().await {
+            Ok(true) => return Ok(DisplayApplyPermit::Allowed),
+            Ok(false) => return Ok(DisplayApplyPermit::Paused),
+            Err(e) => {
+                let msg = e.to_string();
+                let sender_mismatch = msg.contains("does not match registered session");
+                if sender_mismatch && !re_registered {
+                    warn!(
+                        "SESSION DBus: display apply guard reports sender mismatch vs root registration; \
+                         calling register_session again (session_id={session_id})"
+                    );
+                    proxy
+                        .register_session(session_id)
+                        .await
+                        .map_err(|e2| {
+                            format!(
+                                "register_session after display guard sender mismatch: {e2} (was: {msg})"
+                            )
+                        })?;
+                    re_registered = true;
+                    continue;
+                }
+                return Err(format!("register_display_apply_attempt: {e}"));
+            }
+        }
+    }
+}
+
+pub async fn resume_display_applies() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let connection = Connection::system().await?;
+    let proxy = RootStateProxy::new(&connection).await?;
+    proxy.resume_display_applies().await?;
+    Ok(())
 }
 
 async fn wait_for_internal_ack(
@@ -584,6 +757,7 @@ pub async fn run_session_client(
 
     loop {
         if !coalesce_latest_ambient_value(&mut ambient_report_rx, &mut latest_ambient_value) {
+            replace_session_registered_system_bus(None).await;
             return;
         }
 
@@ -611,14 +785,19 @@ pub async fn run_session_client(
             continue;
         }
         info!("SESSION DBus: registered with root daemon");
+        // Publish immediately so display reconcile can use the guard before stream setup finishes;
+        // keep the same `Connection` as `register_session` for matching bus unique name.
+        replace_session_registered_system_bus(Some((connection.clone(), session_id))).await;
 
         if !coalesce_latest_ambient_value(&mut ambient_report_rx, &mut latest_ambient_value) {
+            replace_session_registered_system_bus(None).await;
             return;
         }
 
         if let Some(value) = latest_ambient_value {
             if let Err(e) = proxy.report_ambient_light_enabled(value).await {
                 warn!("SESSION DBus: failed to replay ambient_light_enabled={value} after registration: {e}");
+                replace_session_registered_system_bus(None).await;
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 continue;
             }
@@ -662,6 +841,7 @@ pub async fn run_session_client(
             Ok(proxy) => proxy,
             Err(e) => {
                 error!("SESSION DBus: failed to create org.freedesktop.DBus proxy: {e}");
+                replace_session_registered_system_bus(None).await;
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 continue;
             }
@@ -674,6 +854,7 @@ pub async fn run_session_client(
             Ok(stream) => stream,
             Err(e) => {
                 error!("SESSION DBus: failed to subscribe to root owner changes: {e}");
+                replace_session_registered_system_bus(None).await;
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 continue;
             }
@@ -771,6 +952,7 @@ pub async fn run_session_client(
             }
         }
 
+        replace_session_registered_system_bus(None).await;
         info!("SESSION DBus: reconnecting to root daemon");
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
