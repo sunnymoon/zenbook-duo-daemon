@@ -4,6 +4,7 @@ use std::{path::PathBuf, process, sync::Arc};
 use tokio::fs;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{Mutex, broadcast};
+use crate::dbus_state::OperatorCommand;
 use crate::{
     config::{Config, DEFAULT_CONFIG_PATH},
     events::Event,
@@ -11,11 +12,10 @@ use crate::{
     keyboard_usb::{find_wired_keyboard, start_usb_keyboard_monitor_task, start_usb_keyboard_task},
     mute_state::start_listen_mute_state_thread,
     secondary_display::start_secondary_display_task,
-    state::{KeyboardBacklightState, KeyboardStateManager},
-    unix_pipe::start_receive_commands_task,
+    state::KeyboardStateManager,
     virtual_keyboard::VirtualKeyboard,
 };
-use clap::Parser;
+use clap::{Parser, Subcommand, ValueEnum};
 use keyboard_bt::start_bt_keyboard_monitor_task;
 use log::{error, info, warn};
 
@@ -36,8 +36,58 @@ enum Args {
         #[arg(short, long)]
         config_path: Option<PathBuf>,
     },
-    /// Resume display applies after root-side safety guard paused them
+    /// Resume display applies after root-side safety guard paused them (root only on bus)
     ResumeDisplayApplies,
+    /// Operator command (D-Bus to running root daemon; requires `zenbook-duo` group or root)
+    Control {
+        #[command(subcommand)]
+        cmd: ControlCmd,
+    },
+}
+
+/// Backlight level for `control keyboard-backlight set`.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum BacklightLevelArg {
+    Off,
+    Low,
+    Medium,
+    High,
+}
+
+impl BacklightLevelArg {
+    fn to_u8(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::Low => 1,
+            Self::Medium => 2,
+            Self::High => 3,
+        }
+    }
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum ControlCmd {
+    /// Toggle microphone-mute LED
+    MicMuteLedToggle,
+    /// Set microphone-mute LED on or off (`true` / `false`)
+    MicMuteLed {
+        #[arg(action = clap::ArgAction::Set, value_parser = clap::value_parser!(bool))]
+        on: bool,
+    },
+    /// Cycle keyboard backlight
+    KeyboardBacklightToggle,
+    /// Set keyboard backlight level
+    KeyboardBacklightSet {
+        #[arg(value_enum)]
+        level: BacklightLevelArg,
+    },
+    /// Toggle desired secondary display
+    SecondaryDisplayToggle,
+    /// Enable or disable desired secondary display (`true` / `false`)
+    SecondaryDisplay {
+        #[arg(action = clap::ArgAction::Set, value_parser = clap::value_parser!(bool))]
+        on: bool,
+    },
 }
 
 mod config;
@@ -50,7 +100,6 @@ mod mute_state;
 mod secondary_display;
 mod session;
 mod state;
-mod unix_pipe;
 mod virtual_keyboard;
 
 #[tokio::main(flavor = "current_thread")]
@@ -77,6 +126,22 @@ async fn main() {
                     error!("Failed to resume display applies: {e}");
                     process::exit(1);
                 }
+            }
+        }
+        Args::Control { cmd } => {
+            let op = match cmd {
+                ControlCmd::MicMuteLedToggle => OperatorCommand::ToggleMicMuteLed,
+                ControlCmd::MicMuteLed { on } => OperatorCommand::SetMicMuteLed(on),
+                ControlCmd::KeyboardBacklightToggle => OperatorCommand::ToggleKeyboardBacklight,
+                ControlCmd::KeyboardBacklightSet { level } => {
+                    OperatorCommand::SetKeyboardBacklightLevel(level.to_u8())
+                }
+                ControlCmd::SecondaryDisplayToggle => OperatorCommand::ToggleSecondaryDisplay,
+                ControlCmd::SecondaryDisplay { on } => OperatorCommand::SetSecondaryDisplay(on),
+            };
+            if let Err(e) = dbus_state::run_operator_command(op).await {
+                error!("{e}");
+                process::exit(1);
             }
         }
     }
@@ -154,7 +219,13 @@ async fn run_daemon(config_path: PathBuf) {
     )
     .await;
 
-    if let Err(e) = dbus_state::start_root_service(state_manager.clone()).await {
+    if let Err(e) = dbus_state::start_root_service(
+        state_manager.clone(),
+        config.clone(),
+        activity_notifier.clone(),
+    )
+    .await
+    {
         error!("Failed to start root D-Bus service: {e}");
         process::exit(1);
     }
@@ -177,8 +248,6 @@ async fn run_daemon(config_path: PathBuf) {
     );
 
     start_listen_mute_state_thread(state_manager.clone());
-
-    start_receive_commands_task(&config, state_manager.clone(), activity_notifier.clone());
 
     // Forward keyboard attachment state changes over D-Bus.
     // If no session is registered, or if it does not acknowledge in time, fall back to sysfs.

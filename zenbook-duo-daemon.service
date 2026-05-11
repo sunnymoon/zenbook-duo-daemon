@@ -1,6 +1,7 @@
 [Unit]
 Description=Zenbook Duo Daemon
-After=sysinit.target dbus.service
+After=sysinit.target dbus.service systemd-logind.service
+Wants=systemd-logind.service
 StartLimitIntervalSec=300
 StartLimitBurst=5
 

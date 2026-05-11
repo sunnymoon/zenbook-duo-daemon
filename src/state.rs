@@ -2,7 +2,7 @@ use crate::events::Event;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use tokio::sync::broadcast;
 
 const STATE_DIR: &str = "/var/lib/zenbook-duo-daemon";
@@ -15,6 +15,45 @@ struct PersistedDisplayState {
     desired_secondary_enabled: Option<bool>,
     display_brightness: Option<u32>,
     ambient_light_enabled: Option<bool>,
+}
+
+/// Serializes all display-state JSON read/modify/write so concurrent tasks cannot clobber fields.
+fn display_state_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+fn read_display_state_file_inner() -> PersistedDisplayState {
+    let path = Path::new(DISPLAY_STATE_FILE);
+    if !path.exists() {
+        return PersistedDisplayState::default();
+    }
+
+    match fs::read_to_string(path) {
+        Ok(content) => serde_json::from_str::<PersistedDisplayState>(&content).unwrap_or_default(),
+        Err(_) => PersistedDisplayState::default(),
+    }
+}
+
+fn write_display_state_file_atomically(state: &PersistedDisplayState) {
+    let _ = fs::create_dir_all(STATE_DIR);
+    let Ok(json) = serde_json::to_string(state) else {
+        return;
+    };
+    let tmp = format!("{}.tmp", DISPLAY_STATE_FILE);
+    if fs::write(&tmp, &json).is_err() {
+        let _ = fs::remove_file(&tmp);
+        return;
+    }
+    let _ = fs::rename(&tmp, DISPLAY_STATE_FILE);
+}
+
+fn with_display_state<R>(f: impl FnOnce(&mut PersistedDisplayState) -> R) -> R {
+    let _guard = display_state_lock().lock().unwrap();
+    let mut state = read_display_state_file_inner();
+    let out = f(&mut state);
+    write_display_state_file_atomically(&state);
+    out
 }
 
 fn persist_backlight(state: KeyboardBacklightState) {
@@ -42,63 +81,37 @@ fn load_backlight() -> KeyboardBacklightState {
     }
 }
 
-fn load_display_state() -> PersistedDisplayState {
-    let path = Path::new(DISPLAY_STATE_FILE);
-    if !path.exists() {
-        return PersistedDisplayState::default();
-    }
-
-    match fs::read_to_string(path) {
-        Ok(content) => serde_json::from_str::<PersistedDisplayState>(&content).unwrap_or_default(),
-        Err(_) => PersistedDisplayState::default(),
-    }
-}
-
-fn persist_display_state(state: &PersistedDisplayState) {
-    let _ = fs::create_dir_all(STATE_DIR);
-    if let Ok(json) = serde_json::to_string(state) {
-        let _ = fs::write(DISPLAY_STATE_FILE, json);
-    }
-}
-
 fn persist_desired_primary(primary: &str) {
-    let mut state = load_display_state();
-    state.desired_primary = Some(primary.to_string());
-    persist_display_state(&state);
+    with_display_state(|state| {
+        state.desired_primary = Some(primary.to_string());
+    });
 }
 
 fn persist_desired_secondary(enabled: bool) {
-    let mut state = load_display_state();
-    state.desired_secondary_enabled = Some(enabled);
-    persist_display_state(&state);
+    with_display_state(|state| {
+        state.desired_secondary_enabled = Some(enabled);
+    });
 }
 
 fn load_desired_primary() -> Option<String> {
-    load_display_state().desired_primary
-}
-
-fn load_desired_secondary() -> Option<bool> {
-    load_display_state().desired_secondary_enabled
-}
-
-fn persist_display_brightness(brightness: u32) {
-    let mut state = load_display_state();
-    state.display_brightness = Some(brightness);
-    persist_display_state(&state);
+    let _guard = display_state_lock().lock().unwrap();
+    read_display_state_file_inner().desired_primary
 }
 
 fn load_display_brightness() -> Option<u32> {
-    load_display_state().display_brightness
+    let _guard = display_state_lock().lock().unwrap();
+    read_display_state_file_inner().display_brightness
 }
 
 fn persist_ambient_light_enabled(enabled: bool) {
-    let mut state = load_display_state();
-    state.ambient_light_enabled = Some(enabled);
-    persist_display_state(&state);
+    with_display_state(|state| {
+        state.ambient_light_enabled = Some(enabled);
+    });
 }
 
-fn load_ambient_light_enabled() -> Option<bool> {
-    load_display_state().ambient_light_enabled
+fn load_display_snapshot() -> PersistedDisplayState {
+    let _guard = display_state_lock().lock().unwrap();
+    read_display_state_file_inner()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -146,16 +159,16 @@ pub struct KeyboardStateManager {
 
 impl KeyboardStateManager {
     pub fn new(is_usb_attached: bool, sender: broadcast::Sender<Event>) -> Self {
-        let desired_secondary_display_enabled =
-            load_desired_secondary().unwrap_or(true);
-        let ambient_light_enabled = load_ambient_light_enabled().unwrap_or(false);
+        let snap = load_display_snapshot();
+        let desired_secondary_display_enabled = snap.desired_secondary_enabled.unwrap_or(true);
+        let ambient_light_enabled = snap.ambient_light_enabled.unwrap_or(false);
         let is_secondary_display_enabled = if is_usb_attached {
             false
         } else {
             desired_secondary_display_enabled
         };
 
-        if load_ambient_light_enabled().is_none() {
+        if snap.ambient_light_enabled.is_none() {
             persist_ambient_light_enabled(ambient_light_enabled);
         }
 
@@ -239,20 +252,26 @@ impl KeyboardStateManager {
     }
 
     pub fn set_keyboard_backlight(&self, new_state: KeyboardBacklightState) {
-        let mut state = self.state.write().unwrap();
-        state.backlight = new_state;
+        let should_emit = {
+            let mut state = self.state.write().unwrap();
+            state.backlight = new_state;
+            !state.is_idle && !state.is_suspended
+        };
         persist_backlight(new_state);
-        if !state.is_idle && !state.is_suspended {
+        if should_emit {
             self.sender.send(Event::Backlight(new_state)).ok();
         }
     }
 
     pub fn toggle_keyboard_backlight(&self) {
-        let mut state = self.state.write().unwrap();
-        state.backlight = state.backlight.next();
-        persist_backlight(state.backlight);
-        if !state.is_idle && !state.is_suspended {
-            self.sender.send(Event::Backlight(state.backlight)).ok();
+        let (next, should_emit) = {
+            let mut state = self.state.write().unwrap();
+            state.backlight = state.backlight.next();
+            (state.backlight, !state.is_idle && !state.is_suspended)
+        };
+        persist_backlight(next);
+        if should_emit {
+            self.sender.send(Event::Backlight(next)).ok();
         }
     }
 
@@ -266,35 +285,46 @@ impl KeyboardStateManager {
     }
 
     pub fn set_secondary_display(&self, enabled: bool) {
-        let mut state = self.state.write().unwrap();
-        state.desired_secondary_display_enabled = enabled;
-        state.is_secondary_display_enabled = if state.is_usb_attached { false } else { enabled };
+        let is_secondary_display_enabled = {
+            let mut state = self.state.write().unwrap();
+            state.desired_secondary_display_enabled = enabled;
+            state.is_secondary_display_enabled = if state.is_usb_attached { false } else { enabled };
+            state.is_secondary_display_enabled
+        };
         persist_desired_secondary(enabled);
 
         self.sender
-            .send(Event::SecondaryDisplay(state.is_secondary_display_enabled))
+            .send(Event::SecondaryDisplay(is_secondary_display_enabled))
             .ok();
     }
 
     pub fn set_secondary_display_tracked(&self, enabled: bool) {
-        let mut state = self.state.write().unwrap();
-        state.desired_secondary_display_enabled = enabled;
-        state.is_secondary_display_enabled = if state.is_usb_attached { false } else { enabled };
+        {
+            let mut state = self.state.write().unwrap();
+            state.desired_secondary_display_enabled = enabled;
+            state.is_secondary_display_enabled = if state.is_usb_attached { false } else { enabled };
+        }
         persist_desired_secondary(enabled);
     }
 
     pub fn toggle_secondary_display(&self) {
-        let mut state = self.state.write().unwrap();
-        state.desired_secondary_display_enabled = !state.desired_secondary_display_enabled;
-        state.is_secondary_display_enabled = if state.is_usb_attached {
-            false
-        } else {
-            state.desired_secondary_display_enabled
+        let (desired, is_secondary_display_enabled) = {
+            let mut state = self.state.write().unwrap();
+            state.desired_secondary_display_enabled = !state.desired_secondary_display_enabled;
+            state.is_secondary_display_enabled = if state.is_usb_attached {
+                false
+            } else {
+                state.desired_secondary_display_enabled
+            };
+            (
+                state.desired_secondary_display_enabled,
+                state.is_secondary_display_enabled,
+            )
         };
-        persist_desired_secondary(state.desired_secondary_display_enabled);
+        persist_desired_secondary(desired);
 
         self.sender
-            .send(Event::SecondaryDisplay(state.is_secondary_display_enabled))
+            .send(Event::SecondaryDisplay(is_secondary_display_enabled))
             .ok();
     }
 
@@ -383,16 +413,25 @@ impl KeyboardStateManager {
     }
 
     pub fn set_display_brightness_value(&self, brightness: u32) {
-        if load_display_brightness() == Some(brightness) {
-            return;
-        }
-        persist_display_brightness(brightness);
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                if let Err(e) = crate::dbus_state::notify_display_brightness_changed().await {
-                    log::warn!("Failed to publish display_brightness update over D-Bus: {}", e);
-                }
-            });
+        let changed = {
+            let _guard = display_state_lock().lock().unwrap();
+            let mut s = read_display_state_file_inner();
+            if s.display_brightness == Some(brightness) {
+                false
+            } else {
+                s.display_brightness = Some(brightness);
+                write_display_state_file_atomically(&s);
+                true
+            }
+        };
+        if changed {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    if let Err(e) = crate::dbus_state::notify_display_brightness_changed().await {
+                        log::warn!("Failed to publish display_brightness update over D-Bus: {}", e);
+                    }
+                });
+            }
         }
     }
 
@@ -401,8 +440,10 @@ impl KeyboardStateManager {
     }
 
     pub fn set_ambient_light_enabled(&self, enabled: bool) {
-        let mut state = self.state.write().unwrap();
-        state.ambient_light_enabled = enabled;
+        {
+            let mut state = self.state.write().unwrap();
+            state.ambient_light_enabled = enabled;
+        }
         persist_ambient_light_enabled(enabled);
     }
 

@@ -7,10 +7,12 @@ use futures::StreamExt;
 use log::{error, info, warn};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use zbus::fdo::{self, DBusProxy};
-use zbus::message::Header;
-use zbus::{Connection, connection, proxy};
+use zbus::message::{Header, Type};
+use zbus::{MatchRule, MessageStream, connection, proxy, Connection};
 
-use crate::state::KeyboardStateManager;
+use crate::config::Config;
+use crate::idle_detection::ActivityNotifier;
+use crate::state::{KeyboardBacklightState, KeyboardStateManager};
 
 pub const ROOT_DBUS_SERVICE: &str = "asus.zenbook.duo";
 pub const ROOT_DBUS_PATH: &str = "/asus/zenbook/duo/State";
@@ -114,6 +116,45 @@ impl RootStateInterface {
             )),
         }
     }
+
+    /// Operators (CLI / scripts): root UID or normal user (UID ≥ 1000). System accounts in between are rejected.
+    async fn require_operator(
+        &self,
+        header: &Header<'_>,
+        connection: &Connection,
+    ) -> fdo::Result<()> {
+        let Some(sender) = header.sender() else {
+            return Err(fdo::Error::AccessDenied("missing D-Bus sender".into()));
+        };
+        let dbus_proxy = DBusProxy::new(connection)
+            .await
+            .map_err(|e| fdo::Error::Failed(format!("failed to query D-Bus for caller UID: {e}")))?;
+        let bus_name = zbus::names::BusName::try_from(sender.as_str())
+            .map_err(|e| fdo::Error::Failed(format!("invalid sender bus name: {e}")))?;
+        let uid = dbus_proxy
+            .get_connection_unix_user(bus_name)
+            .await
+            .map_err(|e| fdo::Error::Failed(format!("failed to get caller UID: {e}")))?;
+        if uid > 0 && uid < 1000 {
+            warn!("ROOT DBus: rejected operator command from system UID {uid}");
+            return Err(fdo::Error::AccessDenied(format!(
+                "UID {uid} is not permitted to run operator commands"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// One-shot commands forwarded to the running root daemon (see CLI `control` / legacy shell scripts).
+#[derive(Debug, Clone)]
+pub enum OperatorCommand {
+    ToggleMicMuteLed,
+    SetMicMuteLed(bool),
+    ToggleKeyboardBacklight,
+    /// 0 = off, 1 = low, 2 = medium, 3 = high
+    SetKeyboardBacklightLevel(u8),
+    ToggleSecondaryDisplay,
+    SetSecondaryDisplay(bool),
 }
 
 #[zbus::interface(name = "asus.zenbook.duo.State")]
@@ -318,6 +359,86 @@ impl RootStateInterface {
         info!("ROOT DBus: display apply guard resumed by root command");
         Ok(())
     }
+
+    async fn toggle_mic_mute_led(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+    ) -> fdo::Result<()> {
+        self.require_operator(&header, connection).await?;
+        self.state_manager.toggle_mic_mute_led();
+        Ok(())
+    }
+
+    async fn set_mic_mute_led(
+        &self,
+        enabled: bool,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+    ) -> fdo::Result<()> {
+        self.require_operator(&header, connection).await?;
+        self.state_manager.set_mic_mute_led(enabled);
+        Ok(())
+    }
+
+    async fn toggle_keyboard_backlight(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+    ) -> fdo::Result<()> {
+        self.require_operator(&header, connection).await?;
+        self.state_manager.toggle_keyboard_backlight();
+        Ok(())
+    }
+
+    async fn set_keyboard_backlight_level(
+        &self,
+        level: u8,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+    ) -> fdo::Result<()> {
+        self.require_operator(&header, connection).await?;
+        let state = match level {
+            0 => KeyboardBacklightState::Off,
+            1 => KeyboardBacklightState::Low,
+            2 => KeyboardBacklightState::Medium,
+            3 => KeyboardBacklightState::High,
+            _ => {
+                return Err(fdo::Error::Failed(format!(
+                    "keyboard backlight level must be 0..=3, got {level}"
+                )));
+            }
+        };
+        self.state_manager.set_keyboard_backlight(state);
+        Ok(())
+    }
+
+    async fn toggle_secondary_display(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+    ) -> fdo::Result<()> {
+        self.require_operator(&header, connection).await?;
+        self.state_manager.toggle_secondary_display();
+        if let Err(e) = emit_desired_secondary_changed().await {
+            warn!("toggle_secondary_display: failed to notify session D-Bus: {e}");
+        }
+        Ok(())
+    }
+
+    async fn set_secondary_display_desired(
+        &self,
+        enabled: bool,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+    ) -> fdo::Result<()> {
+        self.require_operator(&header, connection).await?;
+        self.state_manager.set_secondary_display(enabled);
+        if let Err(e) = emit_desired_secondary_changed().await {
+            warn!("set_secondary_display_desired: failed to notify session D-Bus: {e}");
+        }
+        Ok(())
+    }
 }
 
 #[proxy(
@@ -332,6 +453,12 @@ trait RootState {
     fn report_ambient_light_enabled(&self, value: bool) -> zbus::Result<()>;
     fn register_display_apply_attempt(&self) -> zbus::Result<bool>;
     fn resume_display_applies(&self) -> zbus::Result<()>;
+    fn toggle_mic_mute_led(&self) -> zbus::Result<()>;
+    fn set_mic_mute_led(&self, enabled: bool) -> zbus::Result<()>;
+    fn toggle_keyboard_backlight(&self) -> zbus::Result<()>;
+    fn set_keyboard_backlight_level(&self, level: u8) -> zbus::Result<()>;
+    fn toggle_secondary_display(&self) -> zbus::Result<()>;
+    fn set_secondary_display_desired(&self, enabled: bool) -> zbus::Result<()>;
 
     #[zbus(property)]
     fn keyboard_attached(&self) -> zbus::Result<bool>;
@@ -494,8 +621,84 @@ async fn watch_registered_session(connection: Connection) {
     }
 }
 
+async fn watch_prepare_for_sleep(
+    config: Config,
+    state_manager: KeyboardStateManager,
+    activity_notifier: ActivityNotifier,
+) {
+    const RULE: &str = "type='signal',interface='org.freedesktop.login1.Manager',member='PrepareForSleep',path='/org/freedesktop/login1'";
+    let rule = match MatchRule::try_from(RULE) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("logind PrepareForSleep: invalid match rule: {e}");
+            return;
+        }
+    };
+
+    let connection = match Connection::system().await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("logind PrepareForSleep: system bus failed: {e}");
+            return;
+        }
+    };
+
+    let mut stream = match MessageStream::for_match_rule(rule, &connection, None).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("logind PrepareForSleep: subscribe failed: {e}");
+            return;
+        }
+    };
+
+    info!("logind: subscribed to PrepareForSleep");
+    while let Some(item) = stream.next().await {
+        let msg = match item {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("logind PrepareForSleep stream: {e}");
+                continue;
+            }
+        };
+        if msg.header().message_type() != Type::Signal {
+            continue;
+        }
+
+        let start: bool = match msg.body().deserialize_unchecked() {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("logind PrepareForSleep: bad signal body: {e}");
+                continue;
+            }
+        };
+
+        if start {
+            info!("PrepareForSleep(start=true): suspending");
+            state_manager.suspend_start();
+        } else {
+            info!("PrepareForSleep(start=false): resumed");
+            state_manager.suspend_end();
+            activity_notifier.notify();
+
+            let current_usb_attached =
+                crate::keyboard_usb::find_wired_keyboard(&config).await.is_some();
+            let reported_attached = state_manager.is_usb_keyboard_attached();
+            if current_usb_attached != reported_attached {
+                info!(
+                    "Post-resume keyboard state mismatch: usb_attached={current_usb_attached}, reported={reported_attached} — updating state"
+                );
+                state_manager.set_usb_keyboard_attached(current_usb_attached);
+            }
+        }
+    }
+
+    warn!("logind PrepareForSleep stream ended");
+}
+
 pub async fn start_root_service(
     state_manager: KeyboardStateManager,
+    config: Config,
+    activity_notifier: ActivityNotifier,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let registration = Arc::new(RwLock::new(None));
     let registered = Arc::new(AtomicBool::new(false));
@@ -507,7 +710,7 @@ pub async fn start_root_service(
         .serve_at(
             ROOT_DBUS_PATH,
             RootStateInterface::new(
-                state_manager,
+                state_manager.clone(),
                 registration.clone(),
                 registered.clone(),
                 ack_tx.clone(),
@@ -527,7 +730,13 @@ pub async fn start_root_service(
         });
     }
 
-    tokio::spawn(watch_registered_session(connection));
+    tokio::spawn(watch_registered_session(connection.clone()));
+    let cfg = config.clone();
+    let sm = state_manager.clone();
+    let an = activity_notifier.clone();
+    tokio::spawn(async move {
+        watch_prepare_for_sleep(cfg, sm, an).await;
+    });
     info!("ROOT DBus: exported {}", ROOT_DBUS_SERVICE);
     Ok(())
 }
@@ -659,6 +868,29 @@ pub async fn resume_display_applies() -> Result<(), Box<dyn std::error::Error + 
     let proxy = RootStateProxy::new(&connection).await?;
     proxy.resume_display_applies().await?;
     Ok(())
+}
+
+pub async fn run_operator_command(cmd: OperatorCommand) -> Result<(), String> {
+    let connection = Connection::system()
+        .await
+        .map_err(|e| format!("system bus: {e}"))?;
+    let proxy = RootStateProxy::new(&connection)
+        .await
+        .map_err(|e| format!("Connect to {}: {e}", ROOT_DBUS_SERVICE))?;
+
+    match cmd {
+        OperatorCommand::ToggleMicMuteLed => proxy.toggle_mic_mute_led().await,
+        OperatorCommand::SetMicMuteLed(enabled) => proxy.set_mic_mute_led(enabled).await,
+        OperatorCommand::ToggleKeyboardBacklight => proxy.toggle_keyboard_backlight().await,
+        OperatorCommand::SetKeyboardBacklightLevel(level) => {
+            proxy.set_keyboard_backlight_level(level).await
+        }
+        OperatorCommand::ToggleSecondaryDisplay => proxy.toggle_secondary_display().await,
+        OperatorCommand::SetSecondaryDisplay(enabled) => {
+            proxy.set_secondary_display_desired(enabled).await
+        }
+    }
+    .map_err(|e| e.to_string())
 }
 
 async fn wait_for_internal_ack(

@@ -25,17 +25,15 @@ The project currently installs multiple components:
 - **Root daemon** (`zenbook-duo-daemon.service`)
   - handles USB keyboard access
   - handles Bluetooth keyboard vendor GATT control
-  - exposes authoritative state on the system D-Bus
-  - manages keyboard backlight, mic-mute LED, pipe commands, and secondary-display sysfs fallback
+  - exposes authoritative state on the system D-Bus (including operator commands formerly sent via a FIFO)
+  - subscribes to **logind** `PrepareForSleep` for suspend/resume (no separate sleep-hook units)
+  - manages keyboard backlight, mic-mute LED, and secondary-display sysfs fallback
+  - rate-limits display configuration applies from the session (blast-radius); if applies are paused after a burst, run `sudo zenbook-duo-daemon resume-display-applies`
 - **Session daemon** (`zenbook-duo-session.service`)
   - runs inside the graphical user session
   - applies display/orientation changes through GNOME/Mutter
   - monitors GNOME ambient light setting
   - acknowledges root requests over D-Bus
-- **Sleep hook services**
-  - `zenbook-duo-daemon-pre-sleep.service`
-  - `zenbook-duo-daemon-post-sleep.service`
-  - send suspend lifecycle events to the daemon through the control pipe
 
 ## What currently works
 
@@ -56,6 +54,7 @@ The project currently installs multiple components:
 
 - ⚠️ The project currently targets **GNOME** as the supported desktop environment for session-side display behavior
 - ⚠️ Display recovery/startup edge cases are improved but still an active area of refinement
+- ⚠️ **External monitors** are out of scope: layout and verification logic focus on **eDP-1** and **eDP-2**. Adding HDMI/DP/etc. may result in those outputs being omitted from an `ApplyMonitorsConfig` rebuild or in verification failing until the external is disconnected.
 - ⚠️ The daemon only remaps the **Zenbook-specific special keys** that require vendor handling; standard keys that already arrive as normal evdev keys are not remapped by the daemon
 
 ## Dual display / Mutter apply ordering (important for Duo internals)
@@ -154,18 +153,27 @@ systemctl status zenbook-duo-daemon.service
 systemctl --user status zenbook-duo-session.service
 ```
 
+### Debugging display applies
+
+- Compare Mutter’s view with what you expect: `gdctl show` (same API family the session daemon uses).
+- Session logs: `journalctl --user -u zenbook-duo-session.service --since "15 min ago"`.
+- Pre-apply “current vs desired” layout diffs are logged at **debug**; set `RUST_LOG=debug` on `zenbook-duo-session.service` (e.g. `systemctl --user edit zenbook-duo-session.service`) when chasing ordering or verification issues.
+- If the root daemon has **paused** further display applies after too many attempts in a short window: `sudo zenbook-duo-daemon resume-display-applies`, then investigate the burst in journals before it happens again.
+
 ## What the install script does
 
 The install script currently:
 
 1. installs the daemon binary into `/opt/zenbook-duo-daemon`
-2. installs the root service, session service, and sleep hook services
+2. installs the root and user session systemd units
 3. installs the D-Bus policy file into `/etc/dbus-1/system.d/zenbook-duo-daemon-dbus.conf`
-4. reloads D-Bus if possible
-5. merges the Zenbook libinput quirks into `/etc/libinput/local-overrides.quirks`
-6. runs config migration if needed
-7. enables the root service, the sleep hook services, and the user session service
-8. restarts the session service for active logged-in users when possible
+4. ensures the **`zenbook-duo`** system group exists and adds active `loginctl` users plus the user who ran **`sudo ./install`** (`SUDO_USER`) when present
+5. removes any **legacy** control FIFO (`/tmp/zenbook-duo-daemon.pipe`) and pre/post-sleep units from older installs
+6. reloads D-Bus if possible
+7. merges the Zenbook libinput quirks into `/etc/libinput/local-overrides.quirks`
+8. runs config migration if needed
+9. enables the root service and the user session service
+10. restarts the session service for active logged-in users when possible
 
 ### D-Bus policy note
 
@@ -174,6 +182,12 @@ The D-Bus policy is installed as its **own file**:
 - `/etc/dbus-1/system.d/zenbook-duo-daemon-dbus.conf`
 
 It is **copied into place**, not XML-merged into another file. That is the correct model for D-Bus policy deployment here.
+
+Only **`root`** (the daemon) and members of the **`zenbook-duo`** group may send to or receive from this service on the system bus (`install` creates the group, adds active `loginctl` users, and adds **`SUDO_USER`** when you run `sudo ./install`, but **a logout/login is required** so the session picks up the new group). Unprivileged callers without that membership will get access errors instead of being able to replace the registered session connection.
+
+`register_session` additionally rejects callers whose D-Bus credentials report a **UID below 1000** (system accounts). Operator-style methods reject UIDs **1–999** (non-root system accounts). `resume_display_applies` accepts **root UID only** (intended for `sudo zenbook-duo-daemon resume-display-applies`).
+
+Tighter models (Polkit rules per method, seat/session matching for registration, or splitting state by user) are possible follow-ups if multi-user shared machines need stronger isolation than “members of `zenbook-duo` trust each other on this host.”
 
 ## Configuration
 
@@ -187,46 +201,27 @@ You can configure:
 - idle timeout
 - special-key remappings
 - keyboard USB VID:PID if needed
-- brightness/status/pipe paths
+- backlight and secondary-display sysfs paths
 
-## Control pipe
+## Operator CLI (D-Bus)
 
-The daemon creates a named pipe at:
+The **root** daemon must be running. Commands call **D-Bus** on `asus.zenbook.duo`; you must be in **`zenbook-duo`** or **root** (same as the bus policy). See `zenbook-duo-daemon --help` and `control --help`.
 
-- `/tmp/zenbook-duo-daemon.pipe`
-
-Example:
+Examples:
 
 ```bash
-echo mic_mute_led_toggle > /tmp/zenbook-duo-daemon.pipe
+zenbook-duo-daemon control mic-mute-led-toggle
+zenbook-duo-daemon control mic-mute-led true
+zenbook-duo-daemon control keyboard-backlight-toggle
+zenbook-duo-daemon control keyboard-backlight-set medium
+zenbook-duo-daemon control secondary-display-toggle
+zenbook-duo-daemon control secondary-display false
+sudo zenbook-duo-daemon resume-display-applies
 ```
 
-Available commands:
+## Suspend / resume
 
-| Command                    | Description |
-| -------------------------- | ----------- |
-| `mic_mute_led_toggle`      | Toggle microphone mute LED |
-| `mic_mute_led_on`          | Turn on microphone mute LED |
-| `mic_mute_led_off`         | Turn off microphone mute LED |
-| `backlight_toggle`         | Cycle keyboard backlight |
-| `backlight_off`            | Set keyboard backlight off |
-| `backlight_low`            | Set keyboard backlight low |
-| `backlight_medium`         | Set keyboard backlight medium |
-| `backlight_high`           | Set keyboard backlight high |
-| `secondary_display_toggle` | Toggle the secondary display desired state |
-| `secondary_display_on`     | Enable the secondary display desired state |
-| `secondary_display_off`    | Disable the secondary display desired state |
-| `suspend_start`            | Notify the daemon that suspend is starting |
-| `suspend_end`              | Notify the daemon that suspend has ended |
-
-## Why the sleep hook services still exist
-
-Yes, they are still needed.
-
-- **Pre-sleep** is used to put the daemon into suspended state before the machine sleeps
-- **Post-sleep** restores state after resume and also triggers a **keyboard attachment rescan**, which is needed if the keyboard was attached or detached while the machine was asleep
-
-So those services are not obsolete.
+Suspend and resume are handled inside the root daemon via **logind**’s `PrepareForSleep` signal on the system bus (no `echo … >` FIFO and no `pre-sleep` / `post-sleep` systemd services). After resume the daemon refreshes idle/LED state and rescans USB keyboard attachment, matching the old post-sleep hook behavior.
 
 ## Development
 
@@ -248,3 +243,5 @@ cargo build
 cargo build
 sudo ./install local-install target/debug/zenbook-duo-daemon
 ```
+
+After install, ensure your user is in the **`zenbook-duo`** group (the script adds active loginctl users) and **log out and back in** so the session daemon can access the system D‑Bus service. See **D-Bus policy note** above.

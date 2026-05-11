@@ -10,8 +10,12 @@ use nusb::{
 use tokio::sync::{Mutex, broadcast};
 
 use crate::{
-    KeyboardBacklightState, config::Config, events::Event, idle_detection::ActivityNotifier,
-    parse_hex_string, state::KeyboardStateManager, virtual_keyboard::VirtualKeyboard,
+    config::Config,
+    events::Event,
+    idle_detection::ActivityNotifier,
+    parse_hex_string,
+    state::{KeyboardBacklightState, KeyboardStateManager},
+    virtual_keyboard::VirtualKeyboard,
 };
 
 pub async fn find_wired_keyboard(config: &Config) -> Option<DeviceInfo> {
@@ -40,6 +44,14 @@ pub fn start_usb_keyboard_monitor_task(
                     if device.vendor_id() == config.vendor_id()
                         && device.product_id() == config.product_id() =>
                 {
+                    if let Some((prev_id, shutdown_tx)) = current_keyboard.take() {
+                        info!(
+                            "USB keyboard hotplug: replacing stale session {:?} with new connection",
+                            prev_id
+                        );
+                        let _ = shutdown_tx.send(());
+                        tokio::time::sleep(Duration::from_millis(120)).await;
+                    }
                     current_keyboard = Some(
                         start_usb_keyboard_task(
                             &config,
@@ -192,63 +204,89 @@ async fn parse_keyboard_data(
     virtual_keyboard: &Arc<Mutex<VirtualKeyboard>>,
     state_manager: &KeyboardStateManager,
 ) {
-    // Only one function key can be pressed at a time, this is a hardware limitation
+    // ASUS vendor HID reports on interrupt endpoint 5 (`0x5a` prefix = 90). Hardware allows only one
+    // such special key at a time.
+    //
+    // Zenbook Duo row (Fn+F1–F3 mute / volume are ordinary evdev keys on the main keyboard node,
+    // not on this vendor channel). Fn+F7 is also **not** here: firmware injects **Super+P**
+    // (`KEY_LEFTMETA` + `KEY_P`) on the main keyboard for GNOME’s display-mode UI (join / mirror /
+    // built-in only / external), so `evtest` on event3 shows meta+P while event4/event5 stay quiet.
+    // Fn+F10 (Bluetooth pairing) is firmware/BlueZ — intentionally unmapped.
+    //
+    // | Physical key              | Vendor byte | Config action                    |
+    // |---------------------------+------------+----------------------------------|
+    // | Fn+F4 keyboard backlight  | 199        | keyboard_backlight_key           |
+    // | Fn+F5 brightness down     | 16         | brightness_down_key              |
+    // | Fn+F6 brightness up       | 32         | brightness_up_key                |
+    // | Fn+F8 swap primaries      | 156        | swap_up_down_display_key         |
+    // | Fn+F9 mic mute LED        | 124        | microphone_mute_key              |
+    // | Fn+F11 emoji              | 126        | emoji_picker_key                 |
+    // | Fn+F12 ASUS / MyASUS      | 134        | myasus_key                       |
+    // | Key right of F12 (bottom)| 106        | toggle_secondary_display_key     |
     match data {
         [90, 0, 0, 0, 0, 0] => {
             debug!("No key pressed");
             virtual_keyboard.lock().await.release_all_keys();
         }
         [90, 199, 0, 0, 0, 0] => {
-            debug!("Backlight key pressed");
+            // Fn+F4
+            debug!("Backlight key pressed (Fn+F4)");
             config
                 .keyboard_backlight_key
                 .execute(&virtual_keyboard, &state_manager)
                 .await;
         }
         [90, 16, 0, 0, 0, 0] => {
-            debug!("Brightness down key pressed");
+            // Fn+F5
+            debug!("Brightness down key pressed (Fn+F5)");
             config
                 .brightness_down_key
                 .execute(&virtual_keyboard, &state_manager)
                 .await;
         }
         [90, 32, 0, 0, 0, 0] => {
-            debug!("Brightness up key pressed");
+            // Fn+F6
+            debug!("Brightness up key pressed (Fn+F6)");
             config
                 .brightness_up_key
                 .execute(&virtual_keyboard, &state_manager)
                 .await;
         }
         [90, 156, 0, 0, 0, 0] => {
-            debug!("Swap up down display key pressed");
+            // Fn+F8
+            debug!("Swap up down display key pressed (Fn+F8)");
             config
                 .swap_up_down_display_key
                 .execute(&virtual_keyboard, &state_manager)
                 .await;
         }
         [90, 124, 0, 0, 0, 0] => {
-            debug!("Microphone mute key pressed");
+            // Fn+F9
+            debug!("Microphone mute key pressed (Fn+F9)");
             config
                 .microphone_mute_key
                 .execute(&virtual_keyboard, &state_manager)
                 .await;
         }
         [90, 126, 0, 0, 0, 0] => {
-            debug!("Emoji picker key pressed");
+            // Fn+F11
+            debug!("Emoji picker key pressed (Fn+F11)");
             config
                 .emoji_picker_key
                 .execute(&virtual_keyboard, &state_manager)
                 .await;
         }
         [90, 134, 0, 0, 0, 0] => {
-            debug!("MyASUS key pressed");
+            // Fn+F12
+            debug!("MyASUS key pressed (Fn+F12)");
             config
                 .myasus_key
                 .execute(&virtual_keyboard, &state_manager)
                 .await;
         }
         [90, 106, 0, 0, 0, 0] => {
-            debug!("Toggle secondary display key pressed");
+            // Dedicated key right of F12 — bottom panel on/off
+            debug!("Toggle secondary display key pressed (key right of F12)");
             config
                 .toggle_secondary_display_key
                 .execute(&virtual_keyboard, &state_manager)

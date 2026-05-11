@@ -1,3 +1,32 @@
+//! Runtime configuration (`config.toml`) and [`KeyFunction`] handlers.
+//!
+//! # Zenbook Duo physical Fn row vs daemon HID paths
+//!
+//! Special keys are delivered two different ways:
+//!
+//! 1. **ASUS vendor channel** — USB HID reports on endpoint 5 (`0x5a` …), or Bluetooth
+//!    `EV_ABS` / `ABS_MISC` on the sibling “ASUS Zenbook Duo Keyboard” evdev nodes. Parsed in
+//!    `parse_keyboard_data` in `keyboard_usb.rs` and `parse_keyboard_event` in `keyboard_bt.rs`.
+//!
+//! 2. **Ordinary evdev** — the main keyboard device (e.g. `/dev/input/event3`). Fn+F1–F3 (mute /
+//!    volume) and **Fn+F7** use this path. **Fn+F7** injects **Super+P** (`KEY_LEFTMETA` +
+//!    `KEY_P`) so GNOME opens its display-mode UI (join / mirror / internal only / external).
+//!    Those keys are **not** vendor-byte codes and are **not** handled by this module.
+//!
+//! | Physical key | Vendor value (USB byte 2 / BT ABS_MISC) | Default [`KeyFunction`] |
+//! |--------------|----------------------------------------|-------------------------|
+//! | Fn+F1 mute, Fn+F2/F3 volume | *(main keyboard only — not vendor channel)* | — |
+//! | Fn+F4 keyboard backlight | `199` | [`KeyFunction::KeyboardBacklight`] |
+//! | Fn+F5 display brightness down | `16` | `KEY_BRIGHTNESSDOWN` |
+//! | Fn+F6 display brightness up | `32` | `KEY_BRIGHTNESSUP` |
+//! | Fn+F7 display mode cycle | Super+P on main keyboard | *(GNOME Shell — not daemon)* |
+//! | Fn+F8 swap primary internal panel | `156` | [`KeyFunction::SwapDisplays`] |
+//! | Fn+F9 mic mute | `124` | `KEY_MICMUTE` |
+//! | Fn+F10 Bluetooth pairing | *(firmware / BlueZ — intentionally unmapped)* | — |
+//! | Fn+F11 emoji | `126` | Ctrl+. |
+//! | Fn+F12 ASUS / Control Center | `134` | [`KeyFunction::NoOp`] |
+//! | Key **right of F12** (bottom panel on/off) | `106` | [`KeyFunction::ToggleSecondaryDisplay`] |
+
 use log::{info, warn};
 use std::{path::PathBuf, sync::Arc};
 use std::time::Duration;
@@ -137,7 +166,6 @@ pub struct Config {
     pub secondary_display_status_path: String,
     pub primary_backlight_path: String,
     pub secondary_backlight_path: String,
-    pub pipe_path: String,
     /// Idle timeout in seconds. Set to 0 to disable idle detection.
     pub idle_timeout_seconds: u64,
 }
@@ -190,7 +218,6 @@ impl Default for Config {
             primary_backlight_path: "/sys/class/backlight/intel_backlight/brightness".to_string(),
             secondary_backlight_path: "/sys/class/backlight/card1-eDP-2-backlight/brightness"
                 .to_string(),
-            pipe_path: "/tmp/zenbook-duo-daemon.pipe".to_string(),
             idle_timeout_seconds: 300, // 5 minutes
         }
     }
@@ -205,11 +232,19 @@ impl Config {
         let help = "
 # # Example Configuration:
 #
+# # Zenbook Duo keys (physical → config keys; see `src/config.rs` module docs for vendor bytes):
+# #   Fn+F4  → keyboard_backlight_key       Fn+F5/F6 → brightness down/up
+# #   Fn+F8  → swap_up_down_display_key     Fn+F9 → microphone_mute_key
+# #   Fn+F11 → emoji_picker_key             Fn+F12 → myasus_key
+# #   Key right of F12 → toggle_secondary_display_key
+# #   Fn+F1–F3, Fn+F7 are NOT on the ASUS vendor HID path: F7 sends Super+P on the main keyboard.
+#
 # [keyboard_backlight_key]                  # This specifies the physical key to configure
 # # Only one of the following values is allowed:
 # KeyBind = [\"KEY_LEFTCTRL\", \"KEY_F10\"]     # Maps the physical key to left ctrl + f10, a list of all the keys can be found in https://docs.rs/evdev-rs/0.6.3/evdev_rs/enums/enum.EV_KEY.html
 # Command = \"echo 'Hello, world!'\"          # Runs a custom command as root when the physical key is pressed
 # KeyboardBacklight = true                  # Toggles the keyboard backlight
+# SwapDisplays = true                       # Swap which internal panel is primary (eDP-1 <-> eDP-2); see README “Dual display / Mutter apply ordering”
 # ToggleSecondaryDisplay = true             # Toggles the secondary display
 # NoOp = true                               # Does nothing when the physical key is pressed
 #

@@ -5,10 +5,6 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVICE_NAME="zenbook-duo-daemon"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-PRE_SLEEP_SERVICE_NAME="zenbook-duo-daemon-pre-sleep"
-PRE_SLEEP_SERVICE_FILE="/etc/systemd/system/${PRE_SLEEP_SERVICE_NAME}.service"
-POST_SLEEP_SERVICE_NAME="zenbook-duo-daemon-post-sleep"
-POST_SLEEP_SERVICE_FILE="/etc/systemd/system/${POST_SLEEP_SERVICE_NAME}.service"
 SESSION_SERVICE_NAME="zenbook-duo-session"
 SESSION_SERVICE_FILE="/etc/systemd/user/${SESSION_SERVICE_NAME}.service"
 DBUS_POLICY_NAME="zenbook-duo-daemon-dbus.conf"
@@ -19,6 +15,35 @@ GITHUB_REPO="https://github.com/PegasisForever/zenbook-duo-daemon/releases/lates
 QUIRKS_FILE="/etc/libinput/local-overrides.quirks"
 QUIRKS_ASSET_NAME="local-overrides.quirks"
 DAEMON_GROUP="zenbook-duo"
+SESSION_SYSTEMD_DIR="$(dirname "${SESSION_SERVICE_FILE}")"
+
+ensure_session_systemd_user_dir() {
+    # Required on minimal images: `curl` / `cp` into /etc/systemd/user otherwise fail.
+    mkdir -p "${SESSION_SYSTEMD_DIR}"
+}
+
+# Legacy FIFO + systemd sleep-hook units (replaced by logind PrepareForSleep + `control` CLI).
+cleanup_legacy_pipe_and_sleep_hooks() {
+    local legacy_pipe="/tmp/zenbook-duo-daemon.pipe"
+    if [ -p "${legacy_pipe}" ] || [ -e "${legacy_pipe}" ]; then
+        echo "Removing legacy control pipe ${legacy_pipe}..."
+        rm -f "${legacy_pipe}" || true
+    fi
+    for u in zenbook-duo-daemon-pre-sleep zenbook-duo-daemon-post-sleep; do
+        if systemctl is-active --quiet "${u}" 2>/dev/null; then
+            echo "Stopping legacy sleep-hook unit ${u}..."
+            systemctl stop "${u}" || true
+        fi
+        if systemctl is-enabled --quiet "${u}" 2>/dev/null; then
+            echo "Disabling legacy sleep-hook unit ${u}..."
+            systemctl disable "${u}" || true
+        fi
+        if [ -f "/etc/systemd/system/${u}.service" ]; then
+            echo "Removing legacy unit file /etc/systemd/system/${u}.service..."
+            rm -f "/etc/systemd/system/${u}.service"
+        fi
+    done
+}
 
 ensure_daemon_group() {
     if ! getent group "${DAEMON_GROUP}" > /dev/null 2>&1; then
@@ -34,6 +59,17 @@ ensure_daemon_group() {
             echo "Note: ${user} must log out and back in (or reboot) for the group change to take effect."
         fi
     done < <(loginctl list-users --no-legend 2>/dev/null || true)
+
+    # User who ran `sudo ./install ...` is not always listed by loginctl the way we expect; ensure they get the group for D-Bus.
+    if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
+        if id -u "${SUDO_USER}" >/dev/null 2>&1; then
+            if ! id -nG "${SUDO_USER}" 2>/dev/null | grep -qw "${DAEMON_GROUP}"; then
+                echo "Adding ${SUDO_USER} (user who invoked sudo) to group ${DAEMON_GROUP}..."
+                usermod -aG "${DAEMON_GROUP}" "${SUDO_USER}"
+                echo "Note: ${SUDO_USER} must log out and back in (or reboot) for the group change to take effect."
+            fi
+        fi
+    fi
 }
 
 remove_daemon_group() {
@@ -261,28 +297,8 @@ uninstall() {
         echo "Disabling service..."
         systemctl disable "${SERVICE_NAME}" || true
     fi
-    
-    # Stop and disable pre-sleep service if it exists
-    if systemctl is-active --quiet "${PRE_SLEEP_SERVICE_NAME}" 2>/dev/null; then
-        echo "Stopping pre-sleep service..."
-        systemctl stop "${PRE_SLEEP_SERVICE_NAME}" || true
-    fi
-    
-    if systemctl is-enabled --quiet "${PRE_SLEEP_SERVICE_NAME}" 2>/dev/null; then
-        echo "Disabling pre-sleep service..."
-        systemctl disable "${PRE_SLEEP_SERVICE_NAME}" || true
-    fi
-    
-    # Stop and disable post-sleep service if it exists
-    if systemctl is-active --quiet "${POST_SLEEP_SERVICE_NAME}" 2>/dev/null; then
-        echo "Stopping post-sleep service..."
-        systemctl stop "${POST_SLEEP_SERVICE_NAME}" || true
-    fi
-    
-    if systemctl is-enabled --quiet "${POST_SLEEP_SERVICE_NAME}" 2>/dev/null; then
-        echo "Disabling post-sleep service..."
-        systemctl disable "${POST_SLEEP_SERVICE_NAME}" || true
-    fi
+
+    cleanup_legacy_pipe_and_sleep_hooks
 
     for_each_active_user stop_session_service_for_user
     echo "Disabling session service globally..."
@@ -293,17 +309,7 @@ uninstall() {
         echo "Removing main service file..."
         rm -f "${SERVICE_FILE}"
     fi
-    
-    if [ -f "${PRE_SLEEP_SERVICE_FILE}" ]; then
-        echo "Removing pre-sleep service file..."
-        rm -f "${PRE_SLEEP_SERVICE_FILE}"
-    fi
-    
-    if [ -f "${POST_SLEEP_SERVICE_FILE}" ]; then
-        echo "Removing post-sleep service file..."
-        rm -f "${POST_SLEEP_SERVICE_FILE}"
-    fi
-    
+
     if [ -f "${SESSION_SERVICE_FILE}" ]; then
         echo "Removing session service file..."
         rm -f "${SESSION_SERVICE_FILE}"
@@ -372,54 +378,29 @@ install() {
         exit 1
     fi
     
-    # Download pre-sleep service file
-    echo "Downloading pre-sleep service file from ${GITHUB_REPO}/zenbook-duo-daemon-pre-sleep.service..."
-    if ! curl -fSL -o "${PRE_SLEEP_SERVICE_FILE}" "${GITHUB_REPO}/zenbook-duo-daemon-pre-sleep.service"; then
-        echo "Error: Failed to download pre-sleep service file" >&2
-        rm -f "${BINARY_PATH}" "${SERVICE_FILE}"
-        exit 1
-    fi
-    if [ ! -s "${PRE_SLEEP_SERVICE_FILE}" ]; then
-        echo "Error: Downloaded pre-sleep service file is empty" >&2
-        rm -f "${BINARY_PATH}" "${SERVICE_FILE}" "${PRE_SLEEP_SERVICE_FILE}"
-        exit 1
-    fi
-    
-    # Download post-sleep service file
-    echo "Downloading post-sleep service file from ${GITHUB_REPO}/zenbook-duo-daemon-post-sleep.service..."
-    if ! curl -fSL -o "${POST_SLEEP_SERVICE_FILE}" "${GITHUB_REPO}/zenbook-duo-daemon-post-sleep.service"; then
-        echo "Error: Failed to download post-sleep service file" >&2
-        rm -f "${BINARY_PATH}" "${SERVICE_FILE}" "${PRE_SLEEP_SERVICE_FILE}"
-        exit 1
-    fi
-    if [ ! -s "${POST_SLEEP_SERVICE_FILE}" ]; then
-        echo "Error: Downloaded post-sleep service file is empty" >&2
-        rm -f "${BINARY_PATH}" "${SERVICE_FILE}" "${PRE_SLEEP_SERVICE_FILE}" "${POST_SLEEP_SERVICE_FILE}"
-        exit 1
-    fi
-    
     # Download session service file
+    ensure_session_systemd_user_dir
     echo "Downloading session service file from ${GITHUB_REPO}/zenbook-duo-session.service..."
     if ! curl -fSL -o "${SESSION_SERVICE_FILE}" "${GITHUB_REPO}/zenbook-duo-session.service"; then
         echo "Error: Failed to download session service file" >&2
-        rm -f "${BINARY_PATH}" "${SERVICE_FILE}" "${PRE_SLEEP_SERVICE_FILE}" "${POST_SLEEP_SERVICE_FILE}"
+        rm -f "${BINARY_PATH}" "${SERVICE_FILE}"
         exit 1
     fi
     if [ ! -s "${SESSION_SERVICE_FILE}" ]; then
         echo "Error: Downloaded session service file is empty" >&2
-        rm -f "${BINARY_PATH}" "${SERVICE_FILE}" "${PRE_SLEEP_SERVICE_FILE}" "${POST_SLEEP_SERVICE_FILE}" "${SESSION_SERVICE_FILE}"
+        rm -f "${BINARY_PATH}" "${SERVICE_FILE}" "${SESSION_SERVICE_FILE}"
         exit 1
     fi
 
     echo "Downloading D-Bus policy file from ${GITHUB_REPO}/${DBUS_POLICY_NAME}..."
     if ! curl -fSL -o "${DBUS_POLICY_FILE}" "${GITHUB_REPO}/${DBUS_POLICY_NAME}"; then
         echo "Error: Failed to download D-Bus policy file" >&2
-        rm -f "${BINARY_PATH}" "${SERVICE_FILE}" "${PRE_SLEEP_SERVICE_FILE}" "${POST_SLEEP_SERVICE_FILE}" "${SESSION_SERVICE_FILE}"
+        rm -f "${BINARY_PATH}" "${SERVICE_FILE}" "${SESSION_SERVICE_FILE}"
         exit 1
     fi
     if [ ! -s "${DBUS_POLICY_FILE}" ]; then
         echo "Error: Downloaded D-Bus policy file is empty" >&2
-        rm -f "${BINARY_PATH}" "${SERVICE_FILE}" "${PRE_SLEEP_SERVICE_FILE}" "${POST_SLEEP_SERVICE_FILE}" "${SESSION_SERVICE_FILE}" "${DBUS_POLICY_FILE}"
+        rm -f "${BINARY_PATH}" "${SERVICE_FILE}" "${SESSION_SERVICE_FILE}" "${DBUS_POLICY_FILE}"
         exit 1
     fi
     reload_system_dbus || true
@@ -437,10 +418,11 @@ install() {
     
     echo "Enabling services..."
     systemctl enable "${SERVICE_NAME}"
-    systemctl enable "${PRE_SLEEP_SERVICE_NAME}"
-    systemctl enable "${POST_SLEEP_SERVICE_NAME}"
-    systemctl --global enable "${SESSION_SERVICE_NAME}" || true
-    
+    if ! systemctl --global enable "${SESSION_SERVICE_NAME}"; then
+        echo "Error: systemctl --global enable ${SESSION_SERVICE_NAME} failed. Is systemd-user configured?" >&2
+        exit 1
+    fi
+
     echo "Starting main service..."
     systemctl start "${SERVICE_NAME}"
     for_each_active_user restart_session_service_for_user
@@ -461,8 +443,6 @@ local_install() {
     local binary_path="$1"
     
     local service_file_path="${SCRIPT_DIR}/zenbook-duo-daemon.service"
-    local pre_sleep_service_file_path="${SCRIPT_DIR}/zenbook-duo-daemon-pre-sleep.service"
-    local post_sleep_service_file_path="${SCRIPT_DIR}/zenbook-duo-daemon-post-sleep.service"
     local session_service_file_path="${SCRIPT_DIR}/zenbook-duo-session.service"
     local dbus_policy_file_path="${SCRIPT_DIR}/${DBUS_POLICY_NAME}"
     local quirks_file_path="${SCRIPT_DIR}/${QUIRKS_ASSET_NAME}"
@@ -476,17 +456,7 @@ local_install() {
         echo "Error: Service file not found: ${service_file_path}" >&2
         exit 1
     fi
-    
-    if [ ! -f "${pre_sleep_service_file_path}" ]; then
-        echo "Error: Pre-sleep service file not found: ${pre_sleep_service_file_path}" >&2
-        exit 1
-    fi
-    
-    if [ ! -f "${post_sleep_service_file_path}" ]; then
-        echo "Error: Post-sleep service file not found: ${post_sleep_service_file_path}" >&2
-        exit 1
-    fi
-    
+
     if [ ! -f "${session_service_file_path}" ]; then
         echo "Error: Session service file not found: ${session_service_file_path}" >&2
         exit 1
@@ -525,13 +495,8 @@ local_install() {
     echo "Copying service file from ${service_file_path}..."
     cp "${service_file_path}" "${SERVICE_FILE}"
     
-    echo "Copying pre-sleep service file from ${pre_sleep_service_file_path}..."
-    cp "${pre_sleep_service_file_path}" "${PRE_SLEEP_SERVICE_FILE}"
-    
-    echo "Copying post-sleep service file from ${post_sleep_service_file_path}..."
-    cp "${post_sleep_service_file_path}" "${POST_SLEEP_SERVICE_FILE}"
-    
     echo "Copying session service file from ${session_service_file_path}..."
+    ensure_session_systemd_user_dir
     cp "${session_service_file_path}" "${SESSION_SERVICE_FILE}"
 
     echo "Copying D-Bus policy file from ${dbus_policy_file_path}..."
@@ -551,10 +516,11 @@ local_install() {
     
     echo "Enabling services..."
     systemctl enable "${SERVICE_NAME}"
-    systemctl enable "${PRE_SLEEP_SERVICE_NAME}"
-    systemctl enable "${POST_SLEEP_SERVICE_NAME}"
-    systemctl --global enable "${SESSION_SERVICE_NAME}" || true
-    
+    if ! systemctl --global enable "${SESSION_SERVICE_NAME}"; then
+        echo "Error: systemctl --global enable ${SESSION_SERVICE_NAME} failed. Is systemd-user configured?" >&2
+        exit 1
+    fi
+
     echo "Starting main service..."
     systemctl start "${SERVICE_NAME}"
     for_each_active_user restart_session_service_for_user

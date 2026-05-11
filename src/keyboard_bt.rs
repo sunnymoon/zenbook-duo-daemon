@@ -1,8 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::Arc,
-    time::Duration,
+    sync::{Arc, Mutex as StdMutex, OnceLock},
+    time::{Duration, Instant},
 };
 
 use evdev_rs::{
@@ -27,6 +27,33 @@ use crate::{
     state::{KeyboardBacklightState, KeyboardStateManager},
     virtual_keyboard::VirtualKeyboard,
 };
+
+/// ASUS Zenbook BT exposes two `ABS_MISC` evdev nodes per MAC; both may need a reader. GATT
+/// restore (`restore_bt_hid_vendor_state_after_connect`) must run once per connect session.
+#[derive(Default)]
+struct BtVendorHotkeyReaders {
+    paths: HashSet<PathBuf>,
+    hid_restore_done: bool,
+}
+
+/// Suppress identical non-zero `ABS_MISC` values from both nodes within a short window.
+static LAST_BT_VENDOR_MISC: StdMutex<Option<(i32, Instant)>> = StdMutex::new(None);
+
+fn suppress_twin_abs_misc_pulse(value: i32) -> bool {
+    if value == 0 {
+        return false;
+    }
+    let now = Instant::now();
+    let mut guard = LAST_BT_VENDOR_MISC.lock().unwrap();
+    let duplicate = matches!(
+        guard.as_ref(),
+        Some((v, t)) if *v == value && now.duration_since(*t) < Duration::from_millis(40)
+    );
+    if !duplicate {
+        *guard = Some((value, now));
+    }
+    duplicate
+}
 
 // ── BlueZ GATT proxies ───────────────────────────────────────────────────────
 
@@ -144,6 +171,42 @@ async fn find_vendor_char(
     Err(format!("Could not find vendor HID feature char under {}", device_path).into())
 }
 
+/// BlueZ allows only one GATT write at a time per peripheral. `/dev/input` churn can briefly
+/// spawn overlapping BT tasks (same MAC) during dock/undock; without serialization + retry,
+/// `org.bluez.Error.InProgress` causes **fn_lock** (and LED sync) to silently fail so Fn+F8 etc.
+/// stop working until reconnect.
+static BT_HID_GATT_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn bt_hid_gatt_write_lock() -> &'static Mutex<()> {
+    BT_HID_GATT_WRITE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+async fn bt_hid_gatt_write(
+    proxy: &GattCharacteristicProxy<'_>,
+    payload: Vec<u8>,
+    what: &'static str,
+) {
+    let _serial = bt_hid_gatt_write_lock().lock().await;
+    let mut delay = Duration::from_millis(45);
+    for attempt in 1..=12u32 {
+        match proxy.write_value(payload.clone(), HashMap::new()).await {
+            Ok(()) => return,
+            Err(e) => {
+                let s = e.to_string().to_lowercase();
+                let busy =
+                    s.contains("in progress") || s.contains("inprogress") || s.contains("busy");
+                if busy && attempt < 12 {
+                    tokio::time::sleep(delay).await;
+                    delay = delay.saturating_mul(2).min(Duration::from_millis(400));
+                    continue;
+                }
+                warn!("Failed BT HID GATT {what}: {e}");
+                return;
+            }
+        }
+    }
+}
+
 async fn send_bt_backlight_state(proxy: &GattCharacteristicProxy<'_>, state: KeyboardBacklightState) {
     let level: u8 = match state {
         KeyboardBacklightState::Off => 0,
@@ -151,21 +214,16 @@ async fn send_bt_backlight_state(proxy: &GattCharacteristicProxy<'_>, state: Key
         KeyboardBacklightState::Medium => 2,
         KeyboardBacklightState::High => 3,
     };
-    if let Err(e) = proxy
-        .write_value(vec![0xba, 0xc5, 0xc4, level], HashMap::new())
-        .await
-    {
-        warn!("Failed to send BT backlight state: {}", e);
-    }
+    bt_hid_gatt_write(proxy, vec![0xba, 0xc5, 0xc4, level], "backlight level").await;
 }
 
 async fn send_bt_mic_mute_state(proxy: &GattCharacteristicProxy<'_>, muted: bool) {
-    if let Err(e) = proxy
-        .write_value(vec![0xd0, 0x7c, if muted { 0x01 } else { 0x00 }], HashMap::new())
-        .await
-    {
-        warn!("Failed to send BT mic mute state: {}", e);
-    }
+    bt_hid_gatt_write(
+        proxy,
+        vec![0xd0, 0x7c, if muted { 0x01 } else { 0x00 }],
+        "mic mute led",
+    )
+    .await;
 }
 
 /// Set keyboard fn_lock state via BT GATT.
@@ -174,11 +232,22 @@ async fn send_bt_mic_mute_state(proxy: &GattCharacteristicProxy<'_>, muted: bool
 async fn send_bt_fn_lock_state(proxy: &GattCharacteristicProxy<'_>, fn_lock: bool) {
     // Mirror of the USB HID feature report 5a d0 4e [00/01], without the 0x5a report-ID prefix.
     let value: u8 = if fn_lock { 0x00 } else { 0x01 };
-    if let Err(e) = proxy
-        .write_value(vec![0xd0, 0x4e, value], HashMap::new())
-        .await
-    {
-        warn!("Failed to send BT fn_lock state: {}", e);
+    bt_hid_gatt_write(proxy, vec![0xd0, 0x4e, value], "fn_lock").await;
+}
+
+async fn restore_bt_hid_vendor_state_after_connect(
+    char_proxy: &GattCharacteristicProxy<'_>,
+    fn_lock: bool,
+    state_manager: &KeyboardStateManager,
+) {
+    // BlueZ / firmware sometimes ignores the first feature writes after link or input churn.
+    for round in 0..4 {
+        if round > 0 {
+            tokio::time::sleep(Duration::from_millis(450)).await;
+        }
+        send_bt_fn_lock_state(char_proxy, fn_lock).await;
+        send_bt_backlight_state(char_proxy, state_manager.get_keyboard_backlight()).await;
+        send_bt_mic_mute_state(char_proxy, state_manager.get_mic_mute_led()).await;
     }
 }
 
@@ -194,10 +263,9 @@ pub fn start_bt_keyboard_monitor_task(
     let config_clone = config.clone();
     let virtual_keyboard_clone = virtual_keyboard.clone();
     let state_manager_clone = state_manager.clone();
-    // Track which BT MACs already have an active control task so we don't
-    // spawn duplicate GATT writers when multiple evdev nodes share a MAC.
-    let active_control_macs: Arc<Mutex<HashSet<String>>> =
-        Arc::new(Mutex::new(HashSet::new()));
+    // BT uniq (MAC key) → active ABS_MISC reader paths + whether HID/GATT restore ran this session.
+    let abs_misc_vendor_claimed: Arc<Mutex<HashMap<String, BtVendorHotkeyReaders>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     tokio::spawn(async move {
         let mut entries = match fs::read_dir("/dev/input").await {
@@ -217,7 +285,7 @@ pub fn start_bt_keyboard_monitor_task(
                 virtual_keyboard_clone.clone(),
                 state_manager_clone.clone(),
                 activity_notifier.clone(),
-                active_control_macs.clone(),
+                abs_misc_vendor_claimed.clone(),
             )
             .await;
         }
@@ -244,7 +312,7 @@ pub fn start_bt_keyboard_monitor_task(
                                 virtual_keyboard_clone.clone(),
                                 state_manager_clone.clone(),
                                 activity_notifier.clone(),
-                                active_control_macs.clone(),
+                                abs_misc_vendor_claimed.clone(),
                             )
                             .await;
                         }
@@ -262,7 +330,7 @@ async fn try_start_bt_keyboard_task(
     virtual_keyboard: Arc<Mutex<VirtualKeyboard>>,
     state_manager: KeyboardStateManager,
     activity_notifier: ActivityNotifier,
-    active_control_macs: Arc<Mutex<HashSet<String>>>,
+    abs_misc_vendor_claimed: Arc<Mutex<HashMap<String, BtVendorHotkeyReaders>>>,
 ) {
     if let Ok(metadata) = fs::metadata(&path).await {
         if metadata.is_dir() {
@@ -281,28 +349,117 @@ async fn try_start_bt_keyboard_task(
     }
 
     let path_clone = path.clone();
-    let input = spawn_blocking(move || {
-        let file = std::fs::File::open(path_clone).unwrap();
-        evdev_rs::Device::new_from_file(file).unwrap()
+    let opened = spawn_blocking(move || {
+        let file = std::fs::File::open(path_clone).ok()?;
+        evdev_rs::Device::new_from_file(file).ok()
     })
     .await
     .unwrap();
 
-    if input.name() == Some("ASUS Zenbook Duo Keyboard") {
-        start_bt_keyboard_task(
-            config,
-            path,
-            input,
-            event_receiver,
-            virtual_keyboard,
-            state_manager,
-            activity_notifier,
-            active_control_macs,
-        );
+    let Some(pre_input) = opened else {
+        return;
+    };
+
+    if pre_input.name() != Some("ASUS Zenbook Duo Keyboard") {
+        return;
     }
+
+    // `uniq` is stable (`fd:…` → BlueZ `dev_FD_…`); we track multiple ABS_MISC evdev nodes per MAC.
+
+    // ASUS exposes several evdev nodes per BT MAC. Normal keys are routed by the kernel on
+    // one node; brightness / swap / mic / Fn+F11… hotkeys arrive as `EV_ABS / ABS_MISC` on
+    // one or both sibling nodes open simultaneously — skipping the second reader can leave Fn
+    // dead depending on which node the kernel picked for this attach.
+    if !pre_input.has(EventCode::EV_ABS(EV_ABS::ABS_MISC)) {
+        debug!(
+            "Skipping ASUS BT evdev {} (no ABS_MISC — not vendor hotkey channel)",
+            path.display()
+        );
+        return;
+    }
+
+    drop(pre_input);
+
+    // Let `/dev/input` + BlueZ settle after USB/BT role changes. Do **not** gate on
+    // `is_usb_keyboard_attached()` here: ordering vs nusb can skip BT startup and leave no
+    // ABS_MISC reader at all (broken Fn row) even though `uniq` is unchanged.
+    tokio::time::sleep(Duration::from_millis(280)).await;
+
+    if fs::metadata(&path).await.is_err() {
+        return;
+    }
+
+    let path_clone2 = path.clone();
+    let input = match spawn_blocking(move || {
+        let file = std::fs::File::open(path_clone2).ok()?;
+        evdev_rs::Device::new_from_file(file).ok()
+    })
+    .await
+    {
+        Ok(Some(d)) => d,
+        _ => return,
+    };
+
+    if input.name() != Some("ASUS Zenbook Duo Keyboard") {
+        return;
+    }
+    if !input.has(EventCode::EV_ABS(EV_ABS::ABS_MISC)) {
+        debug!(
+            "Skipping ASUS BT evdev {} after debounce (lost ABS_MISC?)",
+            path.display()
+        );
+        return;
+    }
+
+    let dedupe_key = match mac_from_evdev_sysfs(&path).await {
+        Some(m) => m,
+        None => format!("no-uniq:{}", path.display()),
+    };
+
+    let mut run_hid_restore = false;
+    let mut registered = false;
+    for attempt in 0..8u32 {
+        let mut map = abs_misc_vendor_claimed.lock().await;
+        let entry = map.entry(dedupe_key.clone()).or_default();
+        if entry.paths.contains(&path) {
+            drop(map);
+            if attempt + 1 < 8 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            info!(
+                "Skipping BT vendor-hotkey {:?}: path still listed active (stale claim / stuck inotify)",
+                path
+            );
+            return;
+        }
+        run_hid_restore = !entry.hid_restore_done;
+        if run_hid_restore {
+            entry.hid_restore_done = true;
+        }
+        entry.paths.insert(path.clone());
+        registered = true;
+        break;
+    }
+    if !registered {
+        return;
+    }
+
+    start_bt_keyboard_task(
+        config,
+        path,
+        input,
+        event_receiver,
+        virtual_keyboard,
+        state_manager,
+        activity_notifier,
+        abs_misc_vendor_claimed,
+        dedupe_key,
+        run_hid_restore,
+    );
 }
 
-pub fn start_bt_keyboard_task(
+fn start_bt_keyboard_task(
     config: &Config,
     path: PathBuf,
     keyboard: Device,
@@ -310,110 +467,116 @@ pub fn start_bt_keyboard_task(
     virtual_keyboard: Arc<Mutex<VirtualKeyboard>>,
     state_manager: KeyboardStateManager,
     activity_notifier: ActivityNotifier,
-    active_control_macs: Arc<Mutex<HashSet<String>>>,
+    abs_misc_vendor_claimed: Arc<Mutex<HashMap<String, BtVendorHotkeyReaders>>>,
+    vendor_channel_dedupe_key: String,
+    run_hid_restore: bool,
 ) {
-    info!("Bluetooth connected on {}", path.display());
+    info!(
+        "Bluetooth connected on {} (vendor hotkeys / ABS_MISC){}",
+        path.display(),
+        if run_hid_restore {
+            " — HID/GATT restore task will run"
+        } else {
+            ""
+        }
+    );
     state_manager.bluetooth_connection_started();
     activity_notifier.notify();
 
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    // GATT: one restore + one event-driven writer per MAC connect session (first ABS_MISC path wins).
+    let shutdown_tx = if run_hid_restore {
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-    // Control task: discovers the GATT char, restores state, then handles events.
-    // Only one control task runs per BT MAC — guarded by active_control_macs.
-    let state_manager_ctrl = state_manager.clone();
-    let fn_lock = config.fn_lock;
-    tokio::spawn(async move {
-        let mac = match mac_from_evdev_sysfs(&path).await {
-            Some(m) => m,
-            None => {
-                warn!("Could not derive BT MAC from {:?} — backlight/mic LED won't work", path);
-                return;
-            }
-        };
-
-        // Skip if another event device for the same keyboard already owns control
-        {
-            let mut set = active_control_macs.lock().await;
-            if set.contains(&mac) {
-                debug!("Control task for MAC {} already running, skipping", mac);
-                return;
-            }
-            set.insert(mac.clone());
-        }
-
-        let device_path = format!("/org/bluez/hci0/dev_{}", mac);
-
-        let conn = match Connection::system().await {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("D-Bus connection failed: {} — backlight/mic LED won't work", e);
-                active_control_macs.lock().await.remove(&mac);
-                return;
-            }
-        };
-
-        let char_path = match find_vendor_char(&conn, &device_path).await {
-            Ok(p) => {
-                info!("BT vendor char found: {}", p.as_str());
-                p
-            }
-            Err(e) => {
-                warn!("Could not find BT vendor char: {} — backlight/mic LED won't work", e);
-                active_control_macs.lock().await.remove(&mac);
-                return;
-            }
-        };
-
-        let char_proxy = match GattCharacteristicProxy::builder(&conn)
-            .path(char_path.as_str())
-            .unwrap()
-            .build()
-            .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                warn!("Failed to build GATT proxy: {} — backlight/mic LED won't work", e);
-                active_control_macs.lock().await.remove(&mac);
-                return;
-            }
-        };
-
-        // Restore state on connect (mirrors USB behaviour)
-        send_bt_fn_lock_state(&char_proxy, fn_lock).await;
-        send_bt_backlight_state(&char_proxy, state_manager_ctrl.get_keyboard_backlight()).await;
-        send_bt_mic_mute_state(&char_proxy, state_manager_ctrl.get_mic_mute_led()).await;
-
-        loop {
-            tokio::select! {
-                _ = &mut shutdown_rx => {
-                    info!("Bluetooth control task shutting down");
-                    break;
+        let state_manager_ctrl = state_manager.clone();
+        let fn_lock = config.fn_lock;
+        let path_for_control = path.clone();
+        tokio::spawn(async move {
+            let mac = match mac_from_evdev_sysfs(&path_for_control).await {
+                Some(m) => m,
+                None => {
+                    warn!(
+                        "Could not derive BT MAC from {:?} — backlight/mic LED won't work",
+                        path_for_control
+                    );
+                    return;
                 }
-                result = event_receiver.recv() => {
-                    match result {
-                        Ok(Event::Backlight(state)) => {
-                            send_bt_backlight_state(&char_proxy, state).await;
-                        }
-                        Ok(Event::MicMuteLed(enabled)) => {
-                            send_bt_mic_mute_state(&char_proxy, enabled).await;
-                        }
-                        Ok(_) => {}
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
-                            continue;
-                        }
-                        Err(broadcast::error::RecvError::Closed) => {
-                            break;
+            };
+
+            let device_path = format!("/org/bluez/hci0/dev_{}", mac);
+
+            let conn = match Connection::system().await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("D-Bus connection failed: {} — backlight/mic LED won't work", e);
+                    return;
+                }
+            };
+
+            let char_path = match find_vendor_char(&conn, &device_path).await {
+                Ok(p) => {
+                    info!("BT vendor char found: {}", p.as_str());
+                    p
+                }
+                Err(e) => {
+                    warn!("Could not find BT vendor char: {} — backlight/mic LED won't work", e);
+                    return;
+                }
+            };
+
+            let char_proxy = match GattCharacteristicProxy::builder(&conn)
+                .path(char_path.as_str())
+                .unwrap()
+                .build()
+                .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("Failed to build GATT proxy: {} — backlight/mic LED won't work", e);
+                    return;
+                }
+            };
+
+            // Restore state on connect (mirrors USB behaviour)
+            restore_bt_hid_vendor_state_after_connect(&char_proxy, fn_lock, &state_manager_ctrl)
+                .await;
+
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => {
+                        info!("Bluetooth control task shutting down");
+                        break;
+                    }
+                    result = event_receiver.recv() => {
+                        match result {
+                            Ok(Event::Backlight(state)) => {
+                                send_bt_backlight_state(&char_proxy, state).await;
+                            }
+                            Ok(Event::MicMuteLed(enabled)) => {
+                                send_bt_mic_mute_state(&char_proxy, enabled).await;
+                            }
+                            Ok(_) => {}
+                            Err(broadcast::error::RecvError::Lagged(_)) => {
+                                continue;
+                            }
+                            Err(broadcast::error::RecvError::Closed) => {
+                                break;
+                            }
                         }
                     }
                 }
             }
-        }
-
-        active_control_macs.lock().await.remove(&mac);
-    });
+        });
+        Some(shutdown_tx)
+    } else {
+        drop(event_receiver);
+        None
+    };
 
     let config = config.clone();
     let keyboard = Arc::new(std::sync::Mutex::new(keyboard));
+    let claimed_cleanup = abs_misc_vendor_claimed.clone();
+    let dedupe_cleanup = vendor_channel_dedupe_key.clone();
+    let path_cleanup = path.clone();
     tokio::spawn(async move {
         loop {
             let keyboard_clone = keyboard.clone();
@@ -431,6 +594,15 @@ pub fn start_bt_keyboard_task(
                 Err(e) => {
                     if let Some(libc::ENODEV) = e.raw_os_error() {
                         info!("Bluetooth device disconnected. Exiting task.");
+                        {
+                            let mut map = claimed_cleanup.lock().await;
+                            if let Some(entry) = map.get_mut(&dedupe_cleanup) {
+                                entry.paths.remove(&path_cleanup);
+                                if entry.paths.is_empty() {
+                                    map.remove(&dedupe_cleanup);
+                                }
+                            }
+                        }
                         state_manager.bluetooth_connection_stopped();
                         virtual_keyboard.lock().await.release_all_keys();
                         drop(shutdown_tx);
@@ -446,6 +618,10 @@ pub fn start_bt_keyboard_task(
 }
 
 // ── Key event parsing ────────────────────────────────────────────────────────
+//
+// `ABS_MISC` values mirror the USB vendor byte (see `keyboard_usb::parse_keyboard_data`).
+// Fn+F7 is not emitted here: display cycling is **Super+P** on the main keyboard evdev node.
+// Fn+F10 pairing is firmware — unmapped here on purpose.
 
 async fn parse_keyboard_event(
     event: InputEvent,
@@ -454,62 +630,73 @@ async fn parse_keyboard_event(
     state_manager: &KeyboardStateManager,
 ) {
     if event.event_code == EventCode::EV_ABS(EV_ABS::ABS_MISC) {
+        if suppress_twin_abs_misc_pulse(event.value) {
+            return;
+        }
         match event.value {
             0 => {
                 debug!("No key pressed");
                 virtual_keyboard.lock().await.release_all_keys();
             }
             199 => {
-                debug!("Backlight key pressed");
+                // Fn+F4 — keyboard backlight
+                debug!("Backlight key pressed (Fn+F4)");
                 config
                     .keyboard_backlight_key
                     .execute(&virtual_keyboard, &state_manager)
                     .await;
             }
             16 => {
-                debug!("Brightness down key pressed");
+                // Fn+F5
+                debug!("Brightness down key pressed (Fn+F5)");
                 config
                     .brightness_down_key
                     .execute(&virtual_keyboard, &state_manager)
                     .await;
             }
             32 => {
-                debug!("Brightness up key pressed");
+                // Fn+F6
+                debug!("Brightness up key pressed (Fn+F6)");
                 config
                     .brightness_up_key
                     .execute(&virtual_keyboard, &state_manager)
                     .await;
             }
             156 => {
-                debug!("Swap up down display key pressed");
+                // Fn+F8 — swap primaries
+                debug!("Swap up down display key pressed (Fn+F8)");
                 config
                     .swap_up_down_display_key
                     .execute(&virtual_keyboard, &state_manager)
                     .await;
             }
             124 => {
-                debug!("Microphone mute key pressed");
+                // Fn+F9
+                debug!("Microphone mute key pressed (Fn+F9)");
                 config
                     .microphone_mute_key
                     .execute(&virtual_keyboard, &state_manager)
                     .await;
             }
             126 => {
-                debug!("Emoji picker key pressed");
+                // Fn+F11
+                debug!("Emoji picker key pressed (Fn+F11)");
                 config
                     .emoji_picker_key
                     .execute(&virtual_keyboard, &state_manager)
                     .await;
             }
             134 => {
-                debug!("MyASUS key pressed");
+                // Fn+F12 — ASUS / MyASUS
+                debug!("MyASUS key pressed (Fn+F12)");
                 config
                     .myasus_key
                     .execute(&virtual_keyboard, &state_manager)
                     .await;
             }
             106 => {
-                debug!("Toggle secondary display key pressed");
+                // Key right of F12 — bottom display toggle
+                debug!("Toggle secondary display key pressed (key right of F12)");
                 config
                     .toggle_secondary_display_key
                     .execute(&virtual_keyboard, &state_manager)
