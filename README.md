@@ -49,6 +49,8 @@ The project currently installs multiple components:
 - ✅ Native libinput disable-while-typing (DWT) in **Bluetooth mode**
 - ✅ Configurable remapping of the proprietary special keys exposed by the Zenbook keyboard
 - ✅ Persistence of keyboard/display/ambient-related daemon state
+- ✅ Display mode preservation across Super+P / GNOME Control Center changes (mirror ↔ joined)
+- ✅ Keyboard battery warnings (tiered notifications at 20% / 10% / 5% with themed icons)
 
 ## Current known limitations
 
