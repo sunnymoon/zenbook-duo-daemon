@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use log::{debug, error, info, warn};
 use tokio::sync::broadcast;
@@ -10,9 +11,9 @@ use futures::stream::StreamExt;
 
 type ModeProps = HashMap<String, OwnedValue>;
 type MonitorMode = (String, i32, i32, f64, f64, Vec<f64>, ModeProps);
-type PhysicalMonitor = ((String, String, String, String), Vec<MonitorMode>, HashMap<String, OwnedValue>);
+pub(crate) type PhysicalMonitor = ((String, String, String, String), Vec<MonitorMode>, HashMap<String, OwnedValue>);
 type LmRef = (String, String, String, String);
-type LogicalMonitor = (i32, i32, f64, u32, bool, Vec<LmRef>, HashMap<String, OwnedValue>);
+pub(crate) type LogicalMonitor = (i32, i32, f64, u32, bool, Vec<LmRef>, HashMap<String, OwnedValue>);
 type CurrentState = (u32, Vec<PhysicalMonitor>, Vec<LogicalMonitor>, HashMap<String, OwnedValue>);
 type ApplyMonSpec = (String, String, HashMap<String, OwnedValue>);
 type ApplyLm = (i32, i32, f64, u32, bool, Vec<ApplyMonSpec>);
@@ -21,10 +22,26 @@ type BacklightState = (u32, Vec<HashMap<String, OwnedValue>>);
 const DEFAULT_DUO_SCALE: f64 = 5.0 / 3.0;
 const RECONCILE_DEBOUNCE_MS: u64 = 1200;
 const ORIENTATION_STABILIZATION_MS: u64 = 1800;
+/// After `MonitorsChanged`, wait before classifying so Mutter and the “Keep these settings?” dialog settle.
+const GNOME_TOPOLOGY_DEBOUNCE_MS: u64 = 600;
+/// Reconcile debounce for availability nudges (MonitorsChanged path) — shorter because the
+/// MonitorsChanged handler already debounced and verified serial stability.
+const AVAILABILITY_RECONCILE_DEBOUNCE_MS: u64 = 200;
 /// After phase 1 of the eDP-2-primary two-step apply, wait before phase 2 so KMS/Mutter can finish
 /// committing the dual layout. See README "Dual display / Mutter apply ordering".
 const EDPTWO_PRIMARY_PHASE1_STABILITY_MS: u64 = 300;
-
+/// Sleep between display recovery attempts.
+const DISPLAY_RECOVERY_ATTEMPT_DELAY_SECS: u64 = 1;
+/// Transient “attempt N/20” toasts: long enough to read, but gone before the next attempt.
+const DISPLAY_RECOVERY_RETRY_TOAST_EXPIRE_MS: i32 = {
+    let interval_ms = (DISPLAY_RECOVERY_ATTEMPT_DELAY_SECS * 1000) as i32;
+    let minus_100 = interval_ms.saturating_sub(100);
+    if minus_100 > 500 {
+        minus_100
+    } else {
+        500
+    }
+};
 
 #[proxy(
     interface = "org.gnome.Mutter.DisplayConfig",
@@ -51,7 +68,7 @@ pub trait DisplayConfig {
 
 // ── Layout helpers ────────────────────────────────────────────────────────────
 
-fn logical_size(pw: i32, ph: i32, scale: f64, transform: u32) -> (i32, i32) {
+pub(crate) fn logical_size(pw: i32, ph: i32, scale: f64, transform: u32) -> (i32, i32) {
     // Use floor() not round(): Mutter validates adjacency using floor division internally.
     // Using round() can produce a position 1px past the edge, causing "displays not adjacent" errors
     // at non-integer scales (e.g. scale=5/3: 2880/1.6667 rounds to 1728, floor also gives 1728,
@@ -217,25 +234,26 @@ fn build_duo_lms(
     lms
 }
 
+/// Within one **mirrored** logical monitor (several outputs, same mode), Mutter expects the
+/// **desired-primary connector last** in the list passed to `apply_monitors_config` — same
+/// convention as [`build_duo_lms`] for joined mode and as `gdctl set --logical-monitor` (`-M`
+/// lines: non-primary outputs first, **primary last**).
+fn order_mirror_mons_primary_last(mut mons: Vec<ApplyMonSpec>, primary_connector: &str) -> Vec<ApplyMonSpec> {
+    if let Some(i) = mons
+        .iter()
+        .position(|(name, _, _)| name == primary_connector)
+    {
+        let row = mons.remove(i);
+        mons.push(row);
+    }
+    mons
+}
+
 /// Read current display config from logical monitors.
 /// Returns (config, is_corrupted) where is_corrupted=true if same connector appears twice.
 /// Mirrors Python's read_current_state() logic with duplicate detection.
 pub fn read_current_config(logical: &[LogicalMonitor]) -> (HashMap<String, (i32, i32, f64, u32, bool)>, bool) {
-    let mut config = HashMap::new();
-    let mut is_corrupted = false;
-    
-    for lm in logical {
-        if let Some(connector_ref) = lm.5.first() {
-            let connector = connector_ref.0.clone();
-            if config.contains_key(&connector) {
-                warn!("Display: corruption detected - {} appears twice in logical monitors", connector);
-                is_corrupted = true;
-            }
-            config.insert(connector, (lm.0, lm.1, lm.2, lm.3, lm.4));
-        }
-    }
-    
-    (config, is_corrupted)
+    crate::session::display_mode::read_current_logical_rows(logical)
 }
 
 /// Read scale from eDP-1 logical monitor. Falls back to primary logical monitor then DEFAULT.
@@ -245,6 +263,13 @@ fn read_edp1_scale(logical: &[LogicalMonitor]) -> f64 {
         return lm.2;
     }
     logical.iter().find(|lm| lm.4).map(|lm| lm.2).unwrap_or(DEFAULT_DUO_SCALE)
+}
+
+fn read_scale_for_connector(logical: &[LogicalMonitor], connector: &str) -> Option<f64> {
+    logical
+        .iter()
+        .find(|lm| lm.5.iter().any(|r| r.0 == connector))
+        .map(|lm| lm.2)
 }
 
 /// Returns true if the error is a Mutter "displays not adjacent" error.
@@ -312,45 +337,44 @@ fn requested_layout_matches_full(
     actual_modes: &HashMap<String, (String, i32, i32)>,
     warn_on_field_mismatch: bool,
 ) -> bool {
-    if requested.len() != actual_config.len() {
+    let expected_connectors: usize = requested.iter().map(|lm| lm.5.len()).sum();
+    if expected_connectors != actual_config.len() {
         return false;
     }
 
     for (i, lm_request) in requested.iter().enumerate() {
         let (x, y, scale, transform, is_primary, connectors) = lm_request;
-        let Some((connector, mode_id, _)) = connectors.first() else {
-            warn!("Display: requested LM[{i}] has no connector spec");
-            return false;
-        };
 
-        let Some((actual_x, actual_y, actual_scale, actual_transform, actual_is_primary)) =
-            actual_config.get(connector)
-        else {
-            warn!("Display: connector {connector} missing from actual config");
-            return false;
-        };
+        for (connector, mode_id, _) in connectors {
+            let Some((actual_x, actual_y, actual_scale, actual_transform, actual_is_primary)) =
+                actual_config.get(connector)
+            else {
+                warn!("Display: connector {connector} missing from actual config");
+                return false;
+            };
 
-        let Some((actual_mode_id, _, _)) = actual_modes.get(connector) else {
-            warn!("Display: connector {connector} missing current mode");
-            return false;
-        };
+            let Some((actual_mode_id, _, _)) = actual_modes.get(connector) else {
+                warn!("Display: connector {connector} missing current mode");
+                return false;
+            };
 
-        let matches = x == actual_x
-            && y == actual_y
-            && (scale - actual_scale).abs() < 0.01
-            && transform == actual_transform
-            && is_primary == actual_is_primary
-            && mode_id == actual_mode_id;
-        if !matches {
-            let msg = format!(
-                "Display: LM[{i}] {connector} mismatch: requested ({x},{y},{scale},{transform},{is_primary},mode={mode_id}), got ({actual_x},{actual_y},{actual_scale},{actual_transform},{actual_is_primary},mode={actual_mode_id})"
-            );
-            if warn_on_field_mismatch {
-                warn!("{msg}");
-            } else {
-                debug!("{msg} (current vs desired — apply needed)");
+            let matches = *x == *actual_x
+                && *y == *actual_y
+                && (scale - actual_scale).abs() < 0.01
+                && *transform == *actual_transform
+                && *is_primary == *actual_is_primary
+                && mode_id == actual_mode_id;
+            if !matches {
+                let msg = format!(
+                    "Display: LM[{i}] {connector} mismatch: requested ({x},{y},{scale},{transform},{is_primary},mode={mode_id}), got ({actual_x},{actual_y},{actual_scale},{actual_transform},{actual_is_primary},mode={actual_mode_id})"
+                );
+                if warn_on_field_mismatch {
+                    warn!("{msg}");
+                } else {
+                    debug!("{msg} (current vs desired — apply needed)");
+                }
+                return false;
             }
-            return false;
         }
     }
 
@@ -388,6 +412,14 @@ impl DisplayApplyError {
     }
 }
 
+struct ApplyBusyClear<'a>(&'a Arc<AtomicBool>);
+
+impl Drop for ApplyBusyClear<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 /// True when the current Mutter layout is **only eDP-1** (single logical monitor) and the desired
 /// state is **dual with eDP-2 as primary**.
 ///
@@ -417,6 +449,24 @@ fn requires_phase1_edp2_primary_from_edp1_solo(
         && current_config.contains_key("eDP-1")
 }
 
+/// Two stacked logical monitors (eDP-1 and eDP-2), **each** marked primary in a Mutter snapshot:
+/// a wedged state seen after mode switches (`gdctl show`: both `Primary: yes`). Recovery (validated
+/// manually with `gdctl set`) is: apply joined **eDP-1 primary**, then the desired layout (e.g.
+/// eDP-2 primary).
+fn mutter_dual_internal_primary_wedge(logical: &[LogicalMonitor]) -> bool {
+    logical.len() == 2
+        && logical.iter().filter(|lm| lm.4).count() == 2
+        && logical.iter().all(|lm| lm.5.len() == 1)
+        && logical
+            .iter()
+            .all(|lm| matches!(lm.5[0].0.as_str(), "eDP-1" | "eDP-2"))
+        && {
+            let a = logical[0].5[0].0.as_str();
+            let b = logical[1].5[0].0.as_str();
+            (a == "eDP-1" && b == "eDP-2") || (a == "eDP-2" && b == "eDP-1")
+        }
+}
+
 /// Unified display state: read current → build desired → (permission) → apply once → verify.
 /// All `apply_monitors_config` calls go through this path only.
 ///
@@ -429,98 +479,389 @@ async fn apply_desired_display_state(
     desired_secondary_enabled: bool,
     desired_primary: &str,
     desired_transform: u32,
+    desired_attachment: &str,
+    desired_layout: &str,
+    apply_allow_fallback: bool,
 ) -> Result<bool, DisplayApplyError> {
-    let (mut serial, physical, logical, _props) = display
-        .get_current_state()
-        .await
-        .map_err(|e| DisplayApplyError::Apply(e.to_string()))?;
-    let all_modes = extract_all_modes(&physical);
-    let (current_config, current_corrupted) = read_current_config(&logical);
-
-    let edp2_physically_available = all_modes.contains_key("eDP-2");
-    let edp2_should_be_enabled =
-        edp2_physically_available && desired_secondary_enabled && !keyboard_attached;
-
-    let edp1_scale = read_edp1_scale(&logical);
-
-    let desired_primary_effective = if desired_primary == "eDP-2" {
-        if !edp2_physically_available || !desired_secondary_enabled || keyboard_attached {
-            "eDP-1".to_string()
+    for pass in 0u32..2 {
+        let (attachment, layout) = if pass == 0 {
+            (desired_attachment, desired_layout)
         } else {
-            "eDP-2".to_string()
+            (
+                super::display_mode::ATTACH_BUILTIN_ONLY,
+                super::display_mode::LAYOUT_JOINED,
+            )
+        };
+
+        if pass == 1 {
+            info!("Display: falling back to builtin_only+joined after failed canonical apply");
+            let _ = super::notifications::send_transient_notification(
+                "Display layout",
+                "Could not apply the requested layout. Restored internal panels only — adjust externals in Settings if needed.",
+                "dialog-warning",
+                6500,
+                1,
+            )
+            .await;
         }
-    } else {
-        "eDP-1".to_string()
-    };
 
-    let edp1_mode = all_modes
-        .get("eDP-1")
-        .ok_or_else(|| DisplayApplyError::Apply("No mode found for eDP-1".to_string()))?;
-    let edp2_mode_if_duo: Option<(String, i32, i32)> = if edp2_should_be_enabled {
-        Some(
-            find_mode_matching_size(&physical, "eDP-2", edp1_mode.1, edp1_mode.2)
-                .or_else(|| all_modes.get("eDP-2").cloned())
-                .ok_or_else(|| DisplayApplyError::Apply("No mode found for eDP-2".to_string()))?,
-        )
-    } else {
-        None
-    };
+        // Single fallback pass: only when caller allows it and the first pass was not already the safe default.
+        let try_fallback = pass == 0
+            && apply_allow_fallback
+            && (desired_attachment != super::display_mode::ATTACH_BUILTIN_ONLY
+                || desired_layout != super::display_mode::LAYOUT_JOINED);
 
-    let desired_lms = if let Some(ref edp2_mode) = edp2_mode_if_duo {
-        let (primary_mode, secondary_connector, secondary_mode) = if desired_primary_effective == "eDP-1" {
-            (edp1_mode, "eDP-2", edp2_mode)
+        let (mut serial, mut physical, mut logical, _props) = display
+            .get_current_state()
+            .await
+            .map_err(|e| DisplayApplyError::Apply(e.to_string()))?;
+        let mut all_modes = extract_all_modes(&physical);
+        let (mut current_config, mut current_corrupted) = read_current_config(&logical);
+
+        let edp2_physically_available = all_modes.contains_key("eDP-2");
+        let edp2_should_be_enabled =
+            edp2_physically_available && desired_secondary_enabled && !keyboard_attached;
+
+        let mut edp1_scale = read_edp1_scale(&logical);
+
+        let desired_primary_effective = if desired_primary == "eDP-2" {
+            if !edp2_physically_available || !desired_secondary_enabled || keyboard_attached {
+                "eDP-1".to_string()
+            } else {
+                "eDP-2".to_string()
+            }
         } else {
-            (edp2_mode, "eDP-1", edp1_mode)
+            "eDP-1".to_string()
         };
-        build_duo_lms(
-            &desired_primary_effective,
-            primary_mode,
-            Some((secondary_connector, secondary_mode)),
-            desired_transform,
-            edp1_scale,
-        )
-    } else {
-        build_duo_lms(
-            &desired_primary_effective,
-            edp1_mode,
-            None,
-            desired_transform,
-            edp1_scale,
-        )
-    };
 
-    let current_matches_desired =
-        !current_corrupted
-            && requested_layout_matches_full(&desired_lms, &current_config, &all_modes, false);
-    if current_matches_desired {
-        info!("Display state already matches desired (no change needed)");
-        return Ok(false);
-    }
-
-    let run_edp2_primary_phase1 = requires_phase1_edp2_primary_from_edp1_solo(
-        current_corrupted,
-        edp2_should_be_enabled,
-        &desired_primary_effective,
-        &logical,
-        &current_config,
-    );
-
-    if run_edp2_primary_phase1 {
-        let Some(ref edp2_mode) = edp2_mode_if_duo else {
-            return Err(DisplayApplyError::Apply(
-                "internal error: two-phase eDP-2 primary requires eDP-2 mode".to_string(),
-            ));
+        let edp1_mode = all_modes
+            .get("eDP-1")
+            .cloned()
+            .ok_or_else(|| DisplayApplyError::Apply("No mode found for eDP-1".to_string()))?;
+        let edp2_mode_if_duo: Option<(String, i32, i32)> = if edp2_should_be_enabled {
+            Some(
+                find_mode_matching_size(&physical, "eDP-2", edp1_mode.1, edp1_mode.2)
+                    .or_else(|| all_modes.get("eDP-2").cloned())
+                    .ok_or_else(|| DisplayApplyError::Apply("No mode found for eDP-2".to_string()))?,
+            )
+        } else {
+            None
         };
-        let intermediate_lms = build_duo_lms(
-            "eDP-1",
-            edp1_mode,
-            Some(("eDP-2", edp2_mode)),
-            desired_transform,
-            edp1_scale,
-        );
-        info!(
-            "Display: two-phase eDP-2 primary — phase 1: enable dual layout with eDP-1 still primary, then pause for KMS/Mutter"
-        );
+
+        let desired_lms: Vec<ApplyLm> =
+            if attachment == super::display_mode::ATTACH_EXTERNAL_ONLY {
+                let mut v = vec![];
+                for lm in &logical {
+                    let mons: Vec<_> = lm
+                        .5
+                        .iter()
+                        .filter(|r| !super::display_mode::is_internal_connector(&r.0))
+                        .filter_map(|r| {
+                            all_modes
+                                .get(&r.0)
+                                .map(|m| (r.0.clone(), m.0.clone(), HashMap::new()))
+                        })
+                        .collect();
+                    if mons.is_empty() {
+                        continue;
+                    }
+                    v.push((lm.0, lm.1, lm.2, lm.3, lm.4, mons));
+                }
+                if v.is_empty() {
+                    info!("Display: external_only but no external in logical layout; skip apply");
+                    return Ok(false);
+                }
+                v.sort_by_key(|l| !l.4);
+                v
+            } else if attachment == super::display_mode::ATTACH_BUILTIN_ONLY
+                && layout == super::display_mode::LAYOUT_MIRROR
+            {
+                if let Some(ref em) = edp2_mode_if_duo {
+                    let mons = order_mirror_mons_primary_last(
+                        vec![
+                            ("eDP-1".to_string(), edp1_mode.0.clone(), HashMap::new()),
+                            ("eDP-2".to_string(), em.0.clone(), HashMap::new()),
+                        ],
+                        &desired_primary_effective,
+                    );
+                    vec![(
+                        0,
+                        0,
+                        edp1_scale,
+                        desired_transform,
+                        true,
+                        mons,
+                    )]
+                } else {
+                    let mons = vec![(
+                        "eDP-1".to_string(),
+                        edp1_mode.0.clone(),
+                        HashMap::new(),
+                    )];
+                    vec![(
+                        0,
+                        0,
+                        edp1_scale,
+                        desired_transform,
+                        true,
+                        mons,
+                    )]
+                }
+            } else if attachment == super::display_mode::ATTACH_ALL_CONNECTED
+                && layout == super::display_mode::LAYOUT_MIRROR
+            {
+                let ext_name = super::display_mode::first_external_connector(&physical).ok_or_else(
+                    || {
+                        DisplayApplyError::Apply(
+                            "all_connected+mirror requires an external output".into(),
+                        )
+                    },
+                )?;
+                let ext_mode = all_modes.get(&ext_name).ok_or_else(|| {
+                    DisplayApplyError::Apply(format!("No mode for external {ext_name}"))
+                })?;
+                let mut mons = vec![(
+                    "eDP-1".to_string(),
+                    edp1_mode.0.clone(),
+                    HashMap::new(),
+                )];
+                if edp2_should_be_enabled {
+                    if let Some(ref em) = edp2_mode_if_duo {
+                        mons.push(("eDP-2".to_string(), em.0.clone(), HashMap::new()));
+                    }
+                }
+                mons.push((ext_name.clone(), ext_mode.0.clone(), HashMap::new()));
+                let mons = order_mirror_mons_primary_last(mons, &desired_primary_effective);
+                vec![(0, 0, edp1_scale, desired_transform, true, mons)]
+            } else if attachment == super::display_mode::ATTACH_ALL_CONNECTED
+                && layout == super::display_mode::LAYOUT_JOINED
+            {
+                let ext_name = super::display_mode::first_external_connector(&physical).ok_or_else(
+                    || {
+                        DisplayApplyError::Apply(
+                            "all_connected+joined requires an external output".into(),
+                        )
+                    },
+                )?;
+                let ext_mode = all_modes.get(&ext_name).ok_or_else(|| {
+                    DisplayApplyError::Apply(format!("No mode for external {ext_name}"))
+                })?;
+                let mut duo_lms = if let Some(ref edp2_mode) = edp2_mode_if_duo {
+                    let (primary_mode, secondary_connector, secondary_mode) =
+                        if desired_primary_effective == "eDP-1" {
+                            (&edp1_mode, "eDP-2", edp2_mode)
+                        } else {
+                            (edp2_mode, "eDP-1", &edp1_mode)
+                        };
+                    build_duo_lms(
+                        &desired_primary_effective,
+                        primary_mode,
+                        Some((secondary_connector, secondary_mode)),
+                        desired_transform,
+                        edp1_scale,
+                    )
+                } else {
+                    build_duo_lms(
+                        &desired_primary_effective,
+                        &edp1_mode,
+                        None,
+                        desired_transform,
+                        edp1_scale,
+                    )
+                };
+                let (e1x, e1y) = duo_lms
+                    .iter()
+                    .find(|lm| lm.5.iter().any(|(c, _, _)| c == "eDP-1"))
+                    .map(|lm| (lm.0, lm.1))
+                    .unwrap_or((0, 0));
+                let ext_scale = read_scale_for_connector(&logical, &ext_name).unwrap_or(edp1_scale);
+                let ext_x = e1x
+                    + super::display_mode::edp_logical_extent_x(
+                        edp1_mode.1,
+                        edp1_mode.2,
+                        edp1_scale,
+                        desired_transform,
+                    );
+                duo_lms.push((
+                    ext_x,
+                    e1y,
+                    ext_scale,
+                    0u32,
+                    false,
+                    vec![(ext_name.clone(), ext_mode.0.clone(), HashMap::new())],
+                ));
+                duo_lms.sort_by_key(|lm| !lm.4);
+                duo_lms
+            } else if let Some(ref edp2_mode) = edp2_mode_if_duo {
+                let (primary_mode, secondary_connector, secondary_mode) =
+                    if desired_primary_effective == "eDP-1" {
+                        (&edp1_mode, "eDP-2", edp2_mode)
+                    } else {
+                        (edp2_mode, "eDP-1", &edp1_mode)
+                    };
+                build_duo_lms(
+                    &desired_primary_effective,
+                    primary_mode,
+                    Some((secondary_connector, secondary_mode)),
+                    desired_transform,
+                    edp1_scale,
+                )
+            } else {
+                build_duo_lms(
+                    &desired_primary_effective,
+                    &edp1_mode,
+                    None,
+                    desired_transform,
+                    edp1_scale,
+                )
+            };
+
+        let needs_dual_primary_wedge_heal = mutter_dual_internal_primary_wedge(&logical)
+            && edp2_should_be_enabled
+            && attachment == super::display_mode::ATTACH_BUILTIN_ONLY
+            && matches!(
+                layout,
+                super::display_mode::LAYOUT_JOINED | super::display_mode::LAYOUT_MIRROR
+            );
+
+        if needs_dual_primary_wedge_heal {
+            let Some(ref edp2_mode) = edp2_mode_if_duo else {
+                return Err(DisplayApplyError::Apply(
+                    "internal error: dual-primary wedge heal requires eDP-2 mode".to_string(),
+                ));
+            };
+            info!("Display: Mutter dual-primary wedge on both internals — healing with eDP-1-primary joined layout, then applying desired layout");
+            match crate::dbus_state::register_display_apply_attempt().await {
+                Ok(crate::dbus_state::DisplayApplyPermit::Allowed) => {}
+                Ok(crate::dbus_state::DisplayApplyPermit::Paused) => {
+                    return Err(DisplayApplyError::GuardPaused);
+                }
+                Err(e) => return Err(DisplayApplyError::GuardCheck(e)),
+            }
+
+            let heal_lms = build_duo_lms(
+                "eDP-1",
+                &edp1_mode,
+                Some(("eDP-2", edp2_mode)),
+                desired_transform,
+                edp1_scale,
+            );
+            let applied = apply_duo_config_with_adjacency_fix(
+                display,
+                serial,
+                heal_lms,
+                desired_transform,
+            )
+            .await
+            .map_err(|e| DisplayApplyError::Apply(e.to_string()))?;
+            if !applied {
+                if try_fallback {
+                    continue;
+                }
+                return Err(DisplayApplyError::Apply(
+                    "Dual-primary wedge heal: failed to apply eDP-1-primary joined layout"
+                        .to_string(),
+                ));
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(
+                EDPTWO_PRIMARY_PHASE1_STABILITY_MS,
+            ))
+            .await;
+
+            let (s, phys, log, _) = display
+                .get_current_state()
+                .await
+                .map_err(|e| DisplayApplyError::Apply(e.to_string()))?;
+            serial = s;
+            physical = phys;
+            logical = log;
+            all_modes = extract_all_modes(&physical);
+            (current_config, current_corrupted) = read_current_config(&logical);
+            edp1_scale = read_edp1_scale(&logical);
+        }
+
+        let current_matches_desired =
+            !current_corrupted
+                && requested_layout_matches_full(&desired_lms, &current_config, &all_modes, false);
+        if current_matches_desired {
+            info!("Display state already matches desired (no change needed)");
+            return Ok(false);
+        }
+
+        let run_edp2_primary_phase1 = attachment == super::display_mode::ATTACH_BUILTIN_ONLY
+            && layout == super::display_mode::LAYOUT_JOINED
+            && requires_phase1_edp2_primary_from_edp1_solo(
+                current_corrupted,
+                edp2_should_be_enabled,
+                &desired_primary_effective,
+                &logical,
+                &current_config,
+            );
+
+        if run_edp2_primary_phase1 {
+            let Some(ref edp2_mode) = edp2_mode_if_duo else {
+                return Err(DisplayApplyError::Apply(
+                    "internal error: two-phase eDP-2 primary requires eDP-2 mode".to_string(),
+                ));
+            };
+            let intermediate_lms = build_duo_lms(
+                "eDP-1",
+                &edp1_mode,
+                Some(("eDP-2", edp2_mode)),
+                desired_transform,
+                edp1_scale,
+            );
+            info!(
+                "Display: two-phase eDP-2 primary — phase 1: enable dual layout with eDP-1 still primary, then pause for KMS/Mutter"
+            );
+            match crate::dbus_state::register_display_apply_attempt().await {
+                Ok(crate::dbus_state::DisplayApplyPermit::Allowed) => {}
+                Ok(crate::dbus_state::DisplayApplyPermit::Paused) => {
+                    return Err(DisplayApplyError::GuardPaused);
+                }
+                Err(e) => return Err(DisplayApplyError::GuardCheck(e)),
+            }
+
+            let applied = apply_duo_config_with_adjacency_fix(
+                display,
+                serial,
+                intermediate_lms,
+                desired_transform,
+            )
+            .await
+            .map_err(|e| DisplayApplyError::Apply(e.to_string()))?;
+            if !applied {
+                if try_fallback {
+                    continue;
+                }
+                return Err(DisplayApplyError::Apply(
+                    "Two-phase eDP-2 primary: phase 1 failed (dual layout with eDP-1 primary)"
+                        .to_string(),
+                ));
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(
+                EDPTWO_PRIMARY_PHASE1_STABILITY_MS,
+            ))
+            .await;
+
+            let (serial_after_p1, _phys_p1, logical_after_p1, _) = display
+                .get_current_state()
+                .await
+                .map_err(|e| DisplayApplyError::Apply(e.to_string()))?;
+            let (cfg_p1, corrupt_p1) = read_current_config(&logical_after_p1);
+            if corrupt_p1 || !cfg_p1.contains_key("eDP-1") || !cfg_p1.contains_key("eDP-2") {
+                if try_fallback {
+                    continue;
+                }
+                return Err(DisplayApplyError::Apply(
+                    "Two-phase eDP-2 primary: phase 1 did not leave a stable dual layout".to_string(),
+                ));
+            }
+            serial = serial_after_p1;
+        }
+
         match crate::dbus_state::register_display_apply_attempt().await {
             Ok(crate::dbus_state::DisplayApplyPermit::Allowed) => {}
             Ok(crate::dbus_state::DisplayApplyPermit::Paused) => {
@@ -529,133 +870,185 @@ async fn apply_desired_display_state(
             Err(e) => return Err(DisplayApplyError::GuardCheck(e)),
         }
 
-        let applied = apply_duo_config_with_adjacency_fix(
-            display,
-            serial,
-            intermediate_lms,
-            desired_transform,
-        )
-        .await
-        .map_err(|e| DisplayApplyError::Apply(e.to_string()))?;
-        if !applied {
-            return Err(DisplayApplyError::Apply(
-                "Two-phase eDP-2 primary: phase 1 failed (dual layout with eDP-1 primary)".to_string(),
-            ));
+        let use_duo_adjacency = desired_lms.len() == 2
+            && attachment == super::display_mode::ATTACH_BUILTIN_ONLY
+            && layout == super::display_mode::LAYOUT_JOINED;
+
+        let apply_outcome: Result<(), DisplayApplyError> = if use_duo_adjacency {
+            let applied = apply_duo_config_with_adjacency_fix(
+                display,
+                serial,
+                desired_lms.clone(),
+                desired_transform,
+            )
+            .await
+            .map_err(|e| DisplayApplyError::Apply(e.to_string()))?;
+            if !applied {
+                Err(DisplayApplyError::Apply(
+                    "Failed to apply desired dual-monitor layout after adjacency correction"
+                        .to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        } else {
+            display
+                .apply_monitors_config(serial, 1, desired_lms.clone(), HashMap::new())
+                .await
+                .map_err(|e| DisplayApplyError::Apply(e.to_string()))
+        };
+
+        if let Err(e) = apply_outcome {
+            if try_fallback {
+                continue;
+            }
+            return Err(e);
         }
 
-        tokio::time::sleep(std::time::Duration::from_millis(
-            EDPTWO_PRIMARY_PHASE1_STABILITY_MS,
-        ))
-        .await;
-
-        let (serial_after_p1, _phys_p1, logical_after_p1, _) = display
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (_, physical_after, logical_after, _) = display
             .get_current_state()
             .await
             .map_err(|e| DisplayApplyError::Apply(e.to_string()))?;
-        let (cfg_p1, corrupt_p1) = read_current_config(&logical_after_p1);
-        if corrupt_p1 || !cfg_p1.contains_key("eDP-1") || !cfg_p1.contains_key("eDP-2") {
+        let (after_config, after_corrupted) = read_current_config(&logical_after);
+        let after_modes = extract_all_modes(&physical_after);
+        let verified =
+            !after_corrupted
+                && requested_layout_matches_full(&desired_lms, &after_config, &after_modes, true);
+        if !verified {
+            if try_fallback {
+                continue;
+            }
             return Err(DisplayApplyError::Apply(
-                "Two-phase eDP-2 primary: phase 1 did not leave a stable dual layout".to_string(),
+                "Desired display layout mismatch after apply".to_string(),
             ));
         }
-        serial = serial_after_p1;
+
+        info!("Display state applied successfully");
+        return Ok(true);
     }
 
-    match crate::dbus_state::register_display_apply_attempt().await {
-        Ok(crate::dbus_state::DisplayApplyPermit::Allowed) => {}
-        Ok(crate::dbus_state::DisplayApplyPermit::Paused) => {
-            return Err(DisplayApplyError::GuardPaused);
-        }
-        Err(e) => return Err(DisplayApplyError::GuardCheck(e)),
-    }
-
-    if desired_lms.len() == 2 {
-        let applied = apply_duo_config_with_adjacency_fix(display, serial, desired_lms.clone(), desired_transform)
-            .await
-            .map_err(|e| DisplayApplyError::Apply(e.to_string()))?;
-        if !applied {
-            return Err(DisplayApplyError::Apply(
-                "Failed to apply desired dual-monitor layout after adjacency correction".to_string(),
-            ));
-        }
-    } else {
-        display
-            .apply_monitors_config(serial, 1, desired_lms.clone(), HashMap::new())
-            .await
-            .map_err(|e| DisplayApplyError::Apply(e.to_string()))?;
-    }
-
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    let (_, physical_after, logical_after, _) = display
-        .get_current_state()
-        .await
-        .map_err(|e| DisplayApplyError::Apply(e.to_string()))?;
-    let (after_config, after_corrupted) = read_current_config(&logical_after);
-    let after_modes = extract_all_modes(&physical_after);
-    let verified =
-        !after_corrupted
-            && requested_layout_matches_full(&desired_lms, &after_config, &after_modes, true);
-    if !verified {
-        return Err(DisplayApplyError::Apply(
-            "Desired display layout mismatch after apply".to_string(),
-        ));
-    }
-
-    info!("Display state applied successfully");
-    Ok(true)
+    Err(DisplayApplyError::Apply(
+        "Display apply: exhausted fallback attempts".into(),
+    ))
 }
 
-/// Subscribe to D-Bus MonitorsChanged from Mutter when `desired_primary` may need eDP-2 hot-plug handling.
+/// While true, [`subscribe_monitors_changed`] must not persist observed display mode or nudge reconcile.
+#[inline]
+fn mon_changed_skip_if_apply_busy(apply_busy: &Arc<AtomicBool>, phase: &'static str) -> bool {
+    if apply_busy.load(Ordering::SeqCst) {
+        debug!(
+            "MonitorsChanged: apply/recovery active ({phase}) — ignoring (no root display mode change, no reconcile nudge)"
+        );
+        true
+    } else {
+        false
+    }
+}
+
+/// Subscribe to `MonitorsChanged`: debounce, classify topology, report observed mode to root, and
+/// nudge reconciliation (including eDP-2 primary restore when applicable).
+///
+/// Suppressed whenever [`apply_busy`](AtomicBool) is set for the whole handling path: we do not
+/// call [`crate::dbus_state::report_observed_display_mode_from_session`] or
+/// `availability_tx` while the session is applying layout, in fallback, or in recovery.
 async fn subscribe_monitors_changed(
     display: &DisplayConfigProxy<'_>,
     availability_tx: broadcast::Sender<()>,
     desired_primary: Arc<tokio::sync::RwLock<String>>,
+    apply_busy: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("DisplayConfig: subscribing to MonitorsChanged signal (event-driven, no polling)");
 
     let mut signal_rx = display.receive_monitors_changed().await?;
 
     while signal_rx.next().await.is_some() {
-        let desired = desired_primary.read().await.clone();
-
-        if desired != "eDP-2" {
-            debug!("MonitorsChanged: desired_primary is {desired}, not eDP-2, skipping");
+        if mon_changed_skip_if_apply_busy(&apply_busy, "before debounce") {
             continue;
         }
 
-        if let Ok((_serial, _physical, logical, _)) = display.get_current_state().await {
-            let (logical_map, _) = read_current_config(&logical);
+        tokio::time::sleep(tokio::time::Duration::from_millis(GNOME_TOPOLOGY_DEBOUNCE_MS)).await;
 
+        if mon_changed_skip_if_apply_busy(&apply_busy, "after debounce") {
+            continue;
+        }
+
+        let (serial_a, _, _, _) = match display.get_current_state().await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("MonitorsChanged: get_current_state failed: {e}");
+                continue;
+            }
+        };
+
+        if mon_changed_skip_if_apply_busy(&apply_busy, "after first GetCurrentState") {
+            continue;
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+
+        if mon_changed_skip_if_apply_busy(&apply_busy, "after serial stability delay") {
+            continue;
+        }
+
+        let (serial_b, _, logical_b, _) = match display.get_current_state().await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("MonitorsChanged: second get_current_state failed: {e}");
+                continue;
+            }
+        };
+
+        if mon_changed_skip_if_apply_busy(&apply_busy, "after second GetCurrentState") {
+            continue;
+        }
+
+        if serial_a != serial_b {
+            debug!(
+                "MonitorsChanged: state still changing (serial {serial_a} -> {serial_b}), skipping classify"
+            );
+            continue;
+        }
+
+        if mon_changed_skip_if_apply_busy(&apply_busy, "before report to root") {
+            continue;
+        }
+
+        let attachment = super::display_mode::classify_attachment(&logical_b);
+        let layout = super::display_mode::classify_layout(&logical_b);
+        info!(
+            "MonitorsChanged: classified display state as attachment={attachment} layout={layout}, persisting to root"
+        );
+        if let Err(e) = crate::dbus_state::report_observed_display_mode_from_session(
+            attachment.to_string(),
+            layout.to_string(),
+        )
+        .await
+        {
+            warn!("MonitorsChanged: report_observed_display_mode failed: {e}");
+        }
+
+        if mon_changed_skip_if_apply_busy(&apply_busy, "before availability nudge") {
+            continue;
+        }
+
+        let desired = desired_primary.read().await.clone();
+        if desired == "eDP-2" {
+            let (logical_map, _) = read_current_config(&logical_b);
             match logical_map.get("eDP-2") {
                 Some((_, _, _, _, is_primary)) if !*is_primary => {
-                    info!("MonitorsChanged: eDP-2 is available and desired, attempting to restore as primary");
-                    let _ = availability_tx.send(());
-                }
-                Some((_, _, _, _, is_primary)) if *is_primary => {
-                    debug!("MonitorsChanged: eDP-2 already primary, no action needed");
-                }
-                None => {
-                    debug!("MonitorsChanged: eDP-2 not available");
+                    info!(
+                        "MonitorsChanged: eDP-2 is available and desired, attempting to restore as primary"
+                    );
                 }
                 _ => {}
             }
         }
+
+        let _ = availability_tx.send(());
     }
 
     Ok(())
-}
-
-fn effective_secondary_enabled(desired_secondary_enabled: bool, keyboard_attached: bool) -> bool {
-    desired_secondary_enabled && !keyboard_attached
-}
-
-fn stop_availability_monitor(
-    availability_task: &mut Option<tokio::task::JoinHandle<()>>,
-) {
-    if let Some(task) = availability_task.take() {
-        task.abort();
-        info!("DisplayConfig: stopped MonitorsChanged listener");
-    }
 }
 
 fn ensure_availability_monitor(
@@ -663,6 +1056,7 @@ fn ensure_availability_monitor(
     conn: &Connection,
     availability_tx: &broadcast::Sender<()>,
     desired_primary: &Arc<tokio::sync::RwLock<String>>,
+    apply_busy: &Arc<AtomicBool>,
 ) {
     let already_running = availability_task
         .as_ref()
@@ -674,6 +1068,7 @@ fn ensure_availability_monitor(
     let conn_clone = conn.clone();
     let availability_tx_clone = availability_tx.clone();
     let desired_primary_clone = Arc::clone(desired_primary);
+    let apply_busy_clone = Arc::clone(apply_busy);
     *availability_task = Some(tokio::spawn(async move {
         match DisplayConfigProxy::new(&conn_clone).await {
             Ok(display) => {
@@ -681,6 +1076,7 @@ fn ensure_availability_monitor(
                     &display,
                     availability_tx_clone,
                     desired_primary_clone,
+                    apply_busy_clone,
                 )
                 .await
                 {
@@ -692,20 +1088,6 @@ fn ensure_availability_monitor(
             }
         }
     }));
-}
-
-fn update_availability_monitor_for_edp2(
-    availability_task: &mut Option<tokio::task::JoinHandle<()>>,
-    conn: &Connection,
-    availability_tx: &broadcast::Sender<()>,
-    desired_primary: &Arc<tokio::sync::RwLock<String>>,
-    should_wait_for_edp2: bool,
-) {
-    if should_wait_for_edp2 {
-        ensure_availability_monitor(availability_task, conn, availability_tx, desired_primary);
-    } else {
-        stop_availability_monitor(availability_task);
-    }
 }
 
 async fn current_desired_transform(
@@ -737,18 +1119,36 @@ async fn current_desired_transform(
 
 async fn reconcile_display_state(
     display: &DisplayConfigProxy<'_>,
-    conn: &Connection,
-    availability_task: &mut Option<tokio::task::JoinHandle<()>>,
-    availability_tx: &broadcast::Sender<()>,
     desired_primary: &Arc<tokio::sync::RwLock<String>>,
     desired_secondary: &Arc<tokio::sync::RwLock<bool>>,
     keyboard_attached: bool,
+    apply_busy: &Arc<AtomicBool>,
+    apply_serial: &Arc<tokio::sync::Mutex<()>>,
 ) -> Result<bool, DisplayApplyError> {
+    apply_busy.store(true, Ordering::SeqCst);
+    let _apply_idle = ApplyBusyClear(apply_busy);
+    let _serial_guard = apply_serial.lock().await;
+
+    let desired_primary_value = desired_primary.read().await.clone();
+    let desired_secondary_enabled = *desired_secondary.read().await;
+
+    let (desired_attachment, desired_layout) =
+        match crate::dbus_state::read_persisted_display_mode_from_root().await {
+            Ok(v) => v,
+            Err(e) if e.contains("not registered") => {
+                warn!("Display reconcile: {e}; skipping apply until session registers with root");
+                return Ok(false);
+            }
+            Err(e) => return Err(DisplayApplyError::Apply(e)),
+        };
+
     let desired_transform = current_desired_transform(display)
         .await
         .map_err(|e| DisplayApplyError::Apply(e.to_string()))?;
-    let desired_primary_value = desired_primary.read().await.clone();
-    let desired_secondary_enabled = *desired_secondary.read().await;
+    info!(
+        "Display reconcile: persisted mode attachment={desired_attachment} layout={desired_layout}; \
+         desired transform={desired_transform} (from accelerometer)"
+    );
 
     let changed = apply_desired_display_state(
         display,
@@ -756,19 +1156,12 @@ async fn reconcile_display_state(
         desired_secondary_enabled,
         &desired_primary_value,
         desired_transform,
+        &desired_attachment,
+        &desired_layout,
+        true,
     )
     .await?;
 
-    let should_wait_for_edp2 =
-        desired_primary_value == "eDP-2"
-            && effective_secondary_enabled(desired_secondary_enabled, keyboard_attached);
-    update_availability_monitor_for_edp2(
-        availability_task,
-        conn,
-        availability_tx,
-        desired_primary,
-        should_wait_for_edp2,
-    );
     Ok(changed)
 }
 
@@ -781,13 +1174,24 @@ async fn attempt_display_recovery(
     let display = DisplayConfigProxy::new(conn)
         .await
         .map_err(|e| DisplayApplyError::Apply(e.to_string()))?;
-    let desired_transform = current_desired_transform(&display)
-        .await
-        .map_err(|e| DisplayApplyError::Apply(e.to_string()))?;
 
     let kb_before = *keyboard_attached.read().await;
     let sec_before = *desired_secondary.read().await;
     let pri_before = desired_primary.read().await.clone();
+
+    let (attachment, layout) =
+        match crate::dbus_state::read_persisted_display_mode_from_root().await {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(DisplayApplyError::Apply(format!(
+                    "persisted display mode unavailable: {e}"
+                )));
+            }
+        };
+
+    let desired_transform = current_desired_transform(&display)
+        .await
+        .map_err(|e| DisplayApplyError::Apply(e.to_string()))?;
 
     apply_desired_display_state(
         &display,
@@ -795,6 +1199,9 @@ async fn attempt_display_recovery(
         sec_before,
         &pri_before,
         desired_transform,
+        &attachment,
+        &layout,
+        true,
     )
     .await?;
 
@@ -818,6 +1225,8 @@ fn ensure_display_recovery_task(
     desired_secondary: &Arc<tokio::sync::RwLock<bool>>,
     keyboard_attached: &Arc<tokio::sync::RwLock<bool>>,
     reason: &'static str,
+    apply_busy: Arc<AtomicBool>,
+    apply_serial: Arc<tokio::sync::Mutex<()>>,
 ) {
     let already_running = recovery_task
         .as_ref()
@@ -831,8 +1240,11 @@ fn ensure_display_recovery_task(
     let desired_secondary = Arc::clone(desired_secondary);
     let keyboard_attached = Arc::clone(keyboard_attached);
     *recovery_task = Some(tokio::spawn(async move {
+        apply_busy.store(true, Ordering::SeqCst);
+        let _campaign_apply_idle = ApplyBusyClear(&apply_busy);
+        let _campaign_serial = apply_serial.lock().await;
+
         const MAX_ATTEMPTS: usize = 20;
-        const DELAY_SECS: u64 = 1;
 
         for attempt in 1..=MAX_ATTEMPTS {
             match attempt_display_recovery(
@@ -878,8 +1290,8 @@ fn ensure_display_recovery_task(
                             "Display recovery retrying",
                             &body,
                             "dialog-warning",
-                            800,
-                            1, // urgency: normal/yellow
+                            DISPLAY_RECOVERY_RETRY_TOAST_EXPIRE_MS,
+                            1,
                         )
                         .await
                         {
@@ -890,7 +1302,10 @@ fn ensure_display_recovery_task(
             }
 
             if attempt < MAX_ATTEMPTS {
-                tokio::time::sleep(std::time::Duration::from_secs(DELAY_SECS)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    DISPLAY_RECOVERY_ATTEMPT_DELAY_SECS,
+                ))
+                .await;
             }
         }
 
@@ -980,11 +1395,26 @@ pub async fn run(
     // Broadcast channel for availability checks triggered by display state changes
     let (availability_tx, _) = broadcast::channel::<()>(8);
 
+    // `apply_busy`: set for an entire reconcile (including multi-pass fallback inside
+    // `apply_desired_display_state`) and for an entire recovery campaign (all attempts + delays),
+    // so `MonitorsChanged` never persists observed mode to root during those windows. Cleared when
+    // the operation finishes, aborts (new reconcile cancels recovery), or the guard blocks recovery.
+    let apply_busy = Arc::new(AtomicBool::new(false));
+    let apply_serial = Arc::new(tokio::sync::Mutex::new(()));
+
     if let Ok(transform) = current_desired_transform(&display).await {
         info!("Display: startup desired transform={transform}");
     }
     let mut availability_rx = availability_tx.subscribe();
     let mut availability_task: Option<tokio::task::JoinHandle<()>> = None;
+    ensure_availability_monitor(
+        &mut availability_task,
+        &conn,
+        &availability_tx,
+        &desired_primary,
+        &apply_busy,
+    );
+
     let mut recovery_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut keyboard_attached = false;
     let keyboard_attached_state = Arc::new(tokio::sync::RwLock::new(false));
@@ -1021,12 +1451,11 @@ pub async fn run(
                 let start = std::time::Instant::now();
                 match reconcile_display_state(
                     &display,
-                    &conn,
-                    &mut availability_task,
-                    &availability_tx,
                     &desired_primary,
                     &desired_secondary,
                     keyboard_attached,
+                    &apply_busy,
+                    &apply_serial,
                 )
                 .await
                 {
@@ -1060,6 +1489,8 @@ pub async fn run(
                             &desired_secondary,
                             &keyboard_attached_state,
                             pending_reason,
+                            Arc::clone(&apply_busy),
+                            Arc::clone(&apply_serial),
                         );
                     }
                 }
@@ -1214,7 +1645,7 @@ pub async fn run(
                         &mut debounce_deadline,
                         &mut pending_reason,
                         "display availability update",
-                        RECONCILE_DEBOUNCE_MS,
+                        AVAILABILITY_RECONCILE_DEBOUNCE_MS,
                     );
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {}

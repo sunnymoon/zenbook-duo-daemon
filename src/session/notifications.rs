@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use futures::StreamExt as _;
 use log::{error, warn};
 use tokio::sync::broadcast;
-use tokio::time::Duration;
+use tokio::time::{interval_at, Duration, Instant, MissedTickBehavior};
 use zbus::{Connection, proxy, zvariant::Value};
 use zbus::fdo::ObjectManagerProxy;
 
@@ -77,24 +77,20 @@ fn transient_hints() -> HashMap<&'static str, Value<'static>> {
     hints
 }
 
-// Transient: shown briefly, not stored in the notification area.
 fn urgency_hints(urgency: u8) -> HashMap<&'static str, Value<'static>> {
     let mut hints = transient_hints();
-    hints.insert("urgency", Value::from(urgency));
+    hints.insert("urgency", Value::U8(urgency));
     hints
 }
 
-// Persistent: stays in the notification area until dismissed.
+/// Persistent: stays in the notification area until dismissed.
 fn persistent_urgency_hints(urgency: u8) -> HashMap<&'static str, Value<'static>> {
     let mut hints = HashMap::new();
-    hints.insert("urgency", Value::from(urgency));
+    hints.insert("urgency", Value::U8(urgency));
     hints
 }
 
 fn bullet_lines(lines: &[&str]) -> String {
-    // GNOME Shell collapses '\n' but honours U+2028 (Line Separator) for
-    // visual line breaks.  Only <b> and <i> inline markup is rendered;
-    // structural tags (div, ul, li, br) are escaped and shown literally.
     lines
         .iter()
         .map(|line| format!("• {line}"))
@@ -103,7 +99,6 @@ fn bullet_lines(lines: &[&str]) -> String {
 }
 
 /// Persistent notification — stays in GNOME's notification area until dismissed.
-/// Use only for unrecoverable failures that require user attention.
 pub async fn send_notification(
     summary: &str,
     body: &str,
@@ -162,8 +157,6 @@ fn keyboard_notification_text(
     desired_secondary_enabled: bool,
 ) -> (&'static str, String, &'static str) {
     if attached {
-        // When attaching on USB, only mention the top-bar moving if eDP-2 was
-        // actually the primary (meaning the bar truly needs to move to the top).
         let top_bar_moves = desired_primary == "eDP-2";
 
         let body = if desired_secondary_enabled {
@@ -217,7 +210,6 @@ fn keyboard_notification_text(
         };
         ("Keyboard detached (Bluetooth)", body, "input-keyboard-virtual")
     } else {
-        // BT not yet connected (may still be reconnecting)
         let body = if desired_secondary_enabled {
             bullet_lines(&[
                 "Keyboard detached — Bluetooth not connected.",
@@ -290,8 +282,6 @@ pub async fn run(mut kb_rx: broadcast::Receiver<bool>) {
                 }
                 last_attached = Some(attached);
 
-                // When detaching, wait a few seconds for Bluetooth to reconnect
-                // before we read its state — BT reconnection takes 1-3 seconds.
                 if !attached {
                     tokio::time::sleep(Duration::from_millis(2500)).await;
                 }
@@ -354,16 +344,171 @@ pub async fn run(mut kb_rx: broadcast::Receiver<bool>) {
 }
 
 // ── Battery & BT-disconnect monitor ──────────────────────────────────────────
+//
+// The Freedesktop notification spec has **no** per-notification RGB colour.
+// The levers we have: urgency (BYTE 0-2), icon name, and the `image-path` hint
+// (GNOME Shell shows `image-path` as a large icon beside the text with the
+// `app_icon` as a small badge).  We use `image-path` pointing at Adwaita
+// battery-level symbolic icons to give each tier a visually distinct image.
 
-/// Threshold levels we warn at (percentage values, descending).
-const WARN_LOW: u8 = 5;
-const WARN_MEDIUM: u8 = 15;
+const BATTERY_WARN_PCT_LOW: u8 = 20;
+const BATTERY_WARN_PCT_VERY_LOW: u8 = 10;
+const BATTERY_WARN_PCT_CRITICAL: u8 = 5;
+
+/// Poll BlueZ `Percentage` as a fallback when property-change signals are missed.
+const BATTERY_POLL_SECS: u64 = 60;
+
+/// Tracks which battery warnings have been shown during the current discharge.
+/// Lives in [`run_battery_monitor`] so it survives [`battery_monitor_inner`]
+/// restarts (BT reconnect, transient errors).  A flag is only cleared when the
+/// battery recovers **at or above** the corresponding threshold.
+#[derive(Clone, Default, Debug)]
+struct KeyboardBatteryWarn {
+    shown_below_20: bool,
+    shown_below_10: bool,
+    shown_below_5: bool,
+}
+
+impl KeyboardBatteryWarn {
+    fn clear_recovered(&mut self, pct: u8) {
+        if pct >= BATTERY_WARN_PCT_LOW {
+            self.shown_below_20 = false;
+        }
+        if pct >= BATTERY_WARN_PCT_VERY_LOW {
+            self.shown_below_10 = false;
+        }
+        if pct >= BATTERY_WARN_PCT_CRITICAL {
+            self.shown_below_5 = false;
+        }
+    }
+}
+
+/// Emit at most **one** battery toast per call, highest threshold first.
+/// The 20 % and 10 % tiers use the exact same `transient_hints()` as the
+/// working keyboard-attach/detach banners so GNOME renders them as popup toasts.
+async fn maybe_emit_battery_warning(
+    notif: &NotificationsProxy<'_>,
+    pct: u8,
+    w: &mut KeyboardBatteryWarn,
+) {
+    // Check most-critical first: showing "critical" implicitly covers the
+    // less-severe tiers, so we mark them all as shown.
+
+    // ── Below 5 % ── persistent tray entry, urgency critical, 120 s ──
+    if pct < BATTERY_WARN_PCT_CRITICAL && !w.shown_below_5 {
+        w.shown_below_5 = true;
+        w.shown_below_10 = true;
+        w.shown_below_20 = true;
+        let mut hints = persistent_urgency_hints(2);
+        hints.insert("image-path", Value::from("battery-level-0-symbolic"));
+        let _ = notif
+            .notify(
+                "zenbook-duo-daemon",
+                0,
+                "dialog-error",
+                "Keyboard battery critical!",
+                &format!(
+                    "Keyboard battery at <b>{pct}%</b>.\u{2028}\
+                     The keyboard could become unavailable at any moment \
+                     if not reattached to charge."
+                ),
+                vec![],
+                hints,
+                120_000,
+            )
+            .await;
+        return;
+    }
+
+    // ── Below 10 % ── transient banner, 120 s ──
+    if pct < BATTERY_WARN_PCT_VERY_LOW && !w.shown_below_10 {
+        w.shown_below_10 = true;
+        w.shown_below_20 = true;
+        let mut hints = transient_hints();
+        hints.insert("image-path", Value::from("battery-caution-symbolic"));
+        let _ = notif
+            .notify(
+                "zenbook-duo-daemon",
+                0,
+                "dialog-warning",
+                "Keyboard battery below 10%",
+                &format!(
+                    "Keyboard battery at <b>{pct}%</b>.\u{2028}\
+                     Attach the keyboard to USB to charge soon."
+                ),
+                vec![],
+                hints,
+                120_000,
+            )
+            .await;
+        return;
+    }
+
+    // ── Below 20 % ── transient banner, 30 s ──
+    if pct < BATTERY_WARN_PCT_LOW && !w.shown_below_20 {
+        w.shown_below_20 = true;
+        let mut hints = transient_hints();
+        hints.insert("image-path", Value::from("battery-level-20-symbolic"));
+        let _ = notif
+            .notify(
+                "zenbook-duo-daemon",
+                0,
+                "dialog-warning",
+                "Keyboard battery below 20%",
+                &format!(
+                    "Keyboard battery at <b>{pct}%</b>.\u{2028}\
+                     Consider attaching the keyboard to USB to charge."
+                ),
+                vec![],
+                hints,
+                30_000,
+            )
+            .await;
+    }
+}
+
+/// Process a battery percentage reading.
+/// Returns `true` when `pct` is unchanged and the caller can skip further work.
+async fn on_battery_pct_update(
+    notif: &NotificationsProxy<'_>,
+    pct: u8,
+    last_pct: &mut u8,
+    was_below_full: &mut bool,
+    w: &mut KeyboardBatteryWarn,
+) -> bool {
+    if pct == *last_pct {
+        return true;
+    }
+    *last_pct = pct;
+
+    w.clear_recovered(pct);
+    maybe_emit_battery_warning(notif, pct, w).await;
+
+    if pct < 100 {
+        *was_below_full = true;
+    }
+    if pct == 100 && *was_below_full {
+        *was_below_full = false;
+        let _ = notif
+            .notify(
+                "zenbook-duo-daemon",
+                0,
+                "battery-full-charged",
+                "Keyboard battery full",
+                "Keyboard battery is fully charged.\u{2028}\
+                 You can detach it from USB.",
+                vec![],
+                transient_hints(),
+                4_000,
+            )
+            .await;
+    }
+    false
+}
 
 /// Discover the BlueZ object path of the ASUS keyboard (the one with Battery1
 /// AND a Device1 whose name contains "ASUS" or "Keyboard").
-async fn find_keyboard_bluez_path(
-    conn: &Connection,
-) -> Option<String> {
+async fn find_keyboard_bluez_path(conn: &Connection) -> Option<String> {
     let manager = ObjectManagerProxy::builder(conn)
         .destination("org.bluez")
         .ok()?
@@ -379,7 +524,6 @@ async fn find_keyboard_bluez_path(
         if !ifaces.contains_key("org.bluez.Battery1") {
             continue;
         }
-        // Check device name contains a keyboard identifier
         let is_keyboard = ifaces
             .get("org.bluez.Device1")
             .and_then(|props| props.get("Name"))
@@ -397,27 +541,25 @@ async fn find_keyboard_bluez_path(
     None
 }
 
-/// Long-running task that monitors the Bluetooth keyboard battery level and
-/// sends transient notifications when level crosses thresholds.
-/// Also warns if the keyboard BT disconnects unexpectedly (battery dead / hard-off).
 pub async fn run_battery_monitor() {
+    let mut bw = KeyboardBatteryWarn::default();
     loop {
-        if let Err(e) = battery_monitor_inner().await {
+        if let Err(e) = battery_monitor_inner(&mut bw).await {
             warn!("Battery monitor: {e}, retrying in 15s");
         }
         tokio::time::sleep(Duration::from_secs(15)).await;
     }
 }
 
-async fn battery_monitor_inner() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn battery_monitor_inner(
+    bw: &mut KeyboardBatteryWarn,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let system_conn = Connection::system().await?;
     let session_conn = Connection::session().await?;
     let notif = NotificationsProxy::new(&session_conn).await?;
 
-    // Find root state proxy to check whether keyboard is USB-attached
     let root_proxy = RootStateProxy::new(&system_conn).await.ok();
 
-    // Locate the keyboard in BlueZ — retry until found (BT may not be connected yet)
     let device_path = loop {
         if let Some(p) = find_keyboard_bluez_path(&system_conn).await {
             break p;
@@ -425,29 +567,42 @@ async fn battery_monitor_inner() -> Result<(), Box<dyn std::error::Error + Send 
         tokio::time::sleep(Duration::from_secs(10)).await;
     };
 
-    // Subscribe to Battery1 property changes for this device
     let battery_proxy = BlueZBatteryProxy::builder(&system_conn)
         .destination("org.bluez")?
         .path(device_path.as_str())?
         .build()
         .await?;
 
-    // Subscribe to Device1 property changes to detect disconnect
     let device_proxy = BlueZDeviceProxy::builder(&system_conn)
         .destination("org.bluez")?
         .path(device_path.as_str())?
         .build()
         .await?;
 
-    // Read initial battery level
-    let initial_pct = battery_proxy.percentage().await.unwrap_or(100);
+    // If the initial read fails, skip the initial evaluation entirely rather
+    // than assuming 100 % (which would wrongly clear all warning flags).
+    let mut last_pct: u8;
+    let mut was_below_full: bool;
+    match battery_proxy.percentage().await {
+        Ok(pct) => {
+            last_pct = pct;
+            was_below_full = pct < 100;
+            bw.clear_recovered(pct);
+            maybe_emit_battery_warning(&notif, pct, bw).await;
+        }
+        Err(_) => {
+            last_pct = 0;
+            was_below_full = false;
+        }
+    }
 
-    let mut last_pct = initial_pct;
-    let mut warned_low = initial_pct <= WARN_LOW;
-    let mut warned_medium = initial_pct <= WARN_MEDIUM;
-    let mut was_below_full = initial_pct < 100;
     let mut battery_stream = battery_proxy.receive_percentage_changed().await;
     let mut connected_stream = device_proxy.receive_connected_changed().await;
+    let mut pct_poll = interval_at(
+        Instant::now() + Duration::from_secs(BATTERY_POLL_SECS),
+        Duration::from_secs(BATTERY_POLL_SECS),
+    );
+    pct_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
@@ -456,93 +611,14 @@ async fn battery_monitor_inner() -> Result<(), Box<dyn std::error::Error + Send 
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-
-                if pct == last_pct {
+                if on_battery_pct_update(&notif, pct, &mut last_pct, &mut was_below_full, bw).await {
                     continue;
                 }
-                last_pct = pct;
+            }
 
-                // Rising: reset warning flags when battery climbs back up
-                if pct > WARN_MEDIUM + 5 {
-                    warned_medium = false;
-                }
-                if pct > WARN_LOW + 5 {
-                    warned_low = false;
-                }
-                if pct < 100 {
-                    was_below_full = true;
-                }
-
-                // Falling: fire warnings at thresholds
-                if pct == 0 {
-                    // Dead — persistent critical, requires user action
-                    let _ = notif
-                        .notify(
-                            "zenbook-duo-daemon",
-                            0,
-                            "battery-empty",
-                            "Keyboard battery dead",
-                            "• Keyboard battery is at <b>0%</b>.\u{2028}• Attach keyboard to USB immediately to recharge.",
-                            vec![],
-                            persistent_urgency_hints(2), // critical + persistent
-                            0, // stays until dismissed
-                        )
-                        .await;
-                } else if pct <= WARN_LOW && !warned_low {
-                    warned_low = true;
-                    let body = bullet_lines(&[
-                        &format!("Keyboard battery at <b>{pct}%</b> — critically low."),
-                        "Attach keyboard to USB to charge.",
-                    ]);
-                    let _ = notif
-                        .notify(
-                            "zenbook-duo-daemon",
-                            0,
-                            "battery-caution",
-                            "Keyboard battery critical",
-                            &body,
-                            vec![],
-                            urgency_hints(2), // urgent, transient
-                            120_000, // 2 minutes
-                        )
-                        .await;
-                } else if pct <= WARN_MEDIUM && !warned_medium {
-                    warned_medium = true;
-                    let body = bullet_lines(&[
-                        &format!("Keyboard battery at <b>{pct}%</b> — getting low."),
-                        "Consider attaching keyboard to USB to charge.",
-                    ]);
-                    let _ = notif
-                        .notify(
-                            "zenbook-duo-daemon",
-                            0,
-                            "battery-low",
-                            "Keyboard battery low",
-                            &body,
-                            vec![],
-                            urgency_hints(1), // normal
-                            30_000, // 30 seconds
-                        )
-                        .await;
-                } else if pct == 100 && was_below_full {
-                    was_below_full = false;
-                    let body = bullet_lines(&[
-                        "Keyboard battery is fully charged.",
-                        "You can detach it from USB.",
-                    ]);
-                    let _ = notif
-                        .notify(
-                            "zenbook-duo-daemon",
-                            0,
-                            "battery-full-charged",
-                            "Keyboard battery full",
-                            &body,
-                            vec![],
-                            transient_hints(),
-                            4000,
-                        )
-                        .await;
-                }
+            _ = pct_poll.tick() => {
+                let pct = battery_proxy.percentage().await.unwrap_or(last_pct);
+                let _ = on_battery_pct_update(&notif, pct, &mut last_pct, &mut was_below_full, bw).await;
             }
 
             Some(change) = connected_stream.next() => {
@@ -552,12 +628,9 @@ async fn battery_monitor_inner() -> Result<(), Box<dyn std::error::Error + Send 
                 };
 
                 if connected {
-                    // BT reconnected: stop this inner loop so we re-subscribe
-                    // with a fresh state (avoids stale threshold flags).
                     return Ok(());
                 }
 
-                // BT disconnected — only warn if keyboard is also not USB-attached.
                 let usb_attached = root_proxy
                     .as_ref()
                     .and_then(|p| {
@@ -589,7 +662,6 @@ async fn battery_monitor_inner() -> Result<(), Box<dyn std::error::Error + Send 
                         .await;
                 }
 
-                // Device disconnected: break inner loop, outer will retry
                 return Err("keyboard BT disconnected".into());
             }
         }

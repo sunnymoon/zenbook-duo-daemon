@@ -187,6 +187,38 @@ impl RootStateInterface {
     }
 
     #[zbus(property)]
+    fn desired_display_attachment(&self) -> String {
+        crate::state::load_desired_display_mode().0
+    }
+
+    #[zbus(property)]
+    fn desired_display_layout(&self) -> String {
+        crate::state::load_desired_display_mode().1
+    }
+
+    async fn report_observed_display_mode(
+        &self,
+        attachment: String,
+        layout: String,
+        #[zbus(header)] header: Header<'_>,
+    ) -> fdo::Result<()> {
+        self.ensure_registered_sender(&header).await?;
+        if let Err(e) =
+            crate::state::validate_desired_display_mode_strings(&attachment, &layout)
+        {
+            return Err(fdo::Error::Failed(e));
+        }
+        crate::state::persist_desired_display_mode(&attachment, &layout);
+        info!(
+            "ROOT DBus: persisted observed display mode attachment={attachment} layout={layout}"
+        );
+        if let Err(e) = emit_desired_display_mode_changed().await {
+            warn!("report_observed_display_mode: failed to emit property change: {e}");
+        }
+        Ok(())
+    }
+
+    #[zbus(property)]
     fn display_brightness(&self) -> u32 {
         self.state_manager.get_display_brightness_value().unwrap_or(0)
     }
@@ -451,6 +483,7 @@ trait RootState {
     fn acknowledge_keyboard_attached(&self, value: bool) -> zbus::Result<()>;
     fn acknowledge_desired_secondary_applied(&self, value: bool) -> zbus::Result<()>;
     fn report_ambient_light_enabled(&self, value: bool) -> zbus::Result<()>;
+    fn report_observed_display_mode(&self, attachment: String, layout: String) -> zbus::Result<()>;
     fn register_display_apply_attempt(&self) -> zbus::Result<bool>;
     fn resume_display_applies(&self) -> zbus::Result<()>;
     fn toggle_mic_mute_led(&self) -> zbus::Result<()>;
@@ -474,6 +507,12 @@ trait RootState {
 
     #[zbus(property)]
     fn ambient_light_enabled(&self) -> zbus::Result<bool>;
+
+    #[zbus(property)]
+    fn desired_display_attachment(&self) -> zbus::Result<String>;
+
+    #[zbus(property)]
+    fn desired_display_layout(&self) -> zbus::Result<String>;
 
     #[zbus(property)]
     fn display_brightness(&self) -> zbus::Result<u32>;
@@ -515,6 +554,30 @@ async fn emit_bluetooth_connected_changed() -> Result<bool, Box<dyn std::error::
         .get()
         .await
         .bluetooth_connected_changed(iface_ref.signal_emitter())
+        .await?;
+
+    Ok(handle.registered.load(Ordering::SeqCst))
+}
+
+async fn emit_desired_display_mode_changed() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(handle) = get_root_handle().await else {
+        return Ok(false);
+    };
+
+    let iface_ref = handle
+        .connection
+        .object_server()
+        .interface::<_, RootStateInterface>(ROOT_DBUS_PATH)
+        .await?;
+    iface_ref
+        .get()
+        .await
+        .desired_display_attachment_changed(iface_ref.signal_emitter())
+        .await?;
+    iface_ref
+        .get()
+        .await
+        .desired_display_layout_changed(iface_ref.signal_emitter())
         .await?;
 
     Ok(handle.registered.load(Ordering::SeqCst))
@@ -863,11 +926,127 @@ pub async fn register_display_apply_attempt() -> Result<DisplayApplyPermit, Stri
     }
 }
 
+/// Read persisted desired display attachment/layout from the root daemon (same bus registration as
+/// [`register_display_apply_attempt`]).
+pub async fn read_persisted_display_mode_from_root() -> Result<(String, String), String> {
+    let (connection, _) = {
+        let guard = session_registered_system_bus_cell().lock().await;
+        guard
+            .as_ref()
+            .map(|(c, sid)| (c.clone(), *sid))
+            .ok_or_else(|| {
+                "session system bus not registered yet (is the session daemon running and connected to root?)"
+                    .to_string()
+            })?
+    };
+
+    let proxy = RootStateProxy::new(&connection)
+        .await
+        .map_err(|e| format!("root state proxy for persisted display mode: {e}"))?;
+    let attachment = proxy
+        .desired_display_attachment()
+        .await
+        .map_err(|e| format!("desired_display_attachment: {e}"))?;
+    let layout = proxy
+        .desired_display_layout()
+        .await
+        .map_err(|e| format!("desired_display_layout: {e}"))?;
+    Ok((attachment, layout))
+}
+
+/// Push compositor-observed attachment/layout into root persistence (validates on root side).
+pub async fn report_observed_display_mode_from_session(
+    attachment: String,
+    layout: String,
+) -> Result<(), String> {
+    let (connection, _) = {
+        let guard = session_registered_system_bus_cell().lock().await;
+        guard
+            .as_ref()
+            .map(|(c, sid)| (c.clone(), *sid))
+            .ok_or_else(|| {
+                "session system bus not registered yet (is the session daemon running and connected to root?)"
+                    .to_string()
+            })?
+    };
+
+    let proxy = RootStateProxy::new(&connection)
+        .await
+        .map_err(|e| format!("root state proxy for report_observed_display_mode: {e}"))?;
+    proxy
+        .report_observed_display_mode(attachment, layout)
+        .await
+        .map_err(|e| format!("report_observed_display_mode: {e}"))?;
+    Ok(())
+}
+
 pub async fn resume_display_applies() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let connection = Connection::system().await?;
     let proxy = RootStateProxy::new(&connection).await?;
     proxy.resume_display_applies().await?;
     Ok(())
+}
+
+fn push_root_state_property<T: std::fmt::Display>(
+    rows: &mut Vec<(String, String)>,
+    key: &'static str,
+    res: zbus::Result<T>,
+) {
+    match res {
+        Ok(v) => rows.push((key.to_string(), v.to_string())),
+        Err(e) => rows.push((key.to_string(), format!("(error: {e})"))),
+    }
+}
+
+/// Read all [`RootState`] D-Bus properties for the CLI (`zenbook-duo-daemon state`).
+///
+/// Uses the same [`RootStateProxy`] as operator commands. If some properties show `(error: …
+/// UnknownProperty…)`, the **running** root daemon is older than this binary — restart the root
+/// service after installing a build that exports those members.
+pub async fn query_root_state_for_cli() -> Result<Vec<(String, String)>, String> {
+    let connection = Connection::system()
+        .await
+        .map_err(|e| format!("cannot connect to system D-Bus: {e}"))?;
+    let proxy = RootStateProxy::new(&connection)
+        .await
+        .map_err(|e| format!("cannot attach to {}: {e}", ROOT_DBUS_SERVICE))?;
+
+    let mut rows = Vec::new();
+    push_root_state_property(&mut rows, "keyboard_attached", proxy.keyboard_attached().await);
+    push_root_state_property(
+        &mut rows,
+        "bluetooth_connected",
+        proxy.bluetooth_connected().await,
+    );
+    push_root_state_property(&mut rows, "desired_primary", proxy.desired_primary().await);
+    push_root_state_property(
+        &mut rows,
+        "desired_secondary_enabled",
+        proxy.desired_secondary_enabled().await,
+    );
+    push_root_state_property(
+        &mut rows,
+        "ambient_light_enabled",
+        proxy.ambient_light_enabled().await,
+    );
+    push_root_state_property(
+        &mut rows,
+        "desired_display_attachment",
+        proxy.desired_display_attachment().await,
+    );
+    push_root_state_property(
+        &mut rows,
+        "desired_display_layout",
+        proxy.desired_display_layout().await,
+    );
+    push_root_state_property(&mut rows, "display_brightness", proxy.display_brightness().await);
+    push_root_state_property(
+        &mut rows,
+        "display_apply_paused",
+        proxy.display_apply_paused().await,
+    );
+
+    Ok(rows)
 }
 
 pub async fn run_operator_command(cmd: OperatorCommand) -> Result<(), String> {

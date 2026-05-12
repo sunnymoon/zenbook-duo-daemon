@@ -1,5 +1,6 @@
 mod ambient;
 pub(crate) mod display;
+mod display_mode;
 mod notifications;
 mod orientation;
 // mod osk; // OSK support not yet implemented, kept for future use

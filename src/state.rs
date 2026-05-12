@@ -15,6 +15,10 @@ struct PersistedDisplayState {
     desired_secondary_enabled: Option<bool>,
     display_brightness: Option<u32>,
     ambient_light_enabled: Option<bool>,
+    /// `builtin_only` | `external_only` | `all_connected` (see `plan.md` §8).
+    desired_display_attachment: Option<String>,
+    /// `mirror` | `joined`
+    desired_display_layout: Option<String>,
 }
 
 /// Serializes all display-state JSON read/modify/write so concurrent tasks cannot clobber fields.
@@ -112,6 +116,35 @@ fn persist_ambient_light_enabled(enabled: bool) {
 fn load_display_snapshot() -> PersistedDisplayState {
     let _guard = display_state_lock().lock().unwrap();
     read_display_state_file_inner()
+}
+
+pub fn load_desired_display_mode() -> (String, String) {
+    let snap = load_display_snapshot();
+    (
+        snap.desired_display_attachment
+            .unwrap_or_else(|| "builtin_only".to_string()),
+        snap.desired_display_layout
+            .unwrap_or_else(|| "joined".to_string()),
+    )
+}
+
+pub fn persist_desired_display_mode(attachment: &str, layout: &str) {
+    with_display_state(|state| {
+        state.desired_display_attachment = Some(attachment.to_string());
+        state.desired_display_layout = Some(layout.to_string());
+    });
+}
+
+pub fn validate_desired_display_mode_strings(attachment: &str, layout: &str) -> Result<(), String> {
+    match attachment {
+        "builtin_only" | "external_only" | "all_connected" => {}
+        other => return Err(format!("invalid desired_display_attachment: {other}")),
+    }
+    match layout {
+        "mirror" | "joined" => {}
+        other => return Err(format!("invalid desired_display_layout: {other}")),
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]

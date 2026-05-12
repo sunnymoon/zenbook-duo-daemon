@@ -38,6 +38,11 @@ enum Args {
     },
     /// Resume display applies after root-side safety guard paused them (root only on bus)
     ResumeDisplayApplies,
+    /// Print root daemon state from system D-Bus (`asus.zenbook.duo.State` properties).
+    ///
+    /// Uses the same property names as the running service. If a field shows `(error: UnknownProperty)`,
+    /// restart `zenbook-duo-daemon.service` after installing a binary that exports that property.
+    State,
     /// Operator command (D-Bus to running root daemon; requires `zenbook-duo` group or root)
     Control {
         #[command(subcommand)]
@@ -124,6 +129,24 @@ async fn main() {
                 Ok(()) => info!("Display apply guard resumed"),
                 Err(e) => {
                     error!("Failed to resume display applies: {e}");
+                    process::exit(1);
+                }
+            }
+        }
+        Args::State => {
+            match dbus_state::query_root_state_for_cli().await {
+                Ok(rows) => {
+                    let width = rows
+                        .iter()
+                        .map(|(k, _)| k.len())
+                        .max()
+                        .unwrap_or(0);
+                    for (k, v) in rows {
+                        println!("{k:width$}  {v}", width = width);
+                    }
+                }
+                Err(e) => {
+                    error!("{e}");
                     process::exit(1);
                 }
             }
