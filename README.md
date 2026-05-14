@@ -28,9 +28,9 @@ The project currently installs multiple components:
   - exposes authoritative state on the system D-Bus (including operator commands formerly sent via a FIFO)
   - subscribes to **logind** `PrepareForSleep` for suspend/resume (no separate sleep-hook units)
   - manages keyboard backlight, mic-mute LED, and secondary-display sysfs fallback
-  - rate-limits display configuration applies from the session (blast-radius); if applies are paused after a burst, run `sudo zenbook-duo-daemon resume-display-applies`
+  - rate-limits display configuration applies from the session (blast-radius); if applies are paused after a burst, run `zenbook-duo-daemon resume-display-applies` from your **GNOME graphical session** (or `sudo zenbook-duo-daemon resume-display-applies` as root); both are authorized via **Polkit** when policy is installed
 - **Session daemon** (`zenbook-duo-session.service`)
-  - runs inside the graphical user session
+  - runs inside the **GNOME** graphical user session (systemd user unit; `ExecCondition` requires `XDG_CURRENT_DESKTOP` to contain `GNOME`)
   - applies display/orientation changes through GNOME/Mutter
   - monitors GNOME ambient light setting
   - acknowledges root requests over D-Bus
@@ -139,13 +139,13 @@ sudo ./install local-install target/release/zenbook-duo-daemon
 ### Install from the latest release
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/PegasisForever/zenbook-duo-daemon/refs/heads/master/install | sudo bash -s install
+curl -fsSL https://raw.githubusercontent.com/sunnymoon/zenbook-duo-daemon/refs/heads/master/install | sudo bash -s install
 ```
 
 ### Uninstall
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/PegasisForever/zenbook-duo-daemon/refs/heads/master/install | sudo bash -s uninstall
+curl -fsSL https://raw.githubusercontent.com/sunnymoon/zenbook-duo-daemon/refs/heads/master/install | sudo bash -s uninstall
 ```
 
 ### Useful status commands
@@ -160,7 +160,7 @@ systemctl --user status zenbook-duo-session.service
 - Compare Mutter’s view with what you expect: `gdctl show` (same API family the session daemon uses).
 - Session logs: `journalctl --user -u zenbook-duo-session.service --since "15 min ago"`.
 - Pre-apply “current vs desired” layout diffs are logged at **debug**; set `RUST_LOG=debug` on `zenbook-duo-session.service` (e.g. `systemctl --user edit zenbook-duo-session.service`) when chasing ordering or verification issues.
-- If the root daemon has **paused** further display applies after too many attempts in a short window: `sudo zenbook-duo-daemon resume-display-applies`, then investigate the burst in journals before it happens again.
+- If the root daemon has **paused** further display applies after too many attempts in a short window: run `zenbook-duo-daemon resume-display-applies` from the **active GNOME session** (or `sudo …` as root), then investigate the burst in journals before it happens again.
 
 ## What the install script does
 
@@ -169,27 +169,33 @@ The install script currently:
 1. installs the daemon binary into `/opt/zenbook-duo-daemon`
 2. installs the root and user session systemd units
 3. installs the D-Bus policy file into `/etc/dbus-1/system.d/zenbook-duo-daemon-dbus.conf`
-4. ensures the **`zenbook-duo`** system group exists and adds active `loginctl` users plus the user who ran **`sudo ./install`** (`SUDO_USER`) when present
-5. removes any **legacy** control FIFO (`/tmp/zenbook-duo-daemon.pipe`) and pre/post-sleep units from older installs
-6. reloads D-Bus if possible
-7. merges the Zenbook libinput quirks into `/etc/libinput/local-overrides.quirks`
-8. runs config migration if needed
-9. enables the root service and the user session service
-10. restarts the session service for active logged-in users when possible
+4. installs the Polkit actions file into `/usr/share/polkit-1/actions/org.zenbook.duo.policy` (`install` downloads it from `GITHUB_RAW_BASE` in `install`, i.e. this repo’s default `master` raw tree; `local-install` copies `org.zenbook.duo.policy` from the directory that contains `install`)
+5. reloads **polkit** when possible so new actions register immediately
+6. removes any **legacy** control FIFO (`/tmp/zenbook-duo-daemon.pipe`) and pre/post-sleep units from older installs
+7. on **uninstall**, removes the legacy **`zenbook-duo`** system group if it still exists (older installs only)
+8. reloads D-Bus if possible
+9. merges the Zenbook libinput quirks into `/etc/libinput/local-overrides.quirks`
+10. runs config migration if needed
+11. enables the root service and **globally** enables the user session service (`systemctl --global enable zenbook-duo-session`) so every user gets the unit; it only **starts** under GNOME because of `ExecCondition` in the unit
+12. restarts the session service for active logged-in users when possible
 
-### D-Bus policy note
+### D-Bus and Polkit
 
-The D-Bus policy is installed as its **own file**:
+**D-Bus** (`/etc/dbus-1/system.d/zenbook-duo-daemon-dbus.conf`) allows normal clients to connect to `asus.zenbook.duo` on the system bus. **Authorization is enforced in the daemon** with **Polkit** (`org.freedesktop.PolicyKit1.Authority.CheckAuthorization`) using a **unix-process** subject (caller PID + start time from `/proc`).
 
-- `/etc/dbus-1/system.d/zenbook-duo-daemon-dbus.conf`
+Installed actions (see `org.zenbook.duo.policy` in this repository):
 
-It is **copied into place**, not XML-merged into another file. That is the correct model for D-Bus policy deployment here.
+| Action id | Used for |
+|-----------|-----------|
+| `org.zenbook.duo.register-session` | Session daemon registering with the root service |
+| `org.zenbook.duo.operator` | Hardware operator D-Bus methods and the `control` CLI |
+| `org.zenbook.duo.resume-display-applies` | Clearing the display-apply safety guard |
 
-Only **`root`** (the daemon) and members of the **`zenbook-duo`** group may send to or receive from this service on the system bus (`install` creates the group, adds active `loginctl` users, and adds **`SUDO_USER`** when you run `sudo ./install`, but **a logout/login is required** so the session picks up the new group). Unprivileged callers without that membership will get access errors instead of being able to replace the registered session connection.
+Defaults for all three: **`allow_any` no**, **`allow_inactive` no**, **`allow_active` yes** — i.e. **only processes in an active local session** (and **root**, via the distribution’s default Polkit rules) are implicitly allowed without a password prompt.
 
-`register_session` additionally rejects callers whose D-Bus credentials report a **UID below 1000** (system accounts). Operator-style methods reject UIDs **1–999** (non-root system accounts). `resume_display_applies` accepts **root UID only** (intended for `sudo zenbook-duo-daemon resume-display-applies`).
+You need **polkit** installed and running. If `CheckAuthorization` fails at runtime, verify the policy file is present and reload polkit (`systemctl reload polkit` or reboot).
 
-Tighter models (Polkit rules per method, seat/session matching for registration, or splitting state by user) are possible follow-ups if multi-user shared machines need stronger isolation than “members of `zenbook-duo` trust each other on this host.”
+Site-specific tightening (e.g. restrict to a group, require `auth_self`, or per-seat rules) can be done with files under `/etc/polkit-1/rules.d/` without changing the daemon binary.
 
 ## Configuration
 
@@ -207,7 +213,7 @@ You can configure:
 
 ## Operator CLI (D-Bus)
 
-The **root** daemon must be running. Commands call **D-Bus** on `asus.zenbook.duo`; you must be in **`zenbook-duo`** or **root** (same as the bus policy). See `zenbook-duo-daemon --help` and `control --help`.
+The **root** daemon must be running. Commands call **D-Bus** on `asus.zenbook.duo`. The calling process must pass **Polkit** for `org.zenbook.duo.operator` (typically: **active local graphical session** or **root**). See `zenbook-duo-daemon --help` and `control --help`.
 
 Examples:
 
@@ -218,6 +224,7 @@ zenbook-duo-daemon control keyboard-backlight-toggle
 zenbook-duo-daemon control keyboard-backlight-set medium
 zenbook-duo-daemon control secondary-display-toggle
 zenbook-duo-daemon control secondary-display false
+zenbook-duo-daemon resume-display-applies
 sudo zenbook-duo-daemon resume-display-applies
 ```
 
@@ -246,4 +253,8 @@ cargo build
 sudo ./install local-install target/debug/zenbook-duo-daemon
 ```
 
-After install, ensure your user is in the **`zenbook-duo`** group (the script adds active loginctl users) and **log out and back in** so the session daemon can access the system D‑Bus service. See **D-Bus policy note** above.
+After install, log in to a **GNOME** session on the machine: `zenbook-duo-session` is enabled globally and starts when `XDG_CURRENT_DESKTOP` contains `GNOME`. The session registers with the root daemon; **Polkit** grants `org.zenbook.duo.register-session` for active local sessions. **No `zenbook-duo` Unix group** is required anymore.
+
+**Migrating from older installs** that used the `zenbook-duo` group: `sudo ./install uninstall` attempts `groupdel zenbook-duo`. If that fails because users are still members, remove them explicitly, for example `sudo gpasswd -d yourlogin zenbook-duo`, then remove the empty group if needed.
+
+If you maintain a **different GitHub fork**, edit `GITHUB_REPO` and `GITHUB_RAW_BASE` at the top of `install` so `install` (curl) and the Polkit policy download match your repository.

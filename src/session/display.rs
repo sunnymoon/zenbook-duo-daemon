@@ -396,7 +396,7 @@ impl std::fmt::Display for DisplayApplyError {
         match self {
             DisplayApplyError::GuardPaused => write!(
                 f,
-                "root display apply guard is paused — run sudo zenbook-duo-daemon resume-display-applies"
+                "root display apply guard is paused — run zenbook-duo-daemon resume-display-applies (GNOME session) or sudo zenbook-duo-daemon resume-display-applies"
             ),
             DisplayApplyError::GuardCheck(s) => write!(f, "display apply guard unreachable: {s}"),
             DisplayApplyError::Apply(s) => write!(f, "{s}"),
@@ -1260,18 +1260,18 @@ fn ensure_display_recovery_task(
                         "Display recovery: converged successfully on attempt {}/{} after {}",
                         attempt, MAX_ATTEMPTS, reason
                     );
+                    super::notifications::reset_display_recovery_notif_chain().await;
                     return;
                 }
                 Err(e) if e.is_guard_block() => {
                     warn!("Display recovery: aborting — {e}");
-                    if let Err(notify_err) = super::notifications::send_notification(
-                        "Display applies blocked",
-                        "The root display guard paused changes or could not be reached, so recovery stopped. If applies were paused due to repeated failures, run: sudo zenbook-duo-daemon resume-display-applies",
-                        "dialog-warning",
-                        0,
-                        2,
-                    )
-                    .await
+                    if let Err(notify_err) =
+                        super::notifications::send_display_recovery_persistent_critical_chained(
+                            "Display applies blocked",
+                            "The root display guard paused changes or could not be reached, so recovery stopped. If applies were paused due to repeated failures, run: zenbook-duo-daemon resume-display-applies (from GNOME session) or sudo zenbook-duo-daemon resume-display-applies",
+                            "dialog-warning",
+                        )
+                        .await
                     {
                         warn!("Display recovery: failed to send notification: {notify_err}");
                     }
@@ -1286,14 +1286,15 @@ fn ensure_display_recovery_task(
                         let body = format!(
                             "Display recovery attempt {attempt}/{MAX_ATTEMPTS} did not converge yet. Retrying automatically."
                         );
-                        if let Err(notify_err) = super::notifications::send_transient_notification(
-                            "Display recovery retrying",
-                            &body,
-                            "dialog-warning",
-                            DISPLAY_RECOVERY_RETRY_TOAST_EXPIRE_MS,
-                            1,
-                        )
-                        .await
+                        if let Err(notify_err) =
+                            super::notifications::send_display_recovery_transient_chained(
+                                "Display recovery retrying",
+                                &body,
+                                "dialog-warning",
+                                DISPLAY_RECOVERY_RETRY_TOAST_EXPIRE_MS,
+                                1,
+                            )
+                            .await
                         {
                             warn!("Display recovery: failed to send transient retry warning: {notify_err}");
                         }
@@ -1309,12 +1310,10 @@ fn ensure_display_recovery_task(
             }
         }
 
-        if let Err(e) = super::notifications::send_notification(
+        if let Err(e) = super::notifications::send_display_recovery_persistent_critical_chained(
             "Display Recovery Failed",
             "Zenbook Duo daemon could not restore the desired display layout after repeated retries.",
             "dialog-error",
-            0, // persistent — stays until dismissed
-            2, // urgency: critical
         )
         .await
         {

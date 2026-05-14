@@ -12,6 +12,7 @@ use zbus::{MatchRule, MessageStream, connection, proxy, Connection};
 
 use crate::config::Config;
 use crate::idle_detection::ActivityNotifier;
+use crate::polkit;
 use crate::state::{KeyboardBacklightState, KeyboardStateManager};
 
 pub const ROOT_DBUS_SERVICE: &str = "asus.zenbook.duo";
@@ -73,6 +74,19 @@ async fn get_root_handle() -> Option<RootDbusHandle> {
     dbus_handle_cell().lock().await.clone()
 }
 
+async fn dbus_caller_pid(connection: &Connection, sender: &str) -> fdo::Result<u32> {
+    let dbus_proxy = DBusProxy::new(connection)
+        .await
+        .map_err(|e| fdo::Error::Failed(format!("failed to query D-Bus for caller PID: {e}")))?;
+    let bus_name = zbus::names::BusName::try_from(sender)
+        .map_err(|e| fdo::Error::Failed(format!("invalid sender bus name: {e}")))?;
+    let pid = dbus_proxy
+        .get_connection_unix_process_id(bus_name)
+        .await
+        .map_err(|e| fdo::Error::Failed(format!("failed to get caller PID: {e}")))?;
+    Ok(pid)
+}
+
 struct RootStateInterface {
     state_manager: KeyboardStateManager,
     registration: Arc<RwLock<Option<RegisteredSession>>>,
@@ -117,7 +131,7 @@ impl RootStateInterface {
         }
     }
 
-    /// Operators (CLI / scripts): root UID or normal user (UID ≥ 1000). System accounts in between are rejected.
+    /// Operators (CLI / scripts): Polkit action [`polkit::ACTION_OPERATOR`] (active local session or root per system rules).
     async fn require_operator(
         &self,
         header: &Header<'_>,
@@ -126,22 +140,8 @@ impl RootStateInterface {
         let Some(sender) = header.sender() else {
             return Err(fdo::Error::AccessDenied("missing D-Bus sender".into()));
         };
-        let dbus_proxy = DBusProxy::new(connection)
-            .await
-            .map_err(|e| fdo::Error::Failed(format!("failed to query D-Bus for caller UID: {e}")))?;
-        let bus_name = zbus::names::BusName::try_from(sender.as_str())
-            .map_err(|e| fdo::Error::Failed(format!("invalid sender bus name: {e}")))?;
-        let uid = dbus_proxy
-            .get_connection_unix_user(bus_name)
-            .await
-            .map_err(|e| fdo::Error::Failed(format!("failed to get caller UID: {e}")))?;
-        if uid > 0 && uid < 1000 {
-            warn!("ROOT DBus: rejected operator command from system UID {uid}");
-            return Err(fdo::Error::AccessDenied(format!(
-                "UID {uid} is not permitted to run operator commands"
-            )));
-        }
-        Ok(())
+        let pid = dbus_caller_pid(connection, sender.as_str()).await?;
+        polkit::check_authorization(connection, pid, polkit::ACTION_OPERATOR).await
     }
 }
 
@@ -240,22 +240,8 @@ impl RootStateInterface {
             ));
         };
 
-        // Verify the caller is a real user (UID >= 1000), not a system service.
-        let dbus_proxy = DBusProxy::new(connection)
-            .await
-            .map_err(|e| fdo::Error::Failed(format!("failed to query D-Bus for caller UID: {e}")))?;
-        let bus_name = zbus::names::BusName::try_from(sender.as_str())
-            .map_err(|e| fdo::Error::Failed(format!("invalid sender bus name: {e}")))?;
-        let uid = dbus_proxy
-            .get_connection_unix_user(bus_name)
-            .await
-            .map_err(|e| fdo::Error::Failed(format!("failed to get caller UID: {e}")))?;
-        if uid < 1000 {
-            warn!("ROOT DBus: rejected register_session from UID {uid} (not a session user)");
-            return Err(fdo::Error::AccessDenied(
-                format!("UID {uid} is not permitted to register a session"),
-            ));
-        }
+        let pid = dbus_caller_pid(connection, sender.as_str()).await?;
+        polkit::check_authorization(connection, pid, polkit::ACTION_REGISTER_SESSION).await?;
 
         if self.state_manager.is_secondary_display_enabled() {
             crate::secondary_display::arm_sysfs_fallback_once();
@@ -370,25 +356,13 @@ impl RootStateInterface {
             return Err(fdo::Error::AccessDenied("missing D-Bus sender".into()));
         };
 
-        let dbus_proxy = DBusProxy::new(connection)
-            .await
-            .map_err(|e| fdo::Error::Failed(format!("failed to query D-Bus for caller UID: {e}")))?;
-        let bus_name = zbus::names::BusName::try_from(sender.as_str())
-            .map_err(|e| fdo::Error::Failed(format!("invalid sender bus name: {e}")))?;
-        let uid = dbus_proxy
-            .get_connection_unix_user(bus_name)
-            .await
-            .map_err(|e| fdo::Error::Failed(format!("failed to get caller UID: {e}")))?;
-        if uid != 0 {
-            return Err(fdo::Error::AccessDenied(
-                "only root can resume display applies".into(),
-            ));
-        }
+        let pid = dbus_caller_pid(connection, sender.as_str()).await?;
+        polkit::check_authorization(connection, pid, polkit::ACTION_RESUME_DISPLAY_APPLIES).await?;
 
         let mut guard = self.apply_guard.lock().await;
         guard.attempts = 0;
         guard.paused = false;
-        info!("ROOT DBus: display apply guard resumed by root command");
+        info!("ROOT DBus: display apply guard resumed (Polkit-authorized caller, pid {pid})");
         Ok(())
     }
 

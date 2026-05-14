@@ -36,14 +36,14 @@ enum Args {
         #[arg(short, long)]
         config_path: Option<PathBuf>,
     },
-    /// Resume display applies after root-side safety guard paused them (root only on bus)
+    /// Resume display applies after root-side safety guard paused them (Polkit: active local session or root).
     ResumeDisplayApplies,
     /// Print root daemon state from system D-Bus (`asus.zenbook.duo.State` properties).
     ///
     /// Uses the same property names as the running service. If a field shows `(error: UnknownProperty)`,
     /// restart `zenbook-duo-daemon.service` after installing a binary that exports that property.
     State,
-    /// Operator command (D-Bus to running root daemon; requires `zenbook-duo` group or root)
+    /// Operator command (D-Bus to running root daemon; Polkit must allow `org.zenbook.duo.operator` for the caller process).
     Control {
         #[command(subcommand)]
         cmd: ControlCmd,
@@ -97,6 +97,7 @@ enum ControlCmd {
 
 mod config;
 mod dbus_state;
+mod polkit;
  mod events;
 mod idle_detection;
 mod keyboard_bt;

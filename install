@@ -11,10 +11,13 @@ DBUS_POLICY_NAME="zenbook-duo-daemon-dbus.conf"
 DBUS_POLICY_FILE="/etc/dbus-1/system.d/${DBUS_POLICY_NAME}"
 INSTALL_DIR="/opt/zenbook-duo-daemon"
 BINARY_PATH="${INSTALL_DIR}/zenbook-duo-daemon"
-GITHUB_REPO="https://github.com/PegasisForever/zenbook-duo-daemon/releases/latest/download"
+GITHUB_REPO="https://github.com/sunnymoon/zenbook-duo-daemon/releases/latest/download"
+GITHUB_RAW_BASE="https://raw.githubusercontent.com/sunnymoon/zenbook-duo-daemon/refs/heads/master"
 QUIRKS_FILE="/etc/libinput/local-overrides.quirks"
 QUIRKS_ASSET_NAME="local-overrides.quirks"
-DAEMON_GROUP="zenbook-duo"
+POLKIT_POLICY_NAME="org.zenbook.duo.policy"
+POLKIT_POLICY_DEST="/usr/share/polkit-1/actions/${POLKIT_POLICY_NAME}"
+LEGACY_DAEMON_GROUP="zenbook-duo"
 SESSION_SYSTEMD_DIR="$(dirname "${SESSION_SERVICE_FILE}")"
 
 ensure_session_systemd_user_dir() {
@@ -45,37 +48,54 @@ cleanup_legacy_pipe_and_sleep_hooks() {
     done
 }
 
-ensure_daemon_group() {
-    if ! getent group "${DAEMON_GROUP}" > /dev/null 2>&1; then
-        echo "Creating group ${DAEMON_GROUP}..."
-        groupadd --system "${DAEMON_GROUP}"
+reload_polkit() {
+    if systemctl reload polkit.service 2>/dev/null; then
+        return 0
     fi
+    if systemctl try-reload-or-restart polkit.service 2>/dev/null; then
+        return 0
+    fi
+    p="$(pidof polkitd 2>/dev/null || true)"
+    if [ -n "${p}" ]; then
+        for x in ${p}; do
+            kill -HUP "${x}" 2>/dev/null && return 0
+        done
+    fi
+    echo "Warning: Could not reload polkit; new policy may apply after reboot" >&2
+}
 
-    # Add every active loginctl user to the group if not already a member
-    while read -r uid user _; do
-        if [ -n "${user}" ] && ! id -nG "${user}" 2>/dev/null | grep -qw "${DAEMON_GROUP}"; then
-            echo "Adding ${user} to group ${DAEMON_GROUP}..."
-            usermod -aG "${DAEMON_GROUP}" "${user}"
-            echo "Note: ${user} must log out and back in (or reboot) for the group change to take effect."
-        fi
-    done < <(loginctl list-users --no-legend 2>/dev/null || true)
+install_polkit_policy_from_url() {
+    mkdir -p "$(dirname "${POLKIT_POLICY_DEST}")"
+    echo "Downloading Polkit policy from ${GITHUB_RAW_BASE}/${POLKIT_POLICY_NAME}..."
+    if ! curl -fSL -o "${POLKIT_POLICY_DEST}" "${GITHUB_RAW_BASE}/${POLKIT_POLICY_NAME}"; then
+        echo "Error: Failed to download Polkit policy" >&2
+        exit 1
+    fi
+    chmod 644 "${POLKIT_POLICY_DEST}"
+    reload_polkit || true
+}
 
-    # User who ran `sudo ./install ...` is not always listed by loginctl the way we expect; ensure they get the group for D-Bus.
-    if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
-        if id -u "${SUDO_USER}" >/dev/null 2>&1; then
-            if ! id -nG "${SUDO_USER}" 2>/dev/null | grep -qw "${DAEMON_GROUP}"; then
-                echo "Adding ${SUDO_USER} (user who invoked sudo) to group ${DAEMON_GROUP}..."
-                usermod -aG "${DAEMON_GROUP}" "${SUDO_USER}"
-                echo "Note: ${SUDO_USER} must log out and back in (or reboot) for the group change to take effect."
-            fi
-        fi
+install_polkit_policy_from_path() {
+    local src="$1"
+    mkdir -p "$(dirname "${POLKIT_POLICY_DEST}")"
+    echo "Installing Polkit policy to ${POLKIT_POLICY_DEST}..."
+    cp "${src}" "${POLKIT_POLICY_DEST}"
+    chmod 644 "${POLKIT_POLICY_DEST}"
+    reload_polkit || true
+}
+
+remove_polkit_policy() {
+    if [ -f "${POLKIT_POLICY_DEST}" ]; then
+        echo "Removing Polkit policy ${POLKIT_POLICY_DEST}..."
+        rm -f "${POLKIT_POLICY_DEST}"
+        reload_polkit || true
     fi
 }
 
-remove_daemon_group() {
-    if getent group "${DAEMON_GROUP}" > /dev/null 2>&1; then
-        echo "Removing group ${DAEMON_GROUP}..."
-        groupdel "${DAEMON_GROUP}" 2>/dev/null || true
+remove_legacy_daemon_group_if_present() {
+    if getent group "${LEGACY_DAEMON_GROUP}" > /dev/null 2>&1; then
+        echo "Removing legacy system group ${LEGACY_DAEMON_GROUP} (replaced by Polkit; may fail if users are still members)..."
+        groupdel "${LEGACY_DAEMON_GROUP}" 2>/dev/null || true
     fi
 }
 
@@ -320,6 +340,8 @@ uninstall() {
         rm -f "${DBUS_POLICY_FILE}"
         reload_system_dbus || true
     fi
+
+    remove_polkit_policy
     
     systemctl daemon-reload
     for_each_active_user restart_session_service_for_user
@@ -330,7 +352,7 @@ uninstall() {
         rm -rf "${INSTALL_DIR}"
     fi
 
-    remove_daemon_group
+    remove_legacy_daemon_group_if_present
     
     echo "Uninstallation complete."
 }
@@ -347,9 +369,6 @@ install() {
     # Create installation directory
     echo "Creating installation directory..."
     mkdir -p "${INSTALL_DIR}"
-    
-    # Ensure group exists and active users are members
-    ensure_daemon_group
     
     # Download binary
     echo "Downloading binary from ${GITHUB_REPO}/zenbook-duo-daemon..."
@@ -404,6 +423,8 @@ install() {
         exit 1
     fi
     reload_system_dbus || true
+
+    install_polkit_policy_from_url
     
     # Run migrate-config command
     echo "Running config migration..."
@@ -445,6 +466,7 @@ local_install() {
     local service_file_path="${SCRIPT_DIR}/zenbook-duo-daemon.service"
     local session_service_file_path="${SCRIPT_DIR}/zenbook-duo-session.service"
     local dbus_policy_file_path="${SCRIPT_DIR}/${DBUS_POLICY_NAME}"
+    local polkit_policy_file_path="${SCRIPT_DIR}/${POLKIT_POLICY_NAME}"
     local quirks_file_path="${SCRIPT_DIR}/${QUIRKS_ASSET_NAME}"
     
     if [ ! -f "${binary_path}" ]; then
@@ -467,6 +489,11 @@ local_install() {
         exit 1
     fi
 
+    if [ ! -f "${polkit_policy_file_path}" ]; then
+        echo "Error: Polkit policy file not found: ${polkit_policy_file_path}" >&2
+        exit 1
+    fi
+
     if [ ! -f "${quirks_file_path}" ]; then
         echo "Error: Quirk file not found: ${quirks_file_path}" >&2
         exit 1
@@ -481,9 +508,6 @@ local_install() {
     # Create installation directory
     echo "Creating installation directory..."
     mkdir -p "${INSTALL_DIR}"
-    
-    # Ensure group exists and active users are members
-    ensure_daemon_group
     
     # Copy binary
     echo "Copying binary from ${binary_path}..."
@@ -502,6 +526,8 @@ local_install() {
     echo "Copying D-Bus policy file from ${dbus_policy_file_path}..."
     cp "${dbus_policy_file_path}" "${DBUS_POLICY_FILE}"
     reload_system_dbus || true
+
+    install_polkit_policy_from_path "${polkit_policy_file_path}"
     
     # Run migrate-config command
     echo "Running config migration..."
@@ -544,7 +570,7 @@ case "${1:-}" in
         echo "Usage: $0 {uninstall|install|local-install <binary-path>}" >&2
         echo "" >&2
         echo "Commands:" >&2
-        echo "  uninstall          Remove service files and delete /opt/zenbook-duo-daemon" >&2
+        echo "  uninstall          Remove services, D-Bus policy, Polkit policy, and /opt/zenbook-duo-daemon" >&2
         echo "  install            Download and install from GitHub releases" >&2
         echo "  local-install      Install using local binary and service files" >&2
         exit 1

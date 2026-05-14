@@ -1,20 +1,17 @@
 [Unit]
 Description=Zenbook Duo Session Daemon
-# XDG_CURRENT_DESKTOP is set for real graphical login sessions (GNOME, KDE, …)
-# but not for root's synthetic user slice. Using it as a condition prevents the
-# service from starting in non-desktop contexts even when globally enabled.
-ConditionEnvironment=XDG_CURRENT_DESKTOP
+# GNOME sets XDG_CURRENT_DESKTOP to values such as "GNOME" or "ubuntu:GNOME".
 After=graphical-session.target gnome-session-initialized.target
 PartOf=graphical-session.target
 
 [Service]
+Type=simple
+# Only start under a GNOME graphical session (physical login uses graphical-session.target).
+ExecCondition=/bin/sh -c 'case "${XDG_CURRENT_DESKTOP:-}" in *GNOME*) exit 0;; *) exit 1;; esac'
 ExecStart=/opt/zenbook-duo-daemon/zenbook-duo-daemon session
 Restart=on-failure
 RestartSec=3
 Environment=RUST_LOG=info
-
-[Install]
-WantedBy=graphical-session.target
 
 [Install]
 WantedBy=graphical-session.target
