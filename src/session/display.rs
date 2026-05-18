@@ -492,7 +492,7 @@ async fn apply_desired_display_state(
     apply_allow_fallback: bool,
 ) -> Result<bool, DisplayApplyError> {
     for pass in 0u32..2 {
-        let (attachment, layout) = if pass == 0 {
+        let (raw_attachment, layout) = if pass == 0 {
             (desired_attachment, desired_layout)
         } else {
             (
@@ -525,6 +525,20 @@ async fn apply_desired_display_state(
             .map_err(|e| DisplayApplyError::Apply(e.to_string()))?;
         let mut all_modes = extract_all_modes(&physical);
         let (mut current_config, mut current_corrupted) = read_current_config(&logical);
+
+        let externals_with_modes =
+            super::display_mode::external_connectors_ordered(&physical, &all_modes);
+        let attachment =
+            if raw_attachment == super::display_mode::ATTACH_ALL_CONNECTED
+                && externals_with_modes.is_empty()
+            {
+                info!(
+                    "Display: persisted all_connected but no external connectors with modes — applying as builtin_only"
+                );
+                super::display_mode::ATTACH_BUILTIN_ONLY
+            } else {
+                raw_attachment
+            };
 
         let edp2_physically_available = all_modes.contains_key("eDP-2");
         let edp2_should_be_enabled =
@@ -618,16 +632,6 @@ async fn apply_desired_display_state(
             } else if attachment == super::display_mode::ATTACH_ALL_CONNECTED
                 && layout == super::display_mode::LAYOUT_MIRROR
             {
-                let ext_name = super::display_mode::first_external_connector(&physical).ok_or_else(
-                    || {
-                        DisplayApplyError::Apply(
-                            "all_connected+mirror requires an external output".into(),
-                        )
-                    },
-                )?;
-                let ext_mode = all_modes.get(&ext_name).ok_or_else(|| {
-                    DisplayApplyError::Apply(format!("No mode for external {ext_name}"))
-                })?;
                 let mut mons = vec![(
                     "eDP-1".to_string(),
                     edp1_mode.0.clone(),
@@ -638,22 +642,17 @@ async fn apply_desired_display_state(
                         mons.push(("eDP-2".to_string(), em.0.clone(), HashMap::new()));
                     }
                 }
-                mons.push((ext_name.clone(), ext_mode.0.clone(), HashMap::new()));
+                for ext_name in &externals_with_modes {
+                    let ext_mode = all_modes.get(ext_name).ok_or_else(|| {
+                        DisplayApplyError::Apply(format!("No mode for external {ext_name}"))
+                    })?;
+                    mons.push((ext_name.clone(), ext_mode.0.clone(), HashMap::new()));
+                }
                 let mons = order_mirror_mons_primary_last(mons, &desired_primary_effective);
                 vec![(0, 0, edp1_scale, desired_transform, true, mons)]
             } else if attachment == super::display_mode::ATTACH_ALL_CONNECTED
                 && layout == super::display_mode::LAYOUT_JOINED
             {
-                let ext_name = super::display_mode::first_external_connector(&physical).ok_or_else(
-                    || {
-                        DisplayApplyError::Apply(
-                            "all_connected+joined requires an external output".into(),
-                        )
-                    },
-                )?;
-                let ext_mode = all_modes.get(&ext_name).ok_or_else(|| {
-                    DisplayApplyError::Apply(format!("No mode for external {ext_name}"))
-                })?;
                 let mut duo_lms = if let Some(ref edp2_mode) = edp2_mode_if_duo {
                     let (primary_mode, secondary_connector, secondary_mode) =
                         if desired_primary_effective == "eDP-1" {
@@ -682,22 +681,34 @@ async fn apply_desired_display_state(
                     .find(|lm| lm.5.iter().any(|(c, _, _)| c == "eDP-1"))
                     .map(|lm| (lm.0, lm.1))
                     .unwrap_or((0, 0));
-                let ext_scale = read_scale_for_connector(&logical, &ext_name).unwrap_or(edp1_scale);
-                let ext_x = e1x
+                let mut cursor_x = e1x
                     + super::display_mode::edp_logical_extent_x(
                         edp1_mode.1,
                         edp1_mode.2,
                         edp1_scale,
                         desired_transform,
                     );
-                duo_lms.push((
-                    ext_x,
-                    e1y,
-                    ext_scale,
-                    0u32,
-                    false,
-                    vec![(ext_name.clone(), ext_mode.0.clone(), HashMap::new())],
-                ));
+                for ext_name in &externals_with_modes {
+                    let ext_mode = all_modes.get(ext_name).ok_or_else(|| {
+                        DisplayApplyError::Apply(format!("No mode for external {ext_name}"))
+                    })?;
+                    let ext_scale =
+                        read_scale_for_connector(&logical, ext_name).unwrap_or(edp1_scale);
+                    duo_lms.push((
+                        cursor_x,
+                        e1y,
+                        ext_scale,
+                        0u32,
+                        false,
+                        vec![(ext_name.clone(), ext_mode.0.clone(), HashMap::new())],
+                    ));
+                    cursor_x += super::display_mode::edp_logical_extent_x(
+                        ext_mode.1,
+                        ext_mode.2,
+                        ext_scale,
+                        0u32,
+                    );
+                }
                 duo_lms.sort_by_key(|lm| !lm.4);
                 duo_lms
             } else if let Some(ref edp2_mode) = edp2_mode_if_duo {

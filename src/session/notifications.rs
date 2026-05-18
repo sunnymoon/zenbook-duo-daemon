@@ -553,7 +553,7 @@ pub async fn run(mut kb_rx: broadcast::Receiver<bool>) {
 // ── Battery & BT-disconnect monitor ──────────────────────────────────────────
 //
 // GNOME Shell often ignores client `expire_timeout` for banner dwell time; urgency `critical`
-// (byte 2) makes low-battery notifications sticky. See `plan.md` §9.
+// (byte 2) makes low-battery notifications sticky. See `docs/notes-gnome-shell-notifications.md`.
 
 const BATTERY_WARN_PCT_LOW: u8 = 20;
 const BATTERY_WARN_PCT_VERY_LOW: u8 = 10;

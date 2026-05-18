@@ -56,7 +56,7 @@ The project currently installs multiple components:
 
 - ⚠️ The project currently targets **GNOME** as the supported desktop environment for session-side display behavior
 - ⚠️ Display recovery/startup edge cases are improved but still an active area of refinement
-- ⚠️ **External monitors** are out of scope: layout and verification logic focus on **eDP-1** and **eDP-2**. Adding HDMI/DP/etc. may result in those outputs being omitted from an `ApplyMonitorsConfig` rebuild or in verification failing until the external is disconnected.
+- ⚠️ **External monitors** are only partially supported. The session daemon always reasons about **eDP-1** and **eDP-2** first. If persistence still says **`all_connected`** but **no** external has a resolved mode in Mutter’s physical list, **`apply_desired_display_state`** applies **`builtin_only`** for that pass (unplug race). When at least one external mode exists under **`all_connected`**, **`apply_desired_display_state`** (`src/session/display.rs`) rebuilds **mirror** and **joined** using **every** such connector in stable physical-list order (`external_connectors_ordered` in `display_mode.rs`). **`external_only`** reapplies external logical monitors from the current state. **`builtin_only`** paths (and the **automatic fallback** after a failed apply) build **internal-only** payloads, so attached externals can disappear from the layout until you change mode in **Settings** or reconnect. **Joined** places a horizontal strip of externals to the **right** of the eDP-1 block, in order; **mirror** puts all outputs in one mirrored logical monitor (KMS may still reject mixed modes).
 - ⚠️ The daemon only remaps the **Zenbook-specific special keys** that require vendor handling; standard keys that already arrive as normal evdev keys are not remapped by the daemon
 
 ## Dual display / Mutter apply ordering (important for Duo internals)
@@ -223,6 +223,14 @@ Defaults for all three: **`allow_any` no**, **`allow_inactive` no**, **`allow_ac
 You need **polkit** installed and running. If `CheckAuthorization` fails at runtime, verify the policy file is present and reload polkit (`systemctl reload polkit` or reboot).
 
 Site-specific tightening (e.g. restrict to a group, require `auth_self`, or per-seat rules) can be done with files under `/etc/polkit-1/rules.d/` without changing the daemon binary.
+
+### Polkit details (how authorization works)
+
+The policy file **`org.zenbook.duo.policy`** in this repository defines three **Polkit actions** (installed to `/usr/share/polkit-1/actions/org.zenbook.duo.policy`). Each action’s `<defaults>` are **`allow_any` no**, **`allow_inactive` no**, **`allow_active` yes**: only processes in an **active local session** (as logind sees it) get implicit allow; **root** is still covered by normal distribution Polkit rules.
+
+When a client calls a privileged D-Bus method, the root daemon (`src/dbus_state.rs`) calls Polkit’s **`org.freedesktop.PolicyKit1.Authority.CheckAuthorization`** (`src/polkit.rs`) with a **`unix-process`** subject: the caller’s **PID** (from the D-Bus message sender) plus **`start-time`** read from **`/proc/<pid>/stat`**. That binds the authorization check to the **specific running process**, not merely a username string.
+
+If **`CheckAuthorization`** fails (policy missing, **polkitd** not running, or rules deny the caller), the method returns **AccessDenied** / **Failed** and the client should check **`journalctl -u polkit`** / install logs. After editing rules under **`/etc/polkit-1/rules.d/`**, reload Polkit (`systemctl reload polkit` or reboot).
 
 ## Configuration
 
