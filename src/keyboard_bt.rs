@@ -1,3 +1,34 @@
+//! Bluetooth keyboard support for the ASUS Zenbook Duo.
+//!
+//! # Why multiple `/dev/input/event*` tasks for one physical keyboard?
+//!
+//! For Bluetooth, the kernel exposes several `/dev/input/event*` character devices for what is
+//! logically **one** ASUS Zenbook Duo Keyboard. The stable identity per node is sysfs
+//! `device/uniq` (BlueZ-style MAC); see [`mac_from_evdev_sysfs`].
+//!
+//! **Normal typing** (letters, digits, standard modifiers) is delivered as usual `EV_KEY` events on
+//! whichever node the input stack attached as the main keyboard stream.
+//!
+//! **ASUS vendor hotkeys** (Fn+F4 keyboard backlight, Fn+F5/F6 panel brightness, Fn+F8 swap
+//! primaries, Fn+F9 mic mute, Fn+F11 emoji, Fn+F12 MyASUS, the key right of F12 for the bottom
+//! display, etc.) are surfaced as `EV_ABS` / `ABS_MISC` with vendor-specific values—the same
+//! encoding idea as the USB HID vendor path in `keyboard_usb`.
+//!
+//! **Kernel behaviour that forces our design:** those `ABS_MISC` events may be routed through one
+//! of several sibling `event*` nodes—or both in quick succession—depending on connect timing, BlueZ
+//! churn, and internal routing. Listening only to the first discovered node was observed in the
+//! field as an intermittent **dead Fn row** (the hotkey never arrived on the fd we chose). We
+//! therefore register **one blocking read loop per qualifying path** (each must advertise
+//! `ABS_MISC`), not to duplicate normal key handling, but because the stack uses **parallel fds**
+//! as delivery channels for the same physical keyboard.
+//!
+//! **How we keep this bounded:** `BtVendorHotkeyReaders` groups paths by MAC and records whether
+//! GATT restore already ran; `suppress_twin_abs_misc_pulse` drops identical non-zero `ABS_MISC`
+//! values within ~40 ms; `bt_hid_gatt_write_lock` serializes BlueZ GATT writes; on `ENODEV` from
+//! `next_event` we remove this path from the map (see `start_bt_keyboard_task`). Collapsing to a
+//! single reader without new evidence would risk missing vendor keys after reconnect—treat as
+//! intentional design, not a smell.
+
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -28,15 +59,20 @@ use crate::{
     virtual_keyboard::VirtualKeyboard,
 };
 
-/// ASUS Zenbook BT exposes two `ABS_MISC` evdev nodes per MAC; both may need a reader. GATT
-/// restore (`restore_bt_hid_vendor_state_after_connect`) must run once per connect session.
+/// Per Bluetooth MAC (`uniq`): which `event*` paths currently have an `ABS_MISC` reader, and
+/// whether we already ran the one-shot GATT/HID vendor restore for this connect session.
+///
+/// **Why a set of paths:** ASUS can expose **multiple** sibling evdev nodes for the same keyboard;
+/// vendor hotkeys may arrive on any subset. We must open each `ABS_MISC` node, but run GATT restore
+/// only once per session (`hid_restore_done`).
 #[derive(Default)]
 struct BtVendorHotkeyReaders {
     paths: HashSet<PathBuf>,
     hid_restore_done: bool,
 }
 
-/// Suppress identical non-zero `ABS_MISC` values from both nodes within a short window.
+/// When both sibling nodes emit the **same** non-zero `ABS_MISC` value for one physical press,
+/// treat the second arrival within this window as duplicate and ignore it (see module docs).
 static LAST_BT_VENDOR_MISC: StdMutex<Option<(i32, Instant)>> = StdMutex::new(None);
 
 fn suppress_twin_abs_misc_pulse(value: i32) -> bool {
@@ -260,6 +296,9 @@ pub fn start_bt_keyboard_monitor_task(
     state_manager: KeyboardStateManager,
     activity_notifier: ActivityNotifier,
 ) {
+    // Scans existing `/dev/input/event*` nodes, then watches for new ones. Each candidate path is
+    // handed to `try_start_bt_keyboard_task`, which may spawn **one reader per ABS_MISC sibling**
+    // for the same Bluetooth MAC (see module-level docs).
     let config_clone = config.clone();
     let virtual_keyboard_clone = virtual_keyboard.clone();
     let state_manager_clone = state_manager.clone();
@@ -364,12 +403,9 @@ async fn try_start_bt_keyboard_task(
         return;
     }
 
-    // `uniq` is stable (`fd:…` → BlueZ `dev_FD_…`); we track multiple ABS_MISC evdev nodes per MAC.
-
-    // ASUS exposes several evdev nodes per BT MAC. Normal keys are routed by the kernel on
-    // one node; brightness / swap / mic / Fn+F11… hotkeys arrive as `EV_ABS / ABS_MISC` on
-    // one or both sibling nodes open simultaneously — skipping the second reader can leave Fn
-    // dead depending on which node the kernel picked for this attach.
+    // `uniq` is stable (`fd:…` → BlueZ `dev_FD_…`). See crate-level `keyboard_bt` docs: we may keep
+    // **several** `event*` paths open per MAC because `ABS_MISC` vendor hotkeys can land on any
+    // sibling node; skipping nodes without `ABS_MISC` is correct (not a vendor channel).
     if !pre_input.has(EventCode::EV_ABS(EV_ABS::ABS_MISC)) {
         debug!(
             "Skipping ASUS BT evdev {} (no ABS_MISC — not vendor hotkey channel)",
@@ -484,6 +520,10 @@ fn start_bt_keyboard_task(
     activity_notifier.notify();
 
     // GATT: one restore + one event-driven writer per MAC connect session (first ABS_MISC path wins).
+    // Sibling paths set `run_hid_restore = false` and drop their `event_receiver`; they only read
+    // `ABS_MISC`. Dropping `shutdown_tx` on disconnect: `None` here means this path did not own
+    // the GATT task—no-op. `Some(sender)` drops the oneshot sender so the **owning** path's GATT
+    // loop observes the channel close and exits cleanly.
     let shutdown_tx = if run_hid_restore {
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 

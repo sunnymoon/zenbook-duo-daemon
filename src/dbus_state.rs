@@ -188,12 +188,12 @@ impl RootStateInterface {
 
     #[zbus(property)]
     fn desired_display_attachment(&self) -> String {
-        crate::state::load_desired_display_mode().0
+        self.state_manager.get_desired_display_mode().0
     }
 
     #[zbus(property)]
     fn desired_display_layout(&self) -> String {
-        crate::state::load_desired_display_mode().1
+        self.state_manager.get_desired_display_mode().1
     }
 
     async fn report_observed_display_mode(
@@ -208,7 +208,9 @@ impl RootStateInterface {
         {
             return Err(fdo::Error::Failed(e));
         }
-        crate::state::persist_desired_display_mode(&attachment, &layout);
+        self.state_manager
+            .persist_desired_display_mode(&attachment, &layout)
+            .await;
         info!(
             "ROOT DBus: persisted observed display mode attachment={attachment} layout={layout}"
         );
@@ -302,6 +304,23 @@ impl RootStateInterface {
         Ok(())
     }
 
+    /// Session calls this after a **successful** debounced display reconcile when Mutter's layout
+    /// has no logical output on eDP-2 (secondary logically off). Root writes sysfs `off` when
+    /// `desired_secondary_enabled` is false, or when it is still true but the USB keyboard is
+    /// docked (clamshell power save until undock).
+    async fn acknowledge_secondary_sysfs_poweroff_ready(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+    ) -> fdo::Result<()> {
+        self.ensure_registered_sender(&header).await?;
+        info!(
+            "ROOT [secondary sysfs] Moment B (session-stable D-Bus ack): registered session called acknowledge_secondary_sysfs_poweroff_ready — applying session-stable sysfs policy (see next lines for write / no-op)"
+        );
+        crate::secondary_display::apply_secondary_sysfs_poweroff_when_desired_off(&self.state_manager)
+            .await;
+        Ok(())
+    }
+
     async fn report_ambient_light_enabled(
         &self,
         value: bool,
@@ -310,7 +329,7 @@ impl RootStateInterface {
         self.ensure_registered_sender(&header).await?;
         if self.state_manager.get_ambient_light_enabled() != value {
             info!("ROOT DBus: ambient light setting updated to {}", value);
-            self.state_manager.set_ambient_light_enabled(value);
+            self.state_manager.set_ambient_light_enabled(value).await;
         }
         Ok(())
     }
@@ -393,7 +412,7 @@ impl RootStateInterface {
         #[zbus(connection)] connection: &Connection,
     ) -> fdo::Result<()> {
         self.require_operator(&header, connection).await?;
-        self.state_manager.toggle_keyboard_backlight();
+        self.state_manager.toggle_keyboard_backlight().await;
         Ok(())
     }
 
@@ -415,7 +434,7 @@ impl RootStateInterface {
                 )));
             }
         };
-        self.state_manager.set_keyboard_backlight(state);
+        self.state_manager.set_keyboard_backlight(state).await;
         Ok(())
     }
 
@@ -425,10 +444,7 @@ impl RootStateInterface {
         #[zbus(connection)] connection: &Connection,
     ) -> fdo::Result<()> {
         self.require_operator(&header, connection).await?;
-        self.state_manager.toggle_secondary_display();
-        if let Err(e) = emit_desired_secondary_changed().await {
-            warn!("toggle_secondary_display: failed to notify session D-Bus: {e}");
-        }
+        crate::secondary_coordinator::coordinate_secondary_display_toggle(&self.state_manager).await;
         Ok(())
     }
 
@@ -439,10 +455,8 @@ impl RootStateInterface {
         #[zbus(connection)] connection: &Connection,
     ) -> fdo::Result<()> {
         self.require_operator(&header, connection).await?;
-        self.state_manager.set_secondary_display(enabled);
-        if let Err(e) = emit_desired_secondary_changed().await {
-            warn!("set_secondary_display_desired: failed to notify session D-Bus: {e}");
-        }
+        crate::secondary_coordinator::coordinate_secondary_display_to_state(&self.state_manager, enabled)
+            .await;
         Ok(())
     }
 }
@@ -456,6 +470,7 @@ trait RootState {
     fn register_session(&self, session_id: u64) -> zbus::Result<()>;
     fn acknowledge_keyboard_attached(&self, value: bool) -> zbus::Result<()>;
     fn acknowledge_desired_secondary_applied(&self, value: bool) -> zbus::Result<()>;
+    fn acknowledge_secondary_sysfs_poweroff_ready(&self) -> zbus::Result<()>;
     fn report_ambient_light_enabled(&self, value: bool) -> zbus::Result<()>;
     fn report_observed_display_mode(&self, attachment: String, layout: String) -> zbus::Result<()>;
     fn register_display_apply_attempt(&self) -> zbus::Result<bool>;
@@ -823,6 +838,30 @@ pub async fn notify_desired_primary_changed(
 pub async fn notify_desired_secondary_changed(
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     emit_desired_secondary_changed().await
+}
+
+/// Tell the root daemon that Mutter's layout is stable with no logical output on eDP-2 (session
+/// must be registered on the system bus connection used for display applies). Root may sysfs-off
+/// when `desired_secondary_enabled` is false, or when it remains true but the USB keyboard is
+/// docked (clamshell power save).
+pub async fn notify_secondary_sysfs_poweroff_ready() -> Result<(), String> {
+    let connection = {
+        let guard = session_registered_system_bus_cell().lock().await;
+        guard
+            .as_ref()
+            .map(|(c, _)| c.clone())
+            .ok_or_else(|| {
+                "session system bus not registered (cannot reach root for secondary sysfs poweroff ready)"
+                    .to_string()
+            })?
+    };
+    let proxy = RootStateProxy::new(&connection)
+        .await
+        .map_err(|e| format!("root state proxy: {e}"))?;
+    proxy
+        .acknowledge_secondary_sysfs_poweroff_ready()
+        .await
+        .map_err(|e| format!("acknowledge_secondary_sysfs_poweroff_ready: {e}"))
 }
 
 pub async fn notify_display_brightness_changed(

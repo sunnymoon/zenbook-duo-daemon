@@ -11,6 +11,8 @@ DBUS_POLICY_NAME="zenbook-duo-daemon-dbus.conf"
 DBUS_POLICY_FILE="/etc/dbus-1/system.d/${DBUS_POLICY_NAME}"
 INSTALL_DIR="/opt/zenbook-duo-daemon"
 BINARY_PATH="${INSTALL_DIR}/zenbook-duo-daemon"
+# Optional `PATH` convenience: always a symlink to the canonical binary under /opt.
+CLI_SYMLINK_PATH="/usr/local/bin/zenbook-duo-daemon"
 GITHUB_REPO="https://github.com/sunnymoon/zenbook-duo-daemon/releases/latest/download"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/sunnymoon/zenbook-duo-daemon/refs/heads/master"
 QUIRKS_FILE="/etc/libinput/local-overrides.quirks"
@@ -223,6 +225,25 @@ check_root() {
     fi
 }
 
+install_cli_symlink() {
+    mkdir -p "$(dirname "${CLI_SYMLINK_PATH}")"
+    echo "Linking ${CLI_SYMLINK_PATH} -> ${BINARY_PATH}..."
+    ln -sfn "${BINARY_PATH}" "${CLI_SYMLINK_PATH}"
+}
+
+remove_cli_symlink_if_ours() {
+    if [ ! -L "${CLI_SYMLINK_PATH}" ]; then
+        return 0
+    fi
+    local target expected
+    target=$(readlink -f "${CLI_SYMLINK_PATH}" 2>/dev/null || true)
+    expected=$(readlink -f "${BINARY_PATH}" 2>/dev/null || true)
+    if [ -n "${target}" ] && [ -n "${expected}" ] && [ "${target}" = "${expected}" ]; then
+        echo "Removing CLI symlink ${CLI_SYMLINK_PATH}..."
+        rm -f "${CLI_SYMLINK_PATH}"
+    fi
+}
+
 run_user_systemctl() {
     local uid="$1"
     local user="$2"
@@ -345,6 +366,8 @@ uninstall() {
     
     systemctl daemon-reload
     for_each_active_user restart_session_service_for_user
+
+    remove_cli_symlink_if_ours
     
     # Remove installation directory
     if [ -d "${INSTALL_DIR}" ]; then
@@ -382,6 +405,7 @@ install() {
         exit 1
     fi
     chmod +x "${BINARY_PATH}"
+    install_cli_symlink
     install_quirks_from_release
     
     # Download main service file
@@ -513,6 +537,7 @@ local_install() {
     echo "Copying binary from ${binary_path}..."
     cp "${binary_path}" "${BINARY_PATH}"
     chmod +x "${BINARY_PATH}"
+    install_cli_symlink
     install_quirks_from_local_source "${quirks_file_path}"
     
     # Copy service files
@@ -570,7 +595,7 @@ case "${1:-}" in
         echo "Usage: $0 {uninstall|install|local-install <binary-path>}" >&2
         echo "" >&2
         echo "Commands:" >&2
-        echo "  uninstall          Remove services, D-Bus policy, Polkit policy, and /opt/zenbook-duo-daemon" >&2
+        echo "  uninstall          Remove services, D-Bus policy, Polkit policy, CLI symlink, and /opt/zenbook-duo-daemon" >&2
         echo "  install            Download and install from GitHub releases" >&2
         echo "  local-install      Install using local binary and service files" >&2
         exit 1

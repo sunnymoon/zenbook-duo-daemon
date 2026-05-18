@@ -24,7 +24,7 @@ The project currently installs multiple components:
 
 - **Root daemon** (`zenbook-duo-daemon.service`)
   - handles USB keyboard access
-  - handles Bluetooth keyboard vendor GATT control
+  - handles Bluetooth keyboard vendor GATT control (see **ASUS Bluetooth keyboard: why multiple `/dev/input/event*` readers** below)
   - exposes authoritative state on the system D-Bus (including operator commands formerly sent via a FIFO)
   - subscribes to **logind** `PrepareForSleep` for suspend/resume (no separate sleep-hook units)
   - manages keyboard backlight, mic-mute LED, and secondary-display sysfs fallback
@@ -89,6 +89,33 @@ On Fedora 44 + **mutter 50.x**, logs on affected machines have shown:
 Those failures correlate with **too much changing in one atomic modeset**, which matches the bad “one swipe” `gdctl` behavior. The **two-phase** path is a **workaround** for compositor + kernel fragility; keep it unless upstream fixes and hardware re-testing prove a single apply is safe.
 
 **Do not remove or merge the two-phase path** without re-running manual **`gdctl`** experiments and checking `journalctl --user` during the transition.
+
+## ASUS Bluetooth keyboard: why multiple `/dev/input/event*` readers (not a code smell)
+
+On the Zenbook Duo, **one** physical Bluetooth keyboard still shows up as **several** `/dev/input/eventN` devices in `/dev/input/`. That is normal for this stack: the kernel (and ASUS firmware) split responsibilities across nodes.
+
+**What each kind of node does**
+
+- **Ordinary keys** (letters, numbers, modifiers for normal typing) are delivered as usual **key** events on the node the kernel chose for the “main” keyboard stream.
+- **ASUS vendor hotkeys** (Fn+F4 brightness cycle, Fn+F5/F6 display brightness, Fn+F8 swap primaries, Fn+F9 mic mute, Fn+F11 emoji, Fn+F12 MyASUS, the key right of F12 for the bottom panel, etc.) are **not** always injected as normal `EV_KEY` scancodes on that same node. They are exposed to userspace as **`EV_ABS` / `ABS_MISC`** with vendor-specific integer values (mirroring the USB HID vendor path; see `keyboard_usb` and `parse_keyboard_event` in `src/keyboard_bt.rs`).
+
+**Why the daemon opens more than one `event*` for the same MAC**
+
+The kernel may route those **`ABS_MISC`** events through **one** of several sibling `event*` nodes—or **both** in quick succession—depending on connect order, BlueZ churn, and internal routing. If we only listened to **one** node, field experience showed **intermittent “dead Fn row”** behaviour: the hotkey simply never reached the daemon because it arrived on the **other** sibling.
+
+So `zenbook-duo-daemon` deliberately:
+
+1. **Filters** to the ASUS Duo Bluetooth device name and requires **`ABS_MISC`** on the node (other nodes are ignored).
+2. **Groups** all qualifying paths by **`uniq`** (normalized MAC key) in `BtVendorHotkeyReaders`.
+3. Runs **GATT / vendor HID restore once per Bluetooth connect session** for that MAC (`hid_restore_done`), not once per evdev path.
+4. **Suppresses duplicate actions** when both siblings emit the **same** non-zero `ABS_MISC` value within a short window (`suppress_twin_abs_misc_pulse`).
+5. **Removes** each path from the map on **`ENODEV`** disconnect so the state machine matches reality.
+
+**Why this is not a “duplicate reader bug”**
+
+We are not reading the **same** key stream twice out of carelessness: we are reading **different evdev fds** that the kernel uses as **parallel delivery channels** for the **same physical keyboard**, and we coordinate them. Collapsing to a single reader without new kernel/firmware guarantees would **risk regressions** (vendor keys missing after reconnect).
+
+Implementation: `src/keyboard_bt.rs` (`start_bt_keyboard_monitor_task`, `try_start_bt_keyboard_task`, `start_bt_keyboard_task`).
 
 ## Keyboard function support
 
@@ -166,7 +193,7 @@ systemctl --user status zenbook-duo-session.service
 
 The install script currently:
 
-1. installs the daemon binary into `/opt/zenbook-duo-daemon`
+1. installs the daemon binary into `/opt/zenbook-duo-daemon` and updates **`/usr/local/bin/zenbook-duo-daemon`** as a **symlink** to that file (so a normal `PATH` matches the binary the root unit runs); on **uninstall**, removes that symlink only if it still resolves to the removed `/opt/...` binary
 2. installs the root and user session systemd units
 3. installs the D-Bus policy file into `/etc/dbus-1/system.d/zenbook-duo-daemon-dbus.conf`
 4. installs the Polkit actions file into `/usr/share/polkit-1/actions/org.zenbook.duo.policy` (`install` downloads it from `GITHUB_RAW_BASE` in `install`, i.e. this repo’s default `master` raw tree; `local-install` copies `org.zenbook.duo.policy` from the directory that contains `install`)

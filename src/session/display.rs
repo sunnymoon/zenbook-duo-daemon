@@ -78,6 +78,14 @@ pub(crate) fn logical_size(pw: i32, ph: i32, scale: f64, transform: u32) -> (i32
     if transform == 1 || transform == 3 { (lh, lw) } else { (lw, lh) }
 }
 
+/// True if any logical monitor in Mutter's current state drives connector `eDP-2`.
+fn logical_layout_includes_edp2(current: &CurrentState) -> bool {
+    current
+        .2
+        .iter()
+        .any(|lm| lm.5.iter().any(|connector_ref| connector_ref.0 == "eDP-2"))
+}
+
 fn extract_all_modes(physical: &[PhysicalMonitor]) -> HashMap<String, (String, i32, i32)> {
     let mut map = HashMap::new();
     for (info, modes, _) in physical {
@@ -1464,6 +1472,41 @@ pub async fn run(
                         } else {
                             delayed_reconciles_deepness = 0;
                             changed_apply_waiting_followup = false;
+                        }
+                        let notify_root_sysfs_poweroff_ready = {
+                            let sec_desired = *desired_secondary.read().await;
+                            if !sec_desired {
+                                true
+                            } else if keyboard_attached {
+                                match display.get_current_state().await {
+                                    Ok(st) => {
+                                        let has_edp2 = logical_layout_includes_edp2(&st);
+                                        if has_edp2 {
+                                            false
+                                        } else {
+                                            info!(
+                                                "Display: docked USB keyboard and Mutter layout omit eDP-2 — notifying root for sysfs secondary power save (desired_secondary still true)"
+                                            );
+                                            true
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Display: get_current_state failed for sysfs-ready decision: {e}"
+                                        );
+                                        false
+                                    }
+                                }
+                            } else {
+                                false
+                            }
+                        };
+                        if notify_root_sysfs_poweroff_ready {
+                            if let Err(e) =
+                                crate::dbus_state::notify_secondary_sysfs_poweroff_ready().await
+                            {
+                                warn!("Display: secondary sysfs poweroff ready notify failed: {e}");
+                            }
                         }
                         info!(
                             "Display reconcile completed in {:.2}ms",

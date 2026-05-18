@@ -50,7 +50,8 @@ pub enum KeyFunction {
 }
 
 impl KeyFunction {
-    /// Execute a key function - handles KeyBind, Command, KeyboardBacklight, and ToggleSecondaryDisplay
+    /// Execute a key function: `KeyBind`, `Command`, `KeyboardBacklight`, `ToggleSecondaryDisplay`,
+    /// [`SwapDisplays`](KeyFunction::SwapDisplays), and `NoOp`.
     pub async fn execute(
         &self,
         virtual_keyboard: &Arc<Mutex<crate::virtual_keyboard::VirtualKeyboard>>,
@@ -67,57 +68,11 @@ impl KeyFunction {
                 crate::execute_command(command);
             }
             KeyFunction::KeyboardBacklight(true) => {
-                state_manager.toggle_keyboard_backlight();
+                state_manager.toggle_keyboard_backlight().await;
             }
             KeyFunction::ToggleSecondaryDisplay(true) => {
-                crate::secondary_display::pause_brightness_sync_for(Duration::from_secs(4));
-                let new_state = !state_manager.is_secondary_display_desired_enabled();
-                info!("KeyFunction: executing ToggleSecondaryDisplay -> {}", new_state);
-                state_manager.set_secondary_display_tracked(new_state);
-
-                if new_state && state_manager.is_secondary_display_enabled() {
-                    crate::secondary_display::arm_sysfs_fallback_once();
-                    state_manager.emit_secondary_display_state();
-                    if crate::secondary_display::wait_for_secondary_display_state(true, Duration::from_secs(8)).await {
-                        info!("ToggleSecondaryDisplay: secondary display reported enabled via sysfs");
-                    } else {
-                        warn!("ToggleSecondaryDisplay: timed out waiting for secondary display to report enabled; notifying session anyway");
-                    }
-                }
-
-                let session_registered = match crate::dbus_state::notify_desired_secondary_changed().await {
-                    Ok(registered) => registered,
-                    Err(e) => {
-                        warn!("ToggleSecondaryDisplay: failed to publish desired secondary D-Bus update: {}", e);
-                        false
-                    }
-                };
-
-                if session_registered {
-                    let acked = crate::dbus_state::wait_for_desired_secondary_ack(
-                        new_state,
-                        Duration::from_secs(8),
-                    )
-                    .await;
-
-                    if acked {
-                        info!("ToggleSecondaryDisplay: session daemon applied desired secondary state");
-                        // When session ACKs the disable, root must NOT write sysfs off.
-                        // Session owns logical convergence; an extra root sysfs-off after the
-                        // ACK causes the visible off→on→off bounce (kernel re-enables the
-                        // panel in response to the logical remove, then root tears it down
-                        // again). The no-ACK fallback path below is the only case where root
-                        // takes direct sysfs action.
-                    } else {
-                        warn!("ToggleSecondaryDisplay: no session daemon ack, falling back to sysfs");
-                        crate::secondary_display::arm_sysfs_fallback_once();
-                        state_manager.emit_secondary_display_state();
-                    }
-                } else {
-                    warn!("ToggleSecondaryDisplay: no registered session daemon, falling back to sysfs");
-                    crate::secondary_display::arm_sysfs_fallback_once();
-                    state_manager.emit_secondary_display_state();
-                }
+                info!("KeyFunction: executing ToggleSecondaryDisplay");
+                crate::secondary_coordinator::coordinate_secondary_display_toggle(state_manager).await;
             }
             KeyFunction::SwapDisplays(true) => {
                 info!("KeyFunction: executing SwapDisplays");
@@ -132,15 +87,26 @@ impl KeyFunction {
                 };
                 
                 // Save the intended primary BEFORE attempting swap (independent of success)
-                state_manager.set_desired_primary(new_desired);
+                state_manager.set_desired_primary(new_desired).await;
                 info!("User intention: swap to {}", new_desired);
-                
-                // Desired primary is now persisted to state file.
-                // Publish the update over D-Bus so the session daemon reacts immediately.
-                if let Err(e) = crate::dbus_state::notify_desired_primary_changed().await {
-                    warn!("Failed to publish desired_primary update over D-Bus: {}", e);
-                } else {
-                    info!("Published desired_primary={} over D-Bus", new_desired);
+
+                // Root + persisted state are authoritative: nothing is "dropped" if no session is
+                // registered yet. `run_session_client` reads `desired_primary` from the root D-Bus
+                // property when the session daemon connects and follows property updates thereafter.
+                // `notify_desired_primary_changed` returns Ok(false) when no session has registered
+                // — we only emit the signal; Mutter apply happens once GNOME session is up.
+                match crate::dbus_state::notify_desired_primary_changed().await {
+                    Ok(true) => {
+                        info!("Published desired_primary={new_desired} over D-Bus (session registered)");
+                    }
+                    Ok(false) => {
+                        warn!(
+                            "SwapDisplays: persisted desired_primary={new_desired}; no session daemon registered yet — will apply when a GNOME session connects and registers"
+                        );
+                    }
+                    Err(e) => {
+                        warn!("Failed to publish desired_primary update over D-Bus: {e}");
+                    }
                 }
             }
             _ => {
@@ -244,6 +210,8 @@ impl Config {
 # KeyBind = [\"KEY_LEFTCTRL\", \"KEY_F10\"]     # Maps the physical key to left ctrl + f10, a list of all the keys can be found in https://docs.rs/evdev-rs/0.6.3/evdev_rs/enums/enum.EV_KEY.html
 # Command = \"echo 'Hello, world!'\"          # Runs a custom command as root when the physical key is pressed
 # KeyboardBacklight = true                  # Toggles the keyboard backlight
+# # Vendor-style toggles (`KeyboardBacklight`, `SwapDisplays`, `ToggleSecondaryDisplay`, `NoOp`):
+# #   use `= true` or `= false` in TOML (the bool is only so the table shape serializes cleanly).
 # SwapDisplays = true                       # Swap which internal panel is primary (eDP-1 <-> eDP-2); see README “Dual display / Mutter apply ordering”
 # ToggleSecondaryDisplay = true             # Toggles the secondary display
 # NoOp = true                               # Does nothing when the physical key is pressed

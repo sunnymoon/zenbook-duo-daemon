@@ -104,6 +104,7 @@ mod keyboard_bt;
 mod keyboard_usb;
 mod mute_state;
 mod secondary_display;
+mod secondary_coordinator;
 mod session;
 mod state;
 mod virtual_keyboard;
@@ -216,7 +217,7 @@ async fn run_daemon(config_path: PathBuf) {
 
     let (state_manager, activity_notifier, current_usb_keyboard) =
         if let Some(keyboard) = find_wired_keyboard(&config).await {
-            let state_manager = KeyboardStateManager::new(true, event_sender.clone());
+            let state_manager = KeyboardStateManager::new(true, event_sender.clone()).await;
             let activity_notifier = start_idle_detection_task(&config, state_manager.clone());
 
             let current_usb_keyboard = start_usb_keyboard_task(
@@ -230,7 +231,7 @@ async fn run_daemon(config_path: PathBuf) {
             .await;
             (state_manager, activity_notifier, Some(current_usb_keyboard))
         } else {
-            let state_manager = KeyboardStateManager::new(false, event_sender.clone());
+            let state_manager = KeyboardStateManager::new(false, event_sender.clone()).await;
             let activity_notifier = start_idle_detection_task(&config, state_manager.clone());
 
             (state_manager, activity_notifier, None)
