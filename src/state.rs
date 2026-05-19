@@ -335,6 +335,8 @@ impl KeyboardStateManager {
         state.is_usb_attached
     }
 
+    /// Increments the Bluetooth refcount used for D-Bus `bluetooth_connected`.
+    /// Call **once per logical BT keyboard session** (e.g. one MAC), not once per evdev sibling path.
     pub fn bluetooth_connection_started(&self) {
         let mut state = self.state.write().unwrap();
         let was_connected = state.bt_connected_count > 0;
@@ -352,6 +354,9 @@ impl KeyboardStateManager {
         }
     }
 
+    /// Decrements the Bluetooth refcount. Safe to reason about as **idempotent for over-stops**:
+    /// extra `saturating_sub` calls when the count is already `0` do not wrap and do not re-emit
+    /// D-Bus transitions.
     pub fn bluetooth_connection_stopped(&self) {
         let mut state = self.state.write().unwrap();
         let was_connected = state.bt_connected_count > 0;

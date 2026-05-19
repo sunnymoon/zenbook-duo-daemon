@@ -23,7 +23,10 @@
 //! as delivery channels for the same physical keyboard.
 //!
 //! **How we keep this bounded:** `BtVendorHotkeyReaders` groups paths by MAC and records whether
-//! GATT restore already ran; `suppress_twin_abs_misc_pulse` drops identical non-zero `ABS_MISC`
+//! GATT restore already ran; on the first `ENODEV` on **any** sibling path we tear down the **whole**
+//! MAC session (abort other reader tasks, drop the GATT shutdown sender, one `bluetooth_connection_stopped`)
+//! so the GATT-owner path cannot disappear while siblings keep running without LED/backlight control.
+//! `suppress_twin_abs_misc_pulse` drops identical non-zero `ABS_MISC`
 //! values within ~40 ms; `bt_hid_gatt_write_lock` serializes BlueZ GATT writes; on `ENODEV` from
 //! `next_event` we remove this path from the map (see `start_bt_keyboard_task`). Collapsing to a
 //! single reader without new evidence would risk missing vendor keys after reconnect—treat as
@@ -45,6 +48,7 @@ use inotify::{Inotify, WatchMask};
 use log::{debug, info, warn};
 use nix::libc;
 use tokio::sync::{Mutex, broadcast};
+use tokio::task::AbortHandle;
 use tokio::{fs, task::spawn_blocking};
 use zbus::Connection;
 use zbus::fdo::ObjectManagerProxy;
@@ -65,10 +69,23 @@ use crate::{
 /// **Why a set of paths:** ASUS can expose **multiple** sibling evdev nodes for the same keyboard;
 /// vendor hotkeys may arrive on any subset. We must open each `ABS_MISC` node, but run GATT restore
 /// only once per session (`hid_restore_done`).
+///
+/// **`gatt_shutdown`:** the sending end of the oneshot watched by the GATT control task. Dropping it
+/// (session teardown) closes the channel so the task exits. It lives here so removing this struct
+/// always stops GATT even if the owning evdev node disappears first.
+/// Handle for aborting one per-path reader task during coordinated MAC-session teardown.
+struct BtReaderHandle {
+    task_id: usize,
+    abort: AbortHandle,
+}
+
 #[derive(Default)]
 struct BtVendorHotkeyReaders {
     paths: HashSet<PathBuf>,
     hid_restore_done: bool,
+    next_reader_task_id: usize,
+    gatt_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    reader_abort_handles: Vec<BtReaderHandle>,
 }
 
 /// When both sibling nodes emit the **same** non-zero `ABS_MISC` value for one physical press,
@@ -452,61 +469,78 @@ async fn try_start_bt_keyboard_task(
         None => format!("no-uniq:{}", path.display()),
     };
 
-    let mut run_hid_restore = false;
-    let mut registered = false;
-    for attempt in 0..8u32 {
-        let mut map = abs_misc_vendor_claimed.lock().await;
-        let entry = map.entry(dedupe_key.clone()).or_default();
-        if entry.paths.contains(&path) {
-            drop(map);
-            if attempt + 1 < 8 {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
+    let first_path_in_session = 'reg: loop {
+        for attempt in 0..8u32 {
+            let mut map = abs_misc_vendor_claimed.lock().await;
+            let entry = map.entry(dedupe_key.clone()).or_default();
+            if entry.paths.contains(&path) {
+                drop(map);
+                if attempt + 1 < 8 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                info!(
+                    "Skipping BT vendor-hotkey {:?}: path still listed active (stale claim / stuck inotify)",
+                    path
+                );
+                return;
             }
-            info!(
-                "Skipping BT vendor-hotkey {:?}: path still listed active (stale claim / stuck inotify)",
-                path
-            );
-            return;
-        }
-        run_hid_restore = !entry.hid_restore_done;
-        if run_hid_restore {
-            entry.hid_restore_done = true;
-        }
-        entry.paths.insert(path.clone());
-        registered = true;
-        break;
-    }
-    if !registered {
-        return;
-    }
+            let run_hid_restore = !entry.hid_restore_done;
+            let gatt_shutdown_rx = if run_hid_restore {
+                entry.hid_restore_done = true;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                entry.gatt_shutdown = Some(tx);
+                Some(rx)
+            } else {
+                None
+            };
+            let first_path_in_session = entry.paths.is_empty();
+            entry.paths.insert(path.clone());
+            let reader_task_id = entry.next_reader_task_id;
+            entry.next_reader_task_id = entry.next_reader_task_id.saturating_add(1);
 
-    start_bt_keyboard_task(
-        config,
-        path,
-        input,
-        event_receiver,
-        virtual_keyboard,
-        state_manager,
-        activity_notifier,
-        abs_misc_vendor_claimed,
-        dedupe_key,
-        run_hid_restore,
-    );
+            let reader_jh = start_bt_keyboard_task(
+                config.clone(),
+                path,
+                input,
+                event_receiver,
+                virtual_keyboard.clone(),
+                state_manager.clone(),
+                abs_misc_vendor_claimed.clone(),
+                dedupe_key.clone(),
+                run_hid_restore,
+                gatt_shutdown_rx,
+                reader_task_id,
+            );
+            entry.reader_abort_handles.push(BtReaderHandle {
+                task_id: reader_task_id,
+                abort: reader_jh.abort_handle(),
+            });
+            drop(map);
+            break 'reg first_path_in_session;
+        }
+        return;
+    };
+
+    if first_path_in_session {
+        state_manager.bluetooth_connection_started();
+        activity_notifier.notify();
+    }
 }
 
 fn start_bt_keyboard_task(
-    config: &Config,
+    config: Config,
     path: PathBuf,
     keyboard: Device,
-    mut event_receiver: broadcast::Receiver<Event>,
+    event_receiver: broadcast::Receiver<Event>,
     virtual_keyboard: Arc<Mutex<VirtualKeyboard>>,
     state_manager: KeyboardStateManager,
-    activity_notifier: ActivityNotifier,
     abs_misc_vendor_claimed: Arc<Mutex<HashMap<String, BtVendorHotkeyReaders>>>,
     vendor_channel_dedupe_key: String,
     run_hid_restore: bool,
-) {
+    gatt_shutdown_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+    reader_task_id: usize,
+) -> tokio::task::JoinHandle<()> {
     info!(
         "Bluetooth connected on {} (vendor hotkeys / ABS_MISC){}",
         path.display(),
@@ -516,20 +550,16 @@ fn start_bt_keyboard_task(
             ""
         }
     );
-    state_manager.bluetooth_connection_started();
-    activity_notifier.notify();
 
     // GATT: one restore + one event-driven writer per MAC connect session (first ABS_MISC path wins).
     // Sibling paths set `run_hid_restore = false` and drop their `event_receiver`; they only read
-    // `ABS_MISC`. Dropping `shutdown_tx` on disconnect: `None` here means this path did not own
-    // the GATT task—no-op. `Some(sender)` drops the oneshot sender so the **owning** path's GATT
-    // loop observes the channel close and exits cleanly.
-    let shutdown_tx = if run_hid_restore {
-        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-
+    // `ABS_MISC`. The matching `oneshot::Sender` lives in `BtVendorHotkeyReaders::gatt_shutdown`
+    // so removing that map entry (coordinated teardown) always closes this control loop.
+    if let Some(mut shutdown_rx) = gatt_shutdown_rx {
         let state_manager_ctrl = state_manager.clone();
         let fn_lock = config.fn_lock;
         let path_for_control = path.clone();
+        let mut event_receiver_gatt = event_receiver;
         tokio::spawn(async move {
             let mac = match mac_from_evdev_sysfs(&path_for_control).await {
                 Some(m) => m,
@@ -586,7 +616,7 @@ fn start_bt_keyboard_task(
                         info!("Bluetooth control task shutting down");
                         break;
                     }
-                    result = event_receiver.recv() => {
+                    result = event_receiver_gatt.recv() => {
                         match result {
                             Ok(Event::Backlight(state)) => {
                                 send_bt_backlight_state(&char_proxy, state).await;
@@ -606,18 +636,13 @@ fn start_bt_keyboard_task(
                 }
             }
         });
-        Some(shutdown_tx)
     } else {
         drop(event_receiver);
-        None
-    };
+    }
 
-    let config = config.clone();
     let keyboard = Arc::new(std::sync::Mutex::new(keyboard));
     let claimed_cleanup = abs_misc_vendor_claimed.clone();
     let dedupe_cleanup = vendor_channel_dedupe_key.clone();
-    let path_cleanup = path.clone();
-    let owned_gatt_evdev = run_hid_restore;
     tokio::spawn(async move {
         loop {
             let keyboard_clone = keyboard.clone();
@@ -635,24 +660,19 @@ fn start_bt_keyboard_task(
                 Err(e) => {
                     if let Some(libc::ENODEV) = e.raw_os_error() {
                         info!("Bluetooth device disconnected. Exiting task.");
-                        {
+                        let session = {
                             let mut map = claimed_cleanup.lock().await;
-                            if let Some(entry) = map.get_mut(&dedupe_cleanup) {
-                                let had_sibling_abs_misc = entry.paths.len() > 1;
-                                entry.paths.remove(&path_cleanup);
-                                if owned_gatt_evdev && had_sibling_abs_misc {
-                                    warn!(
-                                        "BT vendor-hotkey: GATT-owner evdev disconnected while sibling ABS_MISC paths remain — LED/backlight GATT forwarding may be inactive until Bluetooth reconnects."
-                                    );
-                                }
-                                if entry.paths.is_empty() {
-                                    map.remove(&dedupe_cleanup);
+                            map.remove(&dedupe_cleanup)
+                        };
+                        if let Some(session) = session {
+                            for h in session.reader_abort_handles {
+                                if h.task_id != reader_task_id {
+                                    h.abort.abort();
                                 }
                             }
+                            state_manager.bluetooth_connection_stopped();
+                            virtual_keyboard.lock().await.release_all_keys();
                         }
-                        state_manager.bluetooth_connection_stopped();
-                        virtual_keyboard.lock().await.release_all_keys();
-                        drop(shutdown_tx);
                         return;
                     } else {
                         warn!("Failed to read event: {:?}", e);
@@ -661,7 +681,7 @@ fn start_bt_keyboard_task(
                 }
             }
         }
-    });
+    })
 }
 
 // ── Key event parsing ────────────────────────────────────────────────────────
