@@ -514,7 +514,7 @@ pub async fn start_secondary_display_task(
     }
 
     // Task to periodically verify and enforce secondary display state
-    // For some reason the secondary display always get enabled when resuming from suspend.
+    // For some reason the secondary display always gets enabled when resuming from suspend.
     // A cooldown prevents the enforcer from fighting the kernel while it processes a state change.
     {
         let state_manager = state_manager.clone();

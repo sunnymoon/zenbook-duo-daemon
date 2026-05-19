@@ -617,6 +617,7 @@ fn start_bt_keyboard_task(
     let claimed_cleanup = abs_misc_vendor_claimed.clone();
     let dedupe_cleanup = vendor_channel_dedupe_key.clone();
     let path_cleanup = path.clone();
+    let owned_gatt_evdev = run_hid_restore;
     tokio::spawn(async move {
         loop {
             let keyboard_clone = keyboard.clone();
@@ -637,7 +638,13 @@ fn start_bt_keyboard_task(
                         {
                             let mut map = claimed_cleanup.lock().await;
                             if let Some(entry) = map.get_mut(&dedupe_cleanup) {
+                                let had_sibling_abs_misc = entry.paths.len() > 1;
                                 entry.paths.remove(&path_cleanup);
+                                if owned_gatt_evdev && had_sibling_abs_misc {
+                                    warn!(
+                                        "BT vendor-hotkey: GATT-owner evdev disconnected while sibling ABS_MISC paths remain — LED/backlight GATT forwarding may be inactive until Bluetooth reconnects."
+                                    );
+                                }
                                 if entry.paths.is_empty() {
                                     map.remove(&dedupe_cleanup);
                                 }

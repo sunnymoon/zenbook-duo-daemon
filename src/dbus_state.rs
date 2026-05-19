@@ -801,18 +801,17 @@ pub fn is_session_registered() -> bool {
         .is_some_and(|handle| handle.registered.load(Ordering::SeqCst))
 }
 
-async fn wait_for_ack(expected: AckEvent, timeout: Duration) -> bool {
-    let Some(handle) = get_root_handle().await else {
-        return false;
-    };
-
-    let mut ack_rx = handle.ack_tx.subscribe();
-    tokio::time::timeout(timeout, async move {
+async fn recv_matching_ack(
+    rx: &mut broadcast::Receiver<AckEvent>,
+    expected: AckEvent,
+    timeout: Duration,
+) -> bool {
+    tokio::time::timeout(timeout, async {
         loop {
-            match ack_rx.recv().await {
-                Ok(ack) if ack == expected => break true,
+            match rx.recv().await {
+                Ok(ack) if ack == expected => return true,
                 Ok(_) => continue,
-                Err(_) => break false,
+                Err(_) => return false,
             }
         }
     })
@@ -820,9 +819,56 @@ async fn wait_for_ack(expected: AckEvent, timeout: Duration) -> bool {
     .unwrap_or(false)
 }
 
-pub async fn notify_keyboard_attached_changed(
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    emit_keyboard_attached_changed().await
+/// Subscribe to the root ACK broadcast **before** emitting `keyboard_attached` so a fast session
+/// `acknowledge_keyboard_attached` is not missed (late `broadcast` subscribers do not see past sends).
+///
+/// Returns `(registered_with_root, ack_received)`.
+pub async fn notify_keyboard_attached_changed_wait(
+    attached: bool,
+    timeout: Duration,
+) -> (bool, bool) {
+    let mut rx = match get_root_handle().await {
+        Some(h) => h.ack_tx.subscribe(),
+        None => return (false, false),
+    };
+    let registered = match emit_keyboard_attached_changed().await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("KeyboardAttached: emit keyboard_attached_changed failed: {e}");
+            false
+        }
+    };
+    if !registered {
+        return (false, false);
+    }
+    let acked = recv_matching_ack(&mut rx, AckEvent::KeyboardAttached(attached), timeout).await;
+    (true, acked)
+}
+
+/// Same ordering guarantee as [`notify_keyboard_attached_changed_wait`] for secondary display.
+///
+/// Returns `(registered_with_root, ack_received)`.
+pub async fn notify_desired_secondary_changed_wait(
+    enabled: bool,
+    timeout: Duration,
+) -> (bool, bool) {
+    let mut rx = match get_root_handle().await {
+        Some(h) => h.ack_tx.subscribe(),
+        None => return (false, false),
+    };
+    let registered = match emit_desired_secondary_changed().await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("SecondaryDisplay: emit desired_secondary_enabled_changed failed: {e}");
+            false
+        }
+    };
+    if !registered {
+        return (false, false);
+    }
+    let acked =
+        recv_matching_ack(&mut rx, AckEvent::DesiredSecondaryApplied(enabled), timeout).await;
+    (true, acked)
 }
 
 pub async fn notify_bluetooth_connected_changed(
@@ -867,14 +913,6 @@ pub async fn notify_secondary_sysfs_poweroff_ready() -> Result<(), String> {
 pub async fn notify_display_brightness_changed(
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     emit_display_brightness_changed().await
-}
-
-pub async fn wait_for_keyboard_attached_ack(attached: bool, timeout: Duration) -> bool {
-    wait_for_ack(AckEvent::KeyboardAttached(attached), timeout).await
-}
-
-pub async fn wait_for_desired_secondary_ack(enabled: bool, timeout: Duration) -> bool {
-    wait_for_ack(AckEvent::DesiredSecondaryApplied(enabled), timeout).await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1227,6 +1265,37 @@ pub async fn run_session_client(
             }
         }
 
+        let dbus_proxy = match DBusProxy::new(&connection).await {
+            Ok(proxy) => proxy,
+            Err(e) => {
+                error!("SESSION DBus: failed to create org.freedesktop.DBus proxy: {e}");
+                replace_session_registered_system_bus(None).await;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+
+        let mut owner_changes = match dbus_proxy
+            .receive_name_owner_changed_with_args(&[(0, ROOT_DBUS_SERVICE)])
+            .await
+        {
+            Ok(stream) => stream,
+            Err(e) => {
+                error!("SESSION DBus: failed to subscribe to root owner changes: {e}");
+                replace_session_registered_system_bus(None).await;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+
+        let mut keyboard_changes = proxy.inner().receive_property_changed("KeyboardAttached").await;
+        let mut desired_secondary_changes = proxy
+            .inner()
+            .receive_property_changed("DesiredSecondaryEnabled")
+            .await;
+        let mut desired_primary_changes = proxy.inner().receive_property_changed("DesiredPrimary").await;
+        let mut display_brightness_changes = proxy.inner().receive_property_changed("DisplayBrightness").await;
+
         match proxy.keyboard_attached().await {
             Ok(value) => apply_keyboard_update(&proxy, &kb_tx, &kb_result_rx, value).await,
             Err(e) => warn!("SESSION DBus: failed to read initial keyboard_attached property: {e}"),
@@ -1260,37 +1329,6 @@ pub async fn run_session_client(
             Ok(_) => {}
             Err(e) => warn!("SESSION DBus: failed to read initial display_brightness property: {e}"),
         }
-
-        let dbus_proxy = match DBusProxy::new(&connection).await {
-            Ok(proxy) => proxy,
-            Err(e) => {
-                error!("SESSION DBus: failed to create org.freedesktop.DBus proxy: {e}");
-                replace_session_registered_system_bus(None).await;
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                continue;
-            }
-        };
-
-        let mut owner_changes = match dbus_proxy
-            .receive_name_owner_changed_with_args(&[(0, ROOT_DBUS_SERVICE)])
-            .await
-        {
-            Ok(stream) => stream,
-            Err(e) => {
-                error!("SESSION DBus: failed to subscribe to root owner changes: {e}");
-                replace_session_registered_system_bus(None).await;
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                continue;
-            }
-        };
-
-        let mut keyboard_changes = proxy.inner().receive_property_changed("KeyboardAttached").await;
-        let mut desired_secondary_changes = proxy
-            .inner()
-            .receive_property_changed("DesiredSecondaryEnabled")
-            .await;
-        let mut desired_primary_changes = proxy.inner().receive_property_changed("DesiredPrimary").await;
-        let mut display_brightness_changes = proxy.inner().receive_property_changed("DisplayBrightness").await;
 
         let mut reconnect = false;
         while !reconnect {

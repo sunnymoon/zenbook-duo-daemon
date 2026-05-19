@@ -208,7 +208,7 @@ The install script currently:
 
 ### D-Bus and Polkit
 
-**D-Bus** (`/etc/dbus-1/system.d/zenbook-duo-daemon-dbus.conf`) allows normal clients to connect to `asus.zenbook.duo` on the system bus. **Authorization is enforced in the daemon** with **Polkit** (`org.freedesktop.PolicyKit1.Authority.CheckAuthorization`) using a **unix-process** subject (caller PID + start time from `/proc`).
+**D-Bus** (`/etc/dbus-1/system.d/zenbook-duo-daemon-dbus.conf`) allows normal clients to connect to `asus.zenbook.duo` on the system bus. **Authorization is enforced in the daemon** with **Polkit** (`org.freedesktop.PolicyKit1.Authority.CheckAuthorization`) using a **unix-process** subject (caller PID + start time from `/proc`). The daemon does **not** additionally require a `zenbook-duo` Unix group for operator methods (that group was legacy); effective access is **Polkit + active local session** as below.
 
 Installed actions (see `org.zenbook.duo.policy` in this repository):
 

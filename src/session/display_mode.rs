@@ -1,5 +1,5 @@
 //! Classification of Mutter logical layout for `desired_display_attachment` / `desired_display_layout`.
-//! See `plan.md` §6 (external attachment / layout strategy).
+//! External attachment rules are documented in **`README.md`** (external monitors).
 
 use std::collections::{HashMap, HashSet};
 
@@ -143,12 +143,13 @@ pub fn external_connectors_ordered(
 }
 
 /// Logical width of an internal panel along global **X** (for placing another monitor to the right).
+///
+/// [`super::display::logical_size`] already maps physical size into compositor `(lw, lh)` for the
+/// given rotation; the **first** tuple element is the extent along global **X** used by
+/// [`super::display::build_duo_lms`] for horizontal adjacency (including left-up / right-up).
 pub fn edp_logical_extent_x(pw: i32, ph: i32, scale: f64, transform: u32) -> i32 {
-    let (lw, lh) = super::display::logical_size(pw, ph, scale, transform);
-    match transform {
-        1 | 3 => lh,
-        _ => lw,
-    }
+    let (lw, _) = super::display::logical_size(pw, ph, scale, transform);
+    lw
 }
 
 #[cfg(test)]
@@ -198,5 +199,22 @@ mod external_connectors_ordered_tests {
 
         let v = external_connectors_ordered(&physical, &modes);
         assert_eq!(v, vec!["DP-1"]);
+    }
+
+    #[test]
+    fn edp_logical_extent_x_matches_logical_size_width_for_rotations() {
+        use super::edp_logical_extent_x;
+        use super::super::display::logical_size;
+        let pw = 2880i32;
+        let ph = 1800i32;
+        let scale = 5.0 / 3.0;
+        for transform in [0u32, 1, 2, 3] {
+            let (lw, _) = logical_size(pw, ph, scale, transform);
+            assert_eq!(
+                edp_logical_extent_x(pw, ph, scale, transform),
+                lw,
+                "transform {transform}"
+            );
+        }
     }
 }

@@ -575,14 +575,14 @@ struct KeyboardBatteryWarn {
 
 impl KeyboardBatteryWarn {
     fn clear_recovered(&mut self, pct: u8) {
-        if pct >= BATTERY_WARN_PCT_LOW {
-            self.shown_below_20 = false;
+        if pct > BATTERY_WARN_PCT_CRITICAL {
+            self.shown_below_5 = false;
         }
-        if pct >= BATTERY_WARN_PCT_VERY_LOW {
+        if pct > BATTERY_WARN_PCT_VERY_LOW {
             self.shown_below_10 = false;
         }
-        if pct >= BATTERY_WARN_PCT_CRITICAL {
-            self.shown_below_5 = false;
+        if pct > BATTERY_WARN_PCT_LOW {
+            self.shown_below_20 = false;
         }
     }
 }
@@ -590,12 +590,13 @@ impl KeyboardBatteryWarn {
 /// Battery warnings while **USB detached** and keyboard on Bluetooth.
 /// All tiers use urgency **critical** (byte 2) + **persistent** hints so GNOME treats them as
 /// high-severity; `expire_timeout` is kept for spec compliance (mostly ignored by Shell).
+/// Thresholds fire at **≤** the documented percentages (5%, 10%, 20%).
 async fn maybe_emit_battery_warning_detached_bt(
     notif: &NotificationsProxy<'_>,
     pct: u8,
     w: &mut KeyboardBatteryWarn,
 ) {
-    if pct < BATTERY_WARN_PCT_CRITICAL && !w.shown_below_5 {
+    if pct <= BATTERY_WARN_PCT_CRITICAL && !w.shown_below_5 {
         w.shown_below_5 = true;
         w.shown_below_10 = true;
         w.shown_below_20 = true;
@@ -622,7 +623,7 @@ async fn maybe_emit_battery_warning_detached_bt(
         return;
     }
 
-    if pct < BATTERY_WARN_PCT_VERY_LOW && !w.shown_below_10 {
+    if pct <= BATTERY_WARN_PCT_VERY_LOW && !w.shown_below_10 {
         w.shown_below_10 = true;
         w.shown_below_20 = true;
         let mut hints = persistent_urgency_hints(2);
@@ -648,7 +649,7 @@ async fn maybe_emit_battery_warning_detached_bt(
         return;
     }
 
-    if pct < BATTERY_WARN_PCT_LOW && !w.shown_below_20 {
+    if pct <= BATTERY_WARN_PCT_LOW && !w.shown_below_20 {
         w.shown_below_20 = true;
         let mut hints = persistent_urgency_hints(2);
         hints.insert("image-path", Value::from("battery-full-charging-symbolic"));

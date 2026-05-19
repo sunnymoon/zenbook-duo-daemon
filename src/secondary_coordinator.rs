@@ -33,21 +33,21 @@ pub async fn coordinate_secondary_display_to_state(
         }
     }
 
-    let session_registered = match crate::dbus_state::notify_desired_secondary_changed().await {
-        Ok(registered) => registered,
-        Err(e) => {
-            warn!("SecondaryDisplay: D-Bus notify failed: {}", e);
-            false
-        }
+    let (session_registered, acked) = if new_state {
+        crate::dbus_state::notify_desired_secondary_changed_wait(true, Duration::from_secs(8)).await
+    } else {
+        let registered = match crate::dbus_state::notify_desired_secondary_changed().await {
+            Ok(registered) => registered,
+            Err(e) => {
+                warn!("SecondaryDisplay: D-Bus notify failed: {}", e);
+                false
+            }
+        };
+        (registered, false)
     };
 
     if new_state {
         if session_registered {
-            let acked = crate::dbus_state::wait_for_desired_secondary_ack(
-                true,
-                Duration::from_secs(8),
-            )
-            .await;
             if acked {
                 info!("SecondaryDisplay: session applied enable");
             } else {

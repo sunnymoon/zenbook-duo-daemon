@@ -293,20 +293,13 @@ async fn run_daemon(config_path: PathBuf) {
                             secondary_display::ensure_secondary_display_on().await;
                         }
 
-                        let session_registered = match dbus_state::notify_keyboard_attached_changed().await {
-                            Ok(registered) => registered,
-                            Err(e) => {
-                                warn!("KeyboardAttached: failed to publish D-Bus state update: {e}");
-                                false
-                            }
-                        };
+                        let (session_registered, acked) = dbus_state::notify_keyboard_attached_changed_wait(
+                            attached,
+                            Duration::from_secs(5),
+                        )
+                        .await;
 
                         if session_registered {
-                            let acked = dbus_state::wait_for_keyboard_attached_ack(
-                                attached,
-                                Duration::from_secs(5),
-                            )
-                            .await;
                             if acked {
                                 info!("KeyboardAttached: session daemon acknowledged request");
                             } else {

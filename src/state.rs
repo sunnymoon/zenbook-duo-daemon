@@ -15,7 +15,7 @@ struct PersistedDisplayState {
     desired_secondary_enabled: Option<bool>,
     display_brightness: Option<u32>,
     ambient_light_enabled: Option<bool>,
-    /// `builtin_only` | `external_only` | `all_connected` (see `plan.md` §6).
+    /// `builtin_only` | `external_only` | `all_connected` (see `README.md`, external monitors).
     desired_display_attachment: Option<String>,
     /// `mirror` | `joined`
     desired_display_layout: Option<String>,
