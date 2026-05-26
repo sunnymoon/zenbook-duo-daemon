@@ -235,12 +235,22 @@ remove_cli_symlink_if_ours() {
     if [ ! -L "${CLI_SYMLINK_PATH}" ]; then
         return 0
     fi
-    local target expected
-    target=$(readlink -f "${CLI_SYMLINK_PATH}" 2>/dev/null || true)
-    expected=$(readlink -f "${BINARY_PATH}" 2>/dev/null || true)
-    if [ -n "${target}" ] && [ -n "${expected}" ] && [ "${target}" = "${expected}" ]; then
+    # `readlink -f` needs the symlink target to exist; after a partial uninstall the binary may be
+    # gone while the CLI symlink still points at ${BINARY_PATH}. Compare the stored target first.
+    local literal_target canonical_cli canonical_bin
+    literal_target=$(readlink "${CLI_SYMLINK_PATH}" 2>/dev/null || true)
+    if [ -n "${literal_target}" ] && [ "${literal_target}" = "${BINARY_PATH}" ]; then
         echo "Removing CLI symlink ${CLI_SYMLINK_PATH}..."
         rm -f "${CLI_SYMLINK_PATH}"
+        return 0
+    fi
+    if [ -e "${CLI_SYMLINK_PATH}" ] && [ -e "${BINARY_PATH}" ]; then
+        canonical_cli=$(readlink -f "${CLI_SYMLINK_PATH}" 2>/dev/null || true)
+        canonical_bin=$(readlink -f "${BINARY_PATH}" 2>/dev/null || true)
+        if [ -n "${canonical_cli}" ] && [ -n "${canonical_bin}" ] && [ "${canonical_cli}" = "${canonical_bin}" ]; then
+            echo "Removing CLI symlink ${CLI_SYMLINK_PATH}..."
+            rm -f "${CLI_SYMLINK_PATH}"
+        fi
     fi
 }
 

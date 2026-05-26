@@ -55,8 +55,12 @@ async fn write_display_state_file_atomically(state: &PersistedDisplayState) {
 async fn with_display_state<R>(f: impl FnOnce(&mut PersistedDisplayState) -> R) -> R {
     let _guard = display_state_mutex().lock().await;
     let mut state = read_display_state_file_inner().await;
+    let before_json = serde_json::to_string(&state).unwrap_or_default();
     let out = f(&mut state);
-    write_display_state_file_atomically(&state).await;
+    match serde_json::to_string(&state) {
+        Ok(after_json) if after_json == before_json => {}
+        Ok(_) | Err(_) => write_display_state_file_atomically(&state).await,
+    }
     out
 }
 

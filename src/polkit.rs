@@ -1,7 +1,6 @@
 //! Polkit authorization for system D-Bus entry points (see `org.zenbook.duo.policy`).
 
 use std::collections::HashMap;
-use std::fs;
 use std::io;
 
 use log::warn;
@@ -20,9 +19,9 @@ const POLKIT_INTERFACE: &str = "org.freedesktop.PolicyKit1.Authority";
 /// Field index of `starttime` in `/proc/[pid]/stat` after the `) ` that closes `comm`.
 const PROC_STAT_STARTTIME_FIELD: usize = 19;
 
-fn proc_pid_start_time_ticks(pid: u32) -> io::Result<u64> {
+async fn proc_pid_start_time_ticks(pid: u32) -> io::Result<u64> {
     let path = format!("/proc/{pid}/stat");
-    let data = fs::read_to_string(&path)?;
+    let data = tokio::fs::read_to_string(&path).await?;
     let after_comm = data
         .rfind(')')
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no ')' in /proc stat"))?;
@@ -41,7 +40,7 @@ fn proc_pid_start_time_ticks(pid: u32) -> io::Result<u64> {
 
 /// Returns whether Polkit authorizes `action_id` for the Unix process `pid`.
 pub async fn check_authorization(bus: &Connection, pid: u32, action_id: &str) -> fdo::Result<()> {
-    let start_time = proc_pid_start_time_ticks(pid).map_err(|e| {
+    let start_time = proc_pid_start_time_ticks(pid).await.map_err(|e| {
         fdo::Error::Failed(format!(
             "cannot read process start time for pid {pid} (Polkit subject): {e}"
         ))

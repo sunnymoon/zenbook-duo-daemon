@@ -125,11 +125,9 @@ async fn notify_keyboard_display_chain(
     hints: HashMap<&'static str, Value<'static>>,
     expire_timeout: i32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let rid = {
-        let chain = keyboard_display_notif_state();
-        let st = chain.lock().await;
-        st.replaces_id
-    };
+    let chain = keyboard_display_notif_state();
+    let mut st = chain.lock().await;
+    let rid = st.replaces_id;
     let id = proxy
         .notify(
             "zenbook-duo-daemon",
@@ -142,11 +140,7 @@ async fn notify_keyboard_display_chain(
             expire_timeout,
         )
         .await?;
-    {
-        let chain = keyboard_display_notif_state();
-        let mut st = chain.lock().await;
-        st.replaces_id = id;
-    }
+    st.replaces_id = id;
     Ok(())
 }
 
@@ -161,11 +155,9 @@ async fn notify_keyboard_display_transient_fresh(
     hints: HashMap<&'static str, Value<'static>>,
     expire_timeout: i32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let old_id = {
-        let chain = keyboard_display_notif_state();
-        let st = chain.lock().await;
-        st.replaces_id
-    };
+    let chain = keyboard_display_notif_state();
+    let mut st = chain.lock().await;
+    let old_id = st.replaces_id;
     if old_id != 0 {
         if let Err(e) = proxy.close_notification(old_id).await {
             warn!("CloseNotification({old_id}) before transient toast: {e}");
@@ -183,11 +175,7 @@ async fn notify_keyboard_display_transient_fresh(
             expire_timeout,
         )
         .await?;
-    {
-        let chain = keyboard_display_notif_state();
-        let mut st = chain.lock().await;
-        st.replaces_id = id;
-    }
+    st.replaces_id = id;
     Ok(())
 }
 
@@ -203,11 +191,9 @@ pub async fn send_display_recovery_transient_chained(
     let proxy = NotificationsProxy::new(&conn).await?;
     let mut hints = transient_hints();
     hints.insert("urgency", Value::U8(urgency));
-    let rid = {
-        let recovery = display_recovery_notif_state();
-        let st = recovery.lock().await;
-        st.replaces_id
-    };
+    let recovery = display_recovery_notif_state();
+    let mut st = recovery.lock().await;
+    let rid = st.replaces_id;
     let id = proxy
         .notify(
             "zenbook-duo-daemon",
@@ -220,11 +206,7 @@ pub async fn send_display_recovery_transient_chained(
             expire_timeout,
         )
         .await?;
-    {
-        let recovery = display_recovery_notif_state();
-        let mut st = recovery.lock().await;
-        st.replaces_id = id;
-    }
+    st.replaces_id = id;
     Ok(())
 }
 
@@ -236,11 +218,9 @@ pub async fn send_display_recovery_persistent_critical_chained(
     let conn = Connection::session().await?;
     let proxy = NotificationsProxy::new(&conn).await?;
     let hints = persistent_urgency_hints(2);
-    let rid = {
-        let recovery = display_recovery_notif_state();
-        let st = recovery.lock().await;
-        st.replaces_id
-    };
+    let recovery = display_recovery_notif_state();
+    let mut st = recovery.lock().await;
+    let rid = st.replaces_id;
     let id = proxy
         .notify(
             "zenbook-duo-daemon",
@@ -253,11 +233,7 @@ pub async fn send_display_recovery_persistent_critical_chained(
             0,
         )
         .await?;
-    {
-        let recovery = display_recovery_notif_state();
-        let mut st = recovery.lock().await;
-        st.replaces_id = id;
-    }
+    st.replaces_id = id;
     Ok(())
 }
 
