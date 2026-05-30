@@ -34,6 +34,10 @@ The project currently installs multiple components:
   - applies display/orientation changes through GNOME/Mutter
   - monitors GNOME ambient light setting
   - acknowledges root requests over D-Bus
+  - remaps integrated stylus tablets to panel EDIDs when tablet mapping is enabled
+- **GNOME Shell extension** (`gnome-extension/`, optional)
+  - Quick Settings + panel indicator for battery, link state, display policy, mic/backlight, tablet mapping, and root/session health
+  - install: `gnome-extension/install.sh --enable` (see `gnome-extension/README.md`)
 
 ## What currently works
 
@@ -51,6 +55,8 @@ The project currently installs multiple components:
 - ✅ Persistence of keyboard/display/ambient-related daemon state
 - ✅ Display mode preservation across Super+P / GNOME Control Center changes (mirror ↔ joined)
 - ✅ Keyboard battery warnings (tiered notifications at 20% / 10% / 5% with themed icons)
+- ✅ Keyboard battery level over USB (`0x5a 0x3d` vendor reports) and Bluetooth, with persistence across USB ↔ BT transitions
+- ✅ Stylus / tablet panel mapping (`one_to_one` / `all_to_primary`) via session + D-Bus operator controls
 
 ## Current known limitations
 
@@ -245,10 +251,17 @@ You can configure:
 - special-key remappings
 - keyboard USB VID:PID if needed
 - backlight and secondary-display sysfs paths
+- tablet / stylus mapping (`[tablet]` — `enable`, `mode`)
 
 ## Operator CLI (D-Bus)
 
 The **root** daemon must be running. Commands call **D-Bus** on `asus.zenbook.duo`. The calling process must pass **Polkit** for `org.zenbook.duo.operator` (typically: **active local graphical session** or **root**). See `zenbook-duo-daemon --help` and `control --help`.
+
+Read all root **properties** (keyboard, battery, display desire, tablet mapping, session registration):
+
+```bash
+zenbook-duo-daemon state
+```
 
 Examples:
 

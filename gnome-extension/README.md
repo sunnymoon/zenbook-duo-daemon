@@ -34,8 +34,10 @@ Properties read: `KeyboardUsbConnected`, `KeyboardPogoDocked`,
 
 Methods called (from Quick Settings actions): `SetSecondaryDisplayDesired(bool)`,
 `SetDesiredPrimary(string)`, `SetTabletMappingEnabled(bool)`,
-`SetTabletMappingMode(string)`, `ApplyTabletMapping()`,
-`SetMicMuteLed(bool)`, and `SetKeyboardBacklightLevel(byte)`.
+`SetTabletMappingMode(string)`, `ToggleTabletMappingMode()`,
+`ApplyTabletMapping()`, `SetMicMuteLed(bool)`,
+`ToggleMicMuteLed()`, `SetKeyboardBacklightLevel(byte)`,
+`ToggleKeyboardBacklight()`.
 
 ## Requirements
 
