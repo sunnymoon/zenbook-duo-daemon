@@ -29,6 +29,10 @@
  *   TabletMappingEnabled
  *   TabletMappingMode
  *   TabletMappingApplyNonce
+ *   SessionRegistered
+ *   SessionOwner
+ *   SessionId
+ *   SessionLastSeenUsec
  *   MicMuteLed
  *   KeyboardBacklightLevel
  *
@@ -106,6 +110,10 @@ const DBUS_XML = `
     <property name="TabletMappingEnabled" type="b" access="read"/>
     <property name="TabletMappingMode" type="s" access="read"/>
     <property name="TabletMappingApplyNonce" type="u" access="read"/>
+    <property name="SessionRegistered" type="b" access="read"/>
+    <property name="SessionOwner" type="s" access="read"/>
+    <property name="SessionId" type="t" access="read"/>
+    <property name="SessionLastSeenUsec" type="t" access="read"/>
   </interface>
 </node>`;
 
@@ -165,6 +173,15 @@ function variantValue(variant, fallback) {
     return variant ? variant.deepUnpack() : fallback;
 }
 
+function numberFromVariantValue(variant) {
+    if (!variant)
+        return null;
+    const value = variant.deepUnpack();
+    if (typeof value === 'bigint')
+        return Number(value);
+    return value;
+}
+
 function displayAttachmentText(value) {
     switch (value) {
     case 'builtin_only':
@@ -218,6 +235,14 @@ class ZenbookKeyboardBatteryToggle extends QuickMenuToggle {
             can_focus: false,
         });
         this._batteryItem = new PopupMenu.PopupMenuItem('Battery: Unknown', {
+            reactive: false,
+            can_focus: false,
+        });
+        this._daemonStatusItem = new PopupMenu.PopupMenuItem('Root: unreachable', {
+            reactive: false,
+            can_focus: false,
+        });
+        this._daemonDetailItem = new PopupMenu.PopupMenuItem('Session: unknown', {
             reactive: false,
             can_focus: false,
         });
@@ -331,6 +356,8 @@ class ZenbookKeyboardBatteryToggle extends QuickMenuToggle {
 
         this.menu.addMenuItem(this._stateItem);
         this.menu.addMenuItem(this._batteryItem);
+        this.menu.addMenuItem(this._daemonStatusItem);
+        this.menu.addMenuItem(this._daemonDetailItem);
         this.menu.addMenuItem(this._availabilityItem);
         this.menu.addMenuItem(this._displayMenu);
         this._displayMenu.menu.addMenuItem(this._displayPrimaryItem);
@@ -392,6 +419,10 @@ class ZenbookKeyboardBatteryToggle extends QuickMenuToggle {
         const tabletNonceText = `Last apply nonce: ${
             state.tabletMappingApplyNonce === null ? 'unknown' : state.tabletMappingApplyNonce
         }`;
+        const staleSession = state.sessionRegistered === true
+            && state.sessionLastSeenUsec !== null
+            && state.sessionLastSeenUsec > 0
+            && (state.nowUsec - state.sessionLastSeenUsec) > 30_000_000;
         const tabletKnown = state.tabletMappingEnabled !== null
             && state.tabletMappingMode !== null
             && state.tabletMappingApplyNonce !== null;
@@ -399,6 +430,23 @@ class ZenbookKeyboardBatteryToggle extends QuickMenuToggle {
         this.subtitle = `${connectedText} · ${batteryText}`;
         this._stateItem.label.text = `Keyboard: ${connectedText}`;
         this._batteryItem.label.text = `Battery: ${batteryText}`;
+        if (!state.rootReachable) {
+            this._daemonStatusItem.label.text = 'Root: unreachable';
+            this._daemonDetailItem.label.text = 'Session: unknown';
+        } else if (state.sessionRegistered === null) {
+            this._daemonStatusItem.label.text = 'Root: up · Session: daemon update pending';
+            this._daemonDetailItem.label.text = 'Session details unavailable';
+        } else if (state.sessionRegistered) {
+            this._daemonStatusItem.label.text = staleSession
+                ? 'Root: up · Session: linked (session quiet)'
+                : 'Root: up · Session: linked';
+            const ownerText = state.sessionOwner || 'unknown owner';
+            const idText = state.sessionId === null ? 'unknown id' : `id ${state.sessionId}`;
+            this._daemonDetailItem.label.text = `${ownerText} · ${idText}`;
+        } else {
+            this._daemonStatusItem.label.text = 'Root: up · Session: not registered';
+            this._daemonDetailItem.label.text = 'No active session daemon registration';
+        }
         this._displayPrimaryItem.label.text = primaryText;
         this._displayAttachmentItem.label.text = attachmentText;
         this._displayLayoutItem.label.text = layoutText;
@@ -549,6 +597,34 @@ export default class ZenbookDuoExtension extends Extension {
         // Insert the indicator into the Quick Settings status area.
         Main.panel.statusArea.quickSettings.addExternalIndicator(this._indicator);
 
+        this.state = {
+            rootReachable: false,
+            nowUsec: Date.now() * 1000,
+            keyboardUsbConnected: false,
+            keyboardPogoDocked: false,
+            bluetoothConnected: false,
+            keyboardBatteryPresent: false,
+            keyboardBatteryPercentage: 0,
+            keyboardBatteryCharging: false,
+            keyboardBatteryFull: false,
+            desiredPrimary: 'eDP-1',
+            desiredSecondaryEnabled: false,
+            desiredDisplayAttachment: 'builtin_only',
+            desiredDisplayLayout: 'joined',
+            displayBrightness: null,
+            displayApplyPaused: false,
+            tabletMappingEnabled: null,
+            tabletMappingMode: null,
+            tabletMappingApplyNonce: null,
+            sessionRegistered: null,
+            sessionOwner: null,
+            sessionId: null,
+            sessionLastSeenUsec: null,
+            micMuteLed: null,
+            keyboardBacklightLevel: null,
+        };
+        this._indicator.update(this.state);
+
         this._connectDbus();
     }
 
@@ -586,6 +662,12 @@ export default class ZenbookDuoExtension extends Extension {
                     proxy.init_finish(result);
                 } catch (e) {
                     console.error(`[zenbook-duo] D-Bus init failed: ${e.message}`);
+                    this.state = {
+                        ...this.state,
+                        rootReachable: false,
+                        nowUsec: Date.now() * 1000,
+                    };
+                    this._indicator?.update(this.state);
                     return;
                 }
 
@@ -597,6 +679,10 @@ export default class ZenbookDuoExtension extends Extension {
                     'g-properties-changed',
                     () => this._refresh(),
                 );
+                this._nameOwnerId = this._proxy.connect(
+                    'notify::g-name-owner',
+                    () => this._refresh(),
+                );
             },
         );
     }
@@ -606,6 +692,10 @@ export default class ZenbookDuoExtension extends Extension {
             if (this._propChangeId) {
                 this._proxy.disconnect(this._propChangeId);
                 this._propChangeId = null;
+            }
+            if (this._nameOwnerId) {
+                this._proxy.disconnect(this._nameOwnerId);
+                this._nameOwnerId = null;
             }
             this._proxy = null;
         }
@@ -658,10 +748,17 @@ export default class ZenbookDuoExtension extends Extension {
         const tabletMappingEnabledVar = get('TabletMappingEnabled');
         const tabletMappingModeVar = get('TabletMappingMode');
         const tabletMappingApplyNonceVar = get('TabletMappingApplyNonce');
+        const sessionRegisteredVar = get('SessionRegistered');
+        const sessionOwnerVar = get('SessionOwner');
+        const sessionIdVar = get('SessionId');
+        const sessionLastSeenUsecVar = get('SessionLastSeenUsec');
         const micMuteVar = get('MicMuteLed');
         const backlightLevelVar = get('KeyboardBacklightLevel');
+        const rootReachable = Boolean(this._proxy.get_name_owner());
 
         this.state = {
+            rootReachable,
+            nowUsec: Date.now() * 1000,
             keyboardUsbConnected: variantValue(usbVar, false),
             keyboardPogoDocked: variantValue(pogoVar, false),
             bluetoothConnected: variantValue(btVar, false),
@@ -680,6 +777,10 @@ export default class ZenbookDuoExtension extends Extension {
             tabletMappingApplyNonce: tabletMappingApplyNonceVar
                 ? tabletMappingApplyNonceVar.deepUnpack()
                 : null,
+            sessionRegistered: sessionRegisteredVar ? sessionRegisteredVar.get_boolean() : null,
+            sessionOwner: sessionOwnerVar ? sessionOwnerVar.deepUnpack() : null,
+            sessionId: numberFromVariantValue(sessionIdVar),
+            sessionLastSeenUsec: numberFromVariantValue(sessionLastSeenUsecVar),
             micMuteLed: micMuteVar ? micMuteVar.get_boolean() : null,
             keyboardBacklightLevel: backlightLevelVar ? backlightLevelVar.get_byte() : null,
         };

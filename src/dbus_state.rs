@@ -42,6 +42,15 @@ enum AckEvent {
 struct RegisteredSession {
     session_id: u64,
     owner: String,
+    /// Updated on each session-originated D-Bus call (microseconds since Unix epoch).
+    last_seen_usec: u64,
+}
+
+fn session_now_usec() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
 }
 
 #[derive(Clone)]
@@ -131,6 +140,14 @@ impl RootStateInterface {
             None => Err(fdo::Error::AccessDenied(
                 "no session daemon is currently registered".into(),
             )),
+        }
+    }
+
+    async fn mark_session_activity(&self) {
+        let now = session_now_usec();
+        let mut registration = self.registration.write().await;
+        if let Some(session) = registration.as_mut() {
+            session.last_seen_usec = now;
         }
     }
 
@@ -278,6 +295,7 @@ impl RootStateInterface {
         #[zbus(header)] header: Header<'_>,
     ) -> fdo::Result<()> {
         self.ensure_registered_sender(&header).await?;
+        self.mark_session_activity().await;
         if let Err(e) =
             crate::state::validate_desired_display_mode_strings(&attachment, &layout)
         {
@@ -303,6 +321,45 @@ impl RootStateInterface {
     #[zbus(property)]
     async fn display_apply_paused(&self) -> bool {
         self.apply_guard.lock().await.paused
+    }
+
+    /// `true` while a `zenbook-duo-session` peer has called `RegisterSession` and remains on the bus.
+    #[zbus(property)]
+    fn session_registered(&self) -> bool {
+        self.registered.load(Ordering::SeqCst)
+    }
+
+    /// Unique bus name of the registered session (empty when none).
+    #[zbus(property)]
+    async fn session_owner(&self) -> String {
+        self.registration
+            .read()
+            .await
+            .as_ref()
+            .map(|s| s.owner.clone())
+            .unwrap_or_default()
+    }
+
+    /// Last accepted `register_session` id (`0` when none).
+    #[zbus(property)]
+    async fn session_id(&self) -> u64 {
+        self.registration
+            .read()
+            .await
+            .as_ref()
+            .map(|s| s.session_id)
+            .unwrap_or(0)
+    }
+
+    /// Last session-originated RPC timestamp (µs since epoch); read in UI for staleness checks.
+    #[zbus(property)]
+    async fn session_last_seen_usec(&self) -> u64 {
+        self.registration
+            .read()
+            .await
+            .as_ref()
+            .map(|s| s.last_seen_usec)
+            .unwrap_or(0)
     }
 
     async fn register_session(
@@ -332,9 +389,11 @@ impl RootStateInterface {
             }
         }
 
+        let now = session_now_usec();
         let new_registration = RegisteredSession {
             session_id,
             owner: sender.as_str().to_string(),
+            last_seen_usec: now,
         };
 
         {
@@ -355,6 +414,9 @@ impl RootStateInterface {
             *registration = Some(new_registration);
         }
         self.registered.store(true, Ordering::SeqCst);
+        if let Err(e) = emit_session_registration_changed().await {
+            warn!("register_session: failed to emit session registration properties: {e}");
+        }
 
         Ok(())
     }
@@ -365,6 +427,7 @@ impl RootStateInterface {
         #[zbus(header)] header: Header<'_>,
     ) -> fdo::Result<()> {
         self.ensure_registered_sender(&header).await?;
+        self.mark_session_activity().await;
         let _ = self.ack_tx.send(AckEvent::KeyboardPogoDocked(value));
         Ok(())
     }
@@ -384,6 +447,7 @@ impl RootStateInterface {
         #[zbus(header)] header: Header<'_>,
     ) -> fdo::Result<()> {
         self.ensure_registered_sender(&header).await?;
+        self.mark_session_activity().await;
         let _ = self.ack_tx.send(AckEvent::DesiredSecondaryApplied(value));
         Ok(())
     }
@@ -397,6 +461,7 @@ impl RootStateInterface {
         #[zbus(header)] header: Header<'_>,
     ) -> fdo::Result<()> {
         self.ensure_registered_sender(&header).await?;
+        self.mark_session_activity().await;
         info!(
             "ROOT [secondary sysfs] Moment B (session-stable D-Bus ack): registered session called acknowledge_secondary_sysfs_poweroff_ready — applying session-stable sysfs policy (see next lines for write / no-op)"
         );
@@ -411,6 +476,7 @@ impl RootStateInterface {
         #[zbus(header)] header: Header<'_>,
     ) -> fdo::Result<()> {
         self.ensure_registered_sender(&header).await?;
+        self.mark_session_activity().await;
         if self.state_manager.get_ambient_light_enabled() != value {
             info!("ROOT DBus: ambient light setting updated to {}", value);
             self.state_manager.set_ambient_light_enabled(value).await;
@@ -423,6 +489,7 @@ impl RootStateInterface {
         #[zbus(header)] header: Header<'_>,
     ) -> fdo::Result<bool> {
         self.ensure_registered_sender(&header).await?;
+        self.mark_session_activity().await;
 
         let mut guard = self.apply_guard.lock().await;
         if guard.paused {
@@ -733,6 +800,18 @@ trait RootState {
 
     #[zbus(property)]
     fn display_apply_paused(&self) -> zbus::Result<bool>;
+
+    #[zbus(property)]
+    fn session_registered(&self) -> zbus::Result<bool>;
+
+    #[zbus(property)]
+    fn session_owner(&self) -> zbus::Result<String>;
+
+    #[zbus(property)]
+    fn session_id(&self) -> zbus::Result<u64>;
+
+    #[zbus(property)]
+    fn session_last_seen_usec(&self) -> zbus::Result<u64>;
 }
 
 async fn emit_keyboard_usb_connected_changed() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
@@ -1017,19 +1096,53 @@ async fn emit_display_brightness_changed() -> Result<bool, Box<dyn std::error::E
     Ok(handle.registered.load(Ordering::SeqCst))
 }
 
+async fn emit_session_registration_changed() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(handle) = get_root_handle().await else {
+        return Ok(false);
+    };
+
+    let iface_ref = handle
+        .connection
+        .object_server()
+        .interface::<_, RootStateInterface>(ROOT_DBUS_PATH)
+        .await?;
+    let iface = iface_ref.get().await;
+    let emitter = iface_ref.signal_emitter();
+    iface.session_registered_changed(&emitter).await?;
+    iface.session_owner_changed(&emitter).await?;
+    iface.session_id_changed(&emitter).await?;
+    iface
+        .session_last_seen_usec_changed(&emitter)
+        .await?;
+
+    Ok(handle.registered.load(Ordering::SeqCst))
+}
+
 async fn clear_registration_for_owner(owner: &str) {
     let Some(handle) = get_root_handle().await else {
         return;
     };
 
-    let mut registration = handle.registration.write().await;
-    if registration
-        .as_ref()
-        .is_some_and(|registered| registered.owner == owner)
-    {
-        info!("ROOT DBus: registered session owner {} disappeared", owner);
-        *registration = None;
-        handle.registered.store(false, Ordering::SeqCst);
+    let cleared = {
+        let mut registration = handle.registration.write().await;
+        if registration
+            .as_ref()
+            .is_some_and(|registered| registered.owner == owner)
+        {
+            info!("ROOT DBus: registered session owner {} disappeared", owner);
+            *registration = None;
+            handle.registered.store(false, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    };
+    if cleared {
+        if let Err(e) = emit_session_registration_changed().await {
+            warn!(
+                "clear_registration_for_owner: failed to emit session registration properties: {e}"
+            );
+        }
     }
 }
 
@@ -1550,6 +1663,18 @@ pub async fn query_root_state_for_cli() -> Result<Vec<(String, String)>, String>
         &mut rows,
         "display_apply_paused",
         proxy.display_apply_paused().await,
+    );
+    push_root_state_property(
+        &mut rows,
+        "session_registered",
+        proxy.session_registered().await,
+    );
+    push_root_state_property(&mut rows, "session_owner", proxy.session_owner().await);
+    push_root_state_property(&mut rows, "session_id", proxy.session_id().await);
+    push_root_state_property(
+        &mut rows,
+        "session_last_seen_usec",
+        proxy.session_last_seen_usec().await,
     );
 
     Ok(rows)
