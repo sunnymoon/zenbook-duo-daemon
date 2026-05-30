@@ -1,0 +1,17 @@
+/*
+ * Zenbook Duo Keyboard Battery — stylesheet
+ *
+ * Classes applied by extension.js:
+ *   .zenbook-kbd-battery-label   — percentage label in the top bar
+ *   .zenbook-kbd-battery-status  — status label inside the Quick Settings card
+ */
+
+.zenbook-kbd-battery-label {
+    font-size: 0.8em;
+    margin-left: 2px;
+    margin-right: 4px;
+}
+
+.zenbook-kbd-battery-status {
+    font-size: 0.9em;
+}

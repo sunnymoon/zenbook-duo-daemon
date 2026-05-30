@@ -1,0 +1,8 @@
+{
+    "uuid": "zenbook-duo@zenbook-duo-daemon",
+    "name": "Zenbook Duo Keyboard Battery",
+    "description": "Shows the Zenbook Duo detachable keyboard battery level and charging status in the GNOME Quick Settings panel.",
+    "shell-version": ["45", "46", "47", "48", "50"],
+    "version": 1,
+    "url": "https://github.com/sunnymoon/zenbook-duo-daemon"
+}
