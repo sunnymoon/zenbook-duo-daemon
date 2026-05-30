@@ -17,6 +17,7 @@ use crate::{
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use keyboard_bt::start_bt_keyboard_monitor_task;
+use keyboard_battery_bt::start_bt_battery_monitor_task;
 use log::{error, info, warn};
 
 #[derive(Parser, Debug)]
@@ -48,6 +49,24 @@ enum Args {
         #[command(subcommand)]
         cmd: ControlCmd,
     },
+}
+
+/// Internal panel for `control desired-primary-set`.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum DesiredPrimaryArg {
+    #[value(name = "eDP-1")]
+    Edp1,
+    #[value(name = "eDP-2")]
+    Edp2,
+}
+
+impl DesiredPrimaryArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Edp1 => "eDP-1",
+            Self::Edp2 => "eDP-2",
+        }
+    }
 }
 
 /// Backlight level for `control keyboard-backlight set`.
@@ -86,10 +105,20 @@ enum ControlCmd {
         #[arg(value_enum)]
         level: BacklightLevelArg,
     },
-    /// Toggle desired secondary display
+    /// Set desired primary internal panel (`eDP-1` or `eDP-2`); session reconciles with Mutter
+    DesiredPrimarySet {
+        #[arg(value_enum)]
+        primary: DesiredPrimaryArg,
+    },
+    /// Toggle desired secondary (bottom) internal display
     SecondaryDisplayToggle,
     /// Enable or disable desired secondary display (`true` / `false`)
     SecondaryDisplay {
+        #[arg(action = clap::ArgAction::Set, value_parser = clap::value_parser!(bool))]
+        on: bool,
+    },
+    /// Same as `secondary-display`; name matches D-Bus `DesiredSecondaryEnabled`
+    DesiredSecondaryEnabled {
         #[arg(action = clap::ArgAction::Set, value_parser = clap::value_parser!(bool))]
         on: bool,
     },
@@ -98,15 +127,18 @@ enum ControlCmd {
 mod config;
 mod dbus_state;
 mod polkit;
- mod events;
+mod events;
 mod idle_detection;
 mod keyboard_bt;
+mod keyboard_battery;
+mod keyboard_battery_bt;
 mod keyboard_usb;
 mod mute_state;
 mod secondary_display;
 mod secondary_coordinator;
 mod session;
 mod state;
+mod usb_keyboard_ports;
 mod virtual_keyboard;
 
 #[tokio::main(flavor = "current_thread")]
@@ -161,8 +193,13 @@ async fn main() {
                 ControlCmd::KeyboardBacklightSet { level } => {
                     OperatorCommand::SetKeyboardBacklightLevel(level.to_u8())
                 }
+                ControlCmd::DesiredPrimarySet { primary } => {
+                    OperatorCommand::SetDesiredPrimary(primary.as_str().to_string())
+                }
                 ControlCmd::SecondaryDisplayToggle => OperatorCommand::ToggleSecondaryDisplay,
-                ControlCmd::SecondaryDisplay { on } => OperatorCommand::SetSecondaryDisplay(on),
+                ControlCmd::SecondaryDisplay { on } | ControlCmd::DesiredSecondaryEnabled { on } => {
+                    OperatorCommand::SetSecondaryDisplay(on)
+                }
             };
             if let Err(e) = dbus_state::run_operator_command(op).await {
                 error!("{e}");
@@ -208,6 +245,8 @@ async fn migrate_config(config_path: PathBuf) {
 
 async fn run_daemon(config_path: PathBuf) {
     let config = Config::read(&config_path).await;
+    usb_keyboard_ports::init_pogo_devpaths(&config.usb_keyboard_ports);
+    usb_keyboard_ports::init_usb_keyboard_ids(config.vendor_id(), config.product_id());
 
     // Create event channel
     let (event_sender, _) = broadcast::channel::<Event>(64);
@@ -217,7 +256,13 @@ async fn run_daemon(config_path: PathBuf) {
 
     let (state_manager, activity_notifier, current_usb_keyboard) =
         if let Some(keyboard) = find_wired_keyboard(&config).await {
-            let state_manager = KeyboardStateManager::new(true, event_sender.clone()).await;
+            let pogo_docked = usb_keyboard_ports::keyboard_on_pogo_dock_async(
+                keyboard.bus_id(),
+                keyboard.device_address(),
+            )
+            .await;
+            let state_manager =
+                KeyboardStateManager::new(true, pogo_docked, event_sender.clone()).await;
             let activity_notifier = start_idle_detection_task(&config, state_manager.clone());
 
             let current_usb_keyboard = start_usb_keyboard_task(
@@ -227,11 +272,13 @@ async fn run_daemon(config_path: PathBuf) {
                 virtual_keyboard.clone(),
                 state_manager.clone(),
                 activity_notifier.clone(),
+                Some(pogo_docked),
             )
             .await;
             (state_manager, activity_notifier, Some(current_usb_keyboard))
         } else {
-            let state_manager = KeyboardStateManager::new(false, event_sender.clone()).await;
+            let state_manager =
+                KeyboardStateManager::new(false, false, event_sender.clone()).await;
             let activity_notifier = start_idle_detection_task(&config, state_manager.clone());
 
             (state_manager, activity_notifier, None)
@@ -255,6 +302,12 @@ async fn run_daemon(config_path: PathBuf) {
         process::exit(1);
     }
 
+    if state_manager.keyboard_battery_percentage().is_some()
+        && let Err(e) = dbus_state::notify_keyboard_battery_changed().await
+    {
+        warn!("Failed to publish keyboard battery loaded at startup: {e}");
+    }
+
     start_bt_keyboard_monitor_task(
         &config,
         event_sender.clone(),
@@ -262,6 +315,8 @@ async fn run_daemon(config_path: PathBuf) {
         state_manager.clone(),
         activity_notifier.clone(),
     );
+
+    start_bt_battery_monitor_task(state_manager.clone());
 
     start_usb_keyboard_monitor_task(
         &config,
@@ -282,33 +337,36 @@ async fn run_daemon(config_path: PathBuf) {
         tokio::spawn(async move {
             loop {
                 match event_rx.recv().await {
-                    Ok(Event::KeyboardAttached(attached)) => {
-                        info!("KeyboardAttached event: {}", attached);
+                    Ok(Event::KeyboardPogoDocked(docked)) => {
+                        info!("KeyboardPogoDocked event: {docked}");
                         secondary_display::pause_brightness_sync_for(Duration::from_secs(4));
 
-                        // On detach, write sysfs `on` BEFORE telling the session daemon.
-                        // The session daemon will ask GNOME to enable eDP-2 via DisplayConfig,
-                        // but GNOME can only see the connector once sysfs status = "on".
-                        if !attached {
+                        // On undock, write sysfs `on` BEFORE telling the session daemon.
+                        if !docked {
                             secondary_display::ensure_secondary_display_on().await;
                         }
 
-                        let (session_registered, acked) = dbus_state::notify_keyboard_attached_changed_wait(
-                            attached,
-                            Duration::from_secs(5),
-                        )
-                        .await;
+                        let (session_registered, acked) =
+                            dbus_state::notify_keyboard_pogo_docked_changed_wait(
+                                docked,
+                                Duration::from_secs(5),
+                            )
+                            .await;
 
                         if session_registered {
                             if acked {
-                                info!("KeyboardAttached: session daemon acknowledged request");
+                                info!("KeyboardPogoDocked: session daemon acknowledged request");
                             } else {
-                                warn!("KeyboardAttached: no session daemon ack, falling back to sysfs");
+                                warn!(
+                                    "KeyboardPogoDocked: no session daemon ack, falling back to sysfs"
+                                );
                                 secondary_display::arm_sysfs_fallback_once();
                                 state_manager_clone.emit_secondary_display_state();
                             }
                         } else {
-                            warn!("KeyboardAttached: no registered session daemon, falling back to sysfs");
+                            warn!(
+                                "KeyboardPogoDocked: no registered session daemon, falling back to sysfs"
+                            );
                             secondary_display::arm_sysfs_fallback_once();
                             state_manager_clone.emit_secondary_display_state();
                         }

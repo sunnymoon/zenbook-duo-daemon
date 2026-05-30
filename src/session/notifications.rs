@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -7,8 +7,10 @@ use log::{error, warn};
 use tokio::sync::broadcast;
 use tokio::sync::Mutex;
 use tokio::time::{interval_at, Duration, Instant, MissedTickBehavior};
-use zbus::fdo::ObjectManagerProxy;
 use zbus::{Connection, proxy, zvariant::Value};
+
+use crate::keyboard_battery::BATTERY_FULL_PCT_THRESHOLD;
+use crate::keyboard_battery_bt::find_keyboard_bluez_path;
 
 // ── D-Bus proxies ─────────────────────────────────────────────────────────────
 
@@ -51,7 +53,25 @@ trait RootState {
     fn desired_secondary_enabled(&self) -> zbus::Result<bool>;
 
     #[zbus(property)]
+    fn keyboard_usb_connected(&self) -> zbus::Result<bool>;
+
+    #[zbus(property)]
+    fn keyboard_pogo_docked(&self) -> zbus::Result<bool>;
+
+    #[zbus(property)]
     fn keyboard_attached(&self) -> zbus::Result<bool>;
+
+    #[zbus(property)]
+    fn keyboard_battery_present(&self) -> zbus::Result<bool>;
+
+    #[zbus(property)]
+    fn keyboard_battery_percentage(&self) -> zbus::Result<u8>;
+
+    #[zbus(property)]
+    fn keyboard_battery_charging(&self) -> zbus::Result<bool>;
+
+    #[zbus(property)]
+    fn keyboard_battery_full(&self) -> zbus::Result<bool>;
 }
 
 #[proxy(
@@ -310,43 +330,43 @@ pub async fn send_transient_notification(
 
 // ── Keyboard attach/detach notification text ──────────────────────────────────
 
-fn keyboard_notification_text(
-    attached: bool,
+fn pogo_dock_notification_text(
+    docked: bool,
     bluetooth_connected: bool,
     desired_primary: &str,
     desired_secondary_enabled: bool,
 ) -> (&'static str, String, &'static str) {
-    if attached {
+    if docked {
         let top_bar_moves = desired_primary == "eDP-2";
 
         let body = if desired_secondary_enabled {
             if top_bar_moves {
                 bullet_lines(&[
-                    "Keyboard attached on USB.",
+                    "Keyboard docked on the bottom panel.",
                     "Top bar will move temporarily to the top display.",
                     "Secondary display will turn off.",
                 ])
             } else {
                 bullet_lines(&[
-                    "Keyboard attached on USB.",
+                    "Keyboard docked on the bottom panel.",
                     "Top display stays primary.",
                     "Secondary display will turn off.",
                 ])
             }
         } else if top_bar_moves {
             bullet_lines(&[
-                "Keyboard attached on USB.",
+                "Keyboard docked on the bottom panel.",
                 "Top bar will move temporarily to the top display.",
                 "Secondary display remains off.",
             ])
         } else {
             bullet_lines(&[
-                "Keyboard attached on USB.",
+                "Keyboard docked on the bottom panel.",
                 "Top display stays primary.",
                 "Secondary display remains off.",
             ])
         };
-        ("Keyboard attached (USB)", body, "input-keyboard")
+        ("Keyboard docked", body, "input-keyboard")
     } else if bluetooth_connected {
         let body = if desired_secondary_enabled {
             if desired_primary == "eDP-2" {
@@ -368,22 +388,47 @@ fn keyboard_notification_text(
                 "Secondary display is still configured to stay off.",
             ])
         };
-        ("Keyboard detached (Bluetooth)", body, "input-keyboard-virtual")
+        ("Keyboard undocked (Bluetooth)", body, "input-keyboard-virtual")
     } else {
         let body = if desired_secondary_enabled {
             bullet_lines(&[
-                "Keyboard detached — Bluetooth not connected.",
+                "Keyboard undocked — Bluetooth not connected.",
                 "Secondary display is turning on.",
                 "Keyboard unavailable until Bluetooth reconnects.",
             ])
         } else {
             bullet_lines(&[
-                "Keyboard detached — Bluetooth not connected.",
+                "Keyboard undocked — Bluetooth not connected.",
                 "Keyboard unavailable until Bluetooth reconnects.",
             ])
         };
-        ("Keyboard detached (no Bluetooth)", body, "dialog-warning")
+        ("Keyboard undocked (no Bluetooth)", body, "dialog-warning")
     }
+}
+
+fn usb_charge_notification_text() -> (&'static str, String, &'static str) {
+    (
+        "Keyboard on USB",
+        bullet_lines(&[
+            "Side USB connected (charge / wired input).",
+            "Secondary display stays as configured.",
+        ]),
+        "input-keyboard",
+    )
+}
+
+/// Side-USB unplug (charge cable removed while undocked) — back to Bluetooth.
+fn side_usb_unplug_notification_text(
+    bluetooth_connected: bool,
+    desired_primary: &str,
+    desired_secondary_enabled: bool,
+) -> (&'static str, String, &'static str) {
+    pogo_dock_notification_text(
+        false,
+        bluetooth_connected,
+        desired_primary,
+        desired_secondary_enabled,
+    )
 }
 
 fn append_line_sep(base: &str, extra: &str) -> String {
@@ -392,7 +437,10 @@ fn append_line_sep(base: &str, extra: &str) -> String {
 
 // ── Keyboard attach/detach notification loop ──────────────────────────────────
 
-pub async fn run(mut kb_rx: broadcast::Receiver<bool>) {
+pub async fn run(
+    mut kb_usb_rx: broadcast::Receiver<bool>,
+    mut kb_pogo_rx: broadcast::Receiver<bool>,
+) {
     let conn = match Connection::session().await {
         Ok(c) => c,
         Err(e) => {
@@ -428,100 +476,215 @@ pub async fn run(mut kb_rx: broadcast::Receiver<bool>) {
         None
     };
 
-    let mut initialized = false;
-    let mut last_attached: Option<bool> = None;
+    let mut usb_initialized = false;
+    let mut pogo_initialized = false;
+    let mut last_usb: Option<bool> = None;
+    let mut last_pogo: Option<bool> = None;
+    // True while the keyboard is on side USB (undocked charge/data), not pogo dock.
+    let mut side_usb_session = false;
 
     loop {
-        match kb_rx.recv().await {
-            Ok(attached) => {
-                if !initialized {
-                    initialized = true;
-                    last_attached = Some(attached);
-                    continue;
-                }
+        tokio::select! {
+            msg = kb_usb_rx.recv() => match msg {
+                Ok(usb_connected) => {
+                    if !usb_initialized {
+                        usb_initialized = true;
+                        last_usb = Some(usb_connected);
+                        continue;
+                    }
+                    if last_usb == Some(usb_connected) {
+                        continue;
+                    }
+                    last_usb = Some(usb_connected);
 
-                if last_attached == Some(attached) {
-                    continue;
-                }
-                last_attached = Some(attached);
+                    // Allow root daemon time to resolve hub port (sysfs devpath race on hotplug).
+                    tokio::time::sleep(Duration::from_millis(400)).await;
 
-                if !attached {
-                    tokio::time::sleep(Duration::from_millis(2500)).await;
-                }
-
-                let (bluetooth_connected, desired_primary, desired_secondary_enabled) =
-                    match root_proxy.as_ref() {
-                        Some(p) => (
-                            p.bluetooth_connected().await.unwrap_or(false),
-                            p.desired_primary()
-                                .await
-                                .unwrap_or_else(|_| "eDP-1".to_string()),
-                            p.desired_secondary_enabled().await.unwrap_or(true),
-                        ),
-                        None => (false, "eDP-1".to_string(), true),
+                    let pogo_docked = match root_proxy.as_ref() {
+                        Some(p) => p.keyboard_pogo_docked().await.unwrap_or(false),
+                        None => false,
                     };
 
-                let (summary, mut body, icon) = if root_proxy.is_some() {
-                    keyboard_notification_text(
-                        attached,
-                        bluetooth_connected,
-                        &desired_primary,
-                        desired_secondary_enabled,
-                    )
-                } else if attached {
-                    (
-                        "Keyboard attached (USB)",
-                        bullet_lines(&[
-                            "Keyboard attached on USB.",
-                            "Secondary display will turn off.",
-                        ]),
-                        "input-keyboard",
-                    )
-                } else {
-                    (
-                        "Keyboard detached",
-                        bullet_lines(&[
-                            "Keyboard detached.",
-                            "Bluetooth state could not be confirmed.",
-                        ]),
-                        "dialog-warning",
-                    )
-                };
+                    if !usb_connected {
+                        if !side_usb_session {
+                            continue;
+                        }
+                        side_usb_session = false;
+                        tokio::time::sleep(Duration::from_millis(2500)).await;
 
-                if attached {
-                    let chain = keyboard_display_notif_state();
-                    let last = chain.lock().await.last_battery_pct;
-                    let pct_txt = last
-                        .map(|p| format!("{p}%"))
-                        .unwrap_or_else(|| "unknown".to_string());
-                    let extra = format!("charging (last battery level: {pct_txt}).");
-                    body = append_line_sep(&body, &format!("• {extra}"));
-                } else if let Some(sys) = system_conn.as_ref() {
-                    if bluetooth_connected {
-                        let pct = read_keyboard_battery_pct(sys).await;
-                        let pct_txt = pct
+                        let (bluetooth_connected, desired_primary, desired_secondary_enabled) =
+                            match root_proxy.as_ref() {
+                                Some(p) => (
+                                    p.bluetooth_connected().await.unwrap_or(false),
+                                    p.desired_primary()
+                                        .await
+                                        .unwrap_or_else(|_| "eDP-1".to_string()),
+                                    p.desired_secondary_enabled().await.unwrap_or(true),
+                                ),
+                                None => (false, "eDP-1".to_string(), true),
+                            };
+
+                        let (summary, mut body, icon) = side_usb_unplug_notification_text(
+                            bluetooth_connected,
+                            &desired_primary,
+                            desired_secondary_enabled,
+                        );
+
+                        if let Some(sys) = system_conn.as_ref() {
+                            if bluetooth_connected {
+                                let pct = read_keyboard_battery_pct(sys).await;
+                                let pct_txt = pct
+                                    .map(|p| format!("{p}%"))
+                                    .unwrap_or_else(|| "unknown".to_string());
+                                let extra =
+                                    format!("discharging (current battery level: {pct_txt}).");
+                                body = append_line_sep(&body, &format!("• {extra}"));
+                            }
+                        }
+
+                        if let Err(e) = notify_keyboard_display_transient_fresh(
+                            &notif,
+                            icon,
+                            summary,
+                            &body,
+                            urgency_hints(1),
+                            10_000,
+                        )
+                        .await
+                        {
+                            warn!("Failed to send side USB unplug notification: {e}");
+                        }
+                        continue;
+                    }
+
+                    if pogo_docked {
+                        side_usb_session = false;
+                        continue;
+                    }
+
+                    side_usb_session = true;
+
+                    let (summary, mut body, icon) = usb_charge_notification_text();
+                    if let Some(chain) = Some(keyboard_display_notif_state()) {
+                        let last = chain.lock().await.last_battery_pct;
+                        let pct_txt = last
                             .map(|p| format!("{p}%"))
                             .unwrap_or_else(|| "unknown".to_string());
-                        let extra = format!("discharging (current battery level: {pct_txt}).");
+                        let extra = format!("charging (last battery level: {pct_txt}).");
                         body = append_line_sep(&body, &format!("• {extra}"));
                     }
-                }
 
-                if let Err(e) = notify_keyboard_display_transient_fresh(
-                    &notif,
-                    icon,
-                    summary,
-                    &body,
-                    urgency_hints(1),
-                    10_000,
-                )
-                .await
-                {
-                    warn!("Failed to send notification: {e}");
+                    if let Err(e) = notify_keyboard_display_transient_fresh(
+                        &notif,
+                        icon,
+                        summary,
+                        &body,
+                        urgency_hints(1),
+                        10_000,
+                    )
+                    .await
+                    {
+                        warn!("Failed to send USB charge notification: {e}");
+                    }
                 }
-            }
-            Err(broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            msg = kb_pogo_rx.recv() => match msg {
+                Ok(docked) => {
+                    if !pogo_initialized {
+                        pogo_initialized = true;
+                        last_pogo = Some(docked);
+                        continue;
+                    }
+
+                    if last_pogo == Some(docked) {
+                        continue;
+                    }
+                    last_pogo = Some(docked);
+
+                    if docked {
+                        side_usb_session = false;
+                    }
+
+                    if !docked {
+                        tokio::time::sleep(Duration::from_millis(2500)).await;
+                    }
+
+                    let (bluetooth_connected, desired_primary, desired_secondary_enabled) =
+                        match root_proxy.as_ref() {
+                            Some(p) => (
+                                p.bluetooth_connected().await.unwrap_or(false),
+                                p.desired_primary()
+                                    .await
+                                    .unwrap_or_else(|_| "eDP-1".to_string()),
+                                p.desired_secondary_enabled().await.unwrap_or(true),
+                            ),
+                            None => (false, "eDP-1".to_string(), true),
+                        };
+
+                    let (summary, mut body, icon) = if root_proxy.is_some() {
+                        pogo_dock_notification_text(
+                            docked,
+                            bluetooth_connected,
+                            &desired_primary,
+                            desired_secondary_enabled,
+                        )
+                    } else if docked {
+                        (
+                            "Keyboard docked",
+                            bullet_lines(&[
+                                "Keyboard docked on the bottom panel.",
+                                "Secondary display will turn off.",
+                            ]),
+                            "input-keyboard",
+                        )
+                    } else {
+                        (
+                            "Keyboard undocked",
+                            bullet_lines(&[
+                                "Keyboard undocked.",
+                                "Bluetooth state could not be confirmed.",
+                            ]),
+                            "dialog-warning",
+                        )
+                    };
+
+                    if docked {
+                        let chain = keyboard_display_notif_state();
+                        let last = chain.lock().await.last_battery_pct;
+                        let pct_txt = last
+                            .map(|p| format!("{p}%"))
+                            .unwrap_or_else(|| "unknown".to_string());
+                        let extra = format!("charging (last battery level: {pct_txt}).");
+                        body = append_line_sep(&body, &format!("• {extra}"));
+                    } else if let Some(sys) = system_conn.as_ref() {
+                        if bluetooth_connected {
+                            let pct = read_keyboard_battery_pct(sys).await;
+                            let pct_txt = pct
+                                .map(|p| format!("{p}%"))
+                                .unwrap_or_else(|| "unknown".to_string());
+                            let extra = format!("discharging (current battery level: {pct_txt}).");
+                            body = append_line_sep(&body, &format!("• {extra}"));
+                        }
+                    }
+
+                    if let Err(e) = notify_keyboard_display_transient_fresh(
+                        &notif,
+                        icon,
+                        summary,
+                        &body,
+                        urgency_hints(1),
+                        10_000,
+                    )
+                    .await
+                    {
+                        warn!("Failed to send pogo dock notification: {e}");
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
         }
     }
 }
@@ -535,11 +698,16 @@ const BATTERY_WARN_PCT_LOW: u8 = 20;
 const BATTERY_WARN_PCT_VERY_LOW: u8 = 10;
 const BATTERY_WARN_PCT_CRITICAL: u8 = 5;
 
+const CHARGE_MILESTONE_PCT_HALF: u8 = 50;
+const CHARGE_MILESTONE_PCT_HIGH: u8 = 75;
+
 const BATTERY_EXPIRE_MS_CRITICAL: i32 = 120_000;
 const BATTERY_EXPIRE_MS_BELOW_10: i32 = 60_000;
 const BATTERY_EXPIRE_MS_BELOW_20: i32 = 60_000;
+const CHARGE_MILESTONE_EXPIRE_MS: i32 = 45_000;
+const CHARGE_FULL_EXPIRE_MS: i32 = 60_000;
 
-/// Poll BlueZ `Percentage` as a fallback when property-change signals are missed.
+/// Poll BlueZ / root D-Bus `Percentage` as a fallback when property-change signals are missed.
 const BATTERY_POLL_SECS: u64 = 60;
 
 #[derive(Clone, Default, Debug)]
@@ -561,6 +729,88 @@ impl KeyboardBatteryWarn {
             self.shown_below_20 = false;
         }
     }
+}
+
+#[derive(Clone, Default, Debug)]
+struct KeyboardBatteryChargeWarn {
+    shown_half: bool,
+    shown_high: bool,
+    shown_full: bool,
+}
+
+impl KeyboardBatteryChargeWarn {
+    fn reset_for_new_charge(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Rolling samples while side-USB charging for ETA text on milestone toasts.
+#[derive(Clone, Debug, Default)]
+struct ChargingRateTracker {
+    samples: VecDeque<(Instant, u8)>,
+}
+
+impl ChargingRateTracker {
+    fn reset(&mut self) {
+        self.samples.clear();
+    }
+
+    fn record(&mut self, pct: u8) {
+        let now = Instant::now();
+        if self.samples.back().is_some_and(|(_, p)| *p == pct) {
+            return;
+        }
+        self.samples.push_back((now, pct));
+        while self.samples.len() > 24 {
+            self.samples.pop_front();
+        }
+        while self
+            .samples
+            .front()
+            .is_some_and(|(t, _)| now.duration_since(*t) > Duration::from_secs(45 * 60))
+        {
+            self.samples.pop_front();
+        }
+    }
+
+    fn pct_per_minute(&self) -> Option<f64> {
+        let (t0, p0) = self.samples.front()?;
+        let (t1, p1) = self.samples.back()?;
+        if self.samples.len() < 2 {
+            return None;
+        }
+        let mins = t1.duration_since(*t0).as_secs_f64() / 60.0;
+        if mins < 1.0 {
+            return None;
+        }
+        let delta = f64::from(*p1) - f64::from(*p0);
+        if delta <= 0.0 {
+            return None;
+        }
+        Some(delta / mins)
+    }
+
+    fn eta_minutes_to(&self, current_pct: u8, target_pct: u8) -> Option<u32> {
+        if current_pct >= target_pct {
+            return Some(0);
+        }
+        let rate = self.pct_per_minute()?;
+        let remaining = f64::from(target_pct.saturating_sub(current_pct));
+        Some(((remaining / rate).ceil() as u32).max(1))
+    }
+}
+
+fn format_charge_eta_minutes(eta_mins: Option<u32>) -> String {
+    match eta_mins {
+        None => String::new(),
+        Some(0) => "Estimated time to full: less than a minute.".to_string(),
+        Some(1) => "Estimated time to full: about 1 minute.".to_string(),
+        Some(m) => format!("Estimated time to full: about {m} minutes."),
+    }
+}
+
+fn is_keyboard_battery_full(pct: u8, firmware_full: bool) -> bool {
+    firmware_full || pct >= BATTERY_FULL_PCT_THRESHOLD
 }
 
 /// Battery warnings while **USB detached** and keyboard on Bluetooth.
@@ -650,6 +900,137 @@ async fn maybe_emit_battery_warning_detached_bt(
     }
 }
 
+async fn maybe_emit_battery_charging_milestones(
+    notif: &NotificationsProxy<'_>,
+    pct: u8,
+    w: &mut KeyboardBatteryChargeWarn,
+    rate: &ChargingRateTracker,
+) {
+    if pct >= CHARGE_MILESTONE_PCT_HALF && !w.shown_half {
+        w.shown_half = true;
+        let eta = format_charge_eta_minutes(rate.eta_minutes_to(pct, 100));
+        let mut hints = urgency_hints(1);
+        hints.insert(
+            "image-path",
+            Value::from("battery-medium-charging-symbolic"),
+        );
+        let mut lines = vec![
+            format!("Keyboard battery at <b>{pct}%</b> while charging on USB."),
+        ];
+        if !eta.is_empty() {
+            lines.push(eta);
+        }
+        let _ = notify_keyboard_display_transient_fresh(
+            notif,
+            "battery-medium-charging-symbolic",
+            "Keyboard charging — 50%",
+            &bullet_lines(&lines.iter().map(String::as_str).collect::<Vec<_>>()),
+            hints,
+            CHARGE_MILESTONE_EXPIRE_MS,
+        )
+        .await;
+    }
+
+    if pct >= CHARGE_MILESTONE_PCT_HIGH && !w.shown_high {
+        w.shown_high = true;
+        let eta = format_charge_eta_minutes(rate.eta_minutes_to(pct, 100));
+        let mut hints = urgency_hints(1);
+        hints.insert("image-path", Value::from("battery-good-charging-symbolic"));
+        let mut lines = vec![
+            format!("Keyboard battery at <b>{pct}%</b> while charging on USB."),
+        ];
+        if !eta.is_empty() {
+            lines.push(eta);
+        }
+        let _ = notify_keyboard_display_transient_fresh(
+            notif,
+            "battery-good-charging-symbolic",
+            "Keyboard charging — 75%",
+            &bullet_lines(&lines.iter().map(String::as_str).collect::<Vec<_>>()),
+            hints,
+            CHARGE_MILESTONE_EXPIRE_MS,
+        )
+        .await;
+    }
+}
+
+async fn maybe_emit_battery_full_charged(
+    notif: &NotificationsProxy<'_>,
+    pct: u8,
+    w: &mut KeyboardBatteryChargeWarn,
+) {
+    if w.shown_full {
+        return;
+    }
+    w.shown_full = true;
+    w.shown_half = true;
+    w.shown_high = true;
+
+    let body = if pct >= 100 {
+        bullet_lines(&[
+            "Keyboard battery is fully charged.",
+            "You can unplug the side USB cable and use Bluetooth again.",
+        ])
+    } else {
+        bullet_lines(&[
+            &format!(
+                "Keyboard battery is at <b>{pct}%</b> — the highest level this pack reports when full."
+            ),
+            "You can unplug the side USB cable and use Bluetooth again.",
+        ])
+    };
+
+    let mut hints = urgency_hints(1);
+    hints.insert("image-path", Value::from("battery-full-charged-symbolic"));
+    let _ = notify_keyboard_display_transient_fresh(
+        notif,
+        "battery-full-charged",
+        "Keyboard battery full",
+        &body,
+        hints,
+        CHARGE_FULL_EXPIRE_MS,
+    )
+    .await;
+}
+
+async fn on_usb_battery_update(
+    notif: &NotificationsProxy<'_>,
+    pct: u8,
+    charging: bool,
+    firmware_full: bool,
+    last_pct: &mut u8,
+    was_below_full: &mut bool,
+    bw_charge: &mut KeyboardBatteryChargeWarn,
+    rate: &mut ChargingRateTracker,
+) -> bool {
+    if pct == *last_pct && !firmware_full {
+        return true;
+    }
+    *last_pct = pct;
+
+    {
+        let chain = keyboard_display_notif_state();
+        let mut st = chain.lock().await;
+        st.last_battery_pct = Some(pct);
+    }
+
+    if charging {
+        rate.record(pct);
+        maybe_emit_battery_charging_milestones(notif, pct, bw_charge, rate).await;
+    }
+
+    let full = is_keyboard_battery_full(pct, firmware_full);
+    if full {
+        if *was_below_full {
+            *was_below_full = false;
+            maybe_emit_battery_full_charged(notif, pct, bw_charge).await;
+        }
+    } else if pct < BATTERY_FULL_PCT_THRESHOLD {
+        *was_below_full = true;
+    }
+    false
+}
+
 async fn on_battery_pct_update(
     notif: &NotificationsProxy<'_>,
     pct: u8,
@@ -674,62 +1055,50 @@ async fn on_battery_pct_update(
         maybe_emit_battery_warning_detached_bt(notif, pct, w).await;
     }
 
-    if pct < 100 {
+    if pct < BATTERY_FULL_PCT_THRESHOLD {
         *was_below_full = true;
     }
-    if pct == 100 && *was_below_full {
+    if pct >= BATTERY_FULL_PCT_THRESHOLD && *was_below_full {
         *was_below_full = false;
+        let summary = if pct >= 100 {
+            "Keyboard battery full"
+        } else {
+            "Keyboard battery full"
+        };
+        let body = if pct >= 100 {
+            bullet_lines(&[
+                "Keyboard battery is fully charged.",
+                "You can unplug the side USB cable and use Bluetooth again.",
+            ])
+        } else {
+            bullet_lines(&[
+                &format!(
+                    "Keyboard battery is at <b>{pct}%</b> — the highest level this pack reports when full."
+                ),
+                "You can unplug the side USB cable and use Bluetooth again.",
+            ])
+        };
         let _ = notify_keyboard_display_transient_fresh(
             notif,
             "battery-full-charged",
-            "Keyboard battery full",
-            "Keyboard battery is fully charged.\u{2028}\
-             You can detach it from USB.",
+            summary,
+            &body,
             urgency_hints(1),
-            4_000,
+            CHARGE_FULL_EXPIRE_MS,
         )
         .await;
     }
     false
 }
 
-async fn find_keyboard_bluez_path(conn: &Connection) -> Option<String> {
-    let manager = ObjectManagerProxy::builder(conn)
-        .destination("org.bluez")
-        .ok()?
-        .path("/")
-        .ok()?
-        .build()
-        .await
-        .ok()?;
-
-    let objects = manager.get_managed_objects().await.ok()?;
-
-    for (path, ifaces) in &objects {
-        if !ifaces.contains_key("org.bluez.Battery1") {
-            continue;
-        }
-        let is_keyboard = ifaces
-            .get("org.bluez.Device1")
-            .and_then(|props| props.get("Name"))
-            .and_then(|v| v.downcast_ref::<zbus::zvariant::Str>().ok())
-            .map(|name| {
-                let n = name.as_str().to_uppercase();
-                n.contains("ASUS") || n.contains("KEYBOARD")
-            })
-            .unwrap_or(false);
-
-        if is_keyboard {
-            return Some(path.to_string());
-        }
-    }
-    None
-}
-
 pub async fn run_battery_monitor() {
-    let mut bw = KeyboardBatteryWarn::default();
+    let mut bw_discharge = KeyboardBatteryWarn::default();
+    let mut bw_charge = KeyboardBatteryChargeWarn::default();
+    let mut rate = ChargingRateTracker::default();
     loop {
-        if let Err(e) = battery_monitor_inner(&mut bw).await {
+        if let Err(e) =
+            battery_monitor_inner(&mut bw_discharge, &mut bw_charge, &mut rate).await
+        {
             warn!("Battery monitor: {e}, retrying in 15s");
         }
         tokio::time::sleep(Duration::from_secs(15)).await;
@@ -737,28 +1106,143 @@ pub async fn run_battery_monitor() {
 }
 
 async fn battery_monitor_inner(
-    bw: &mut KeyboardBatteryWarn,
+    bw_discharge: &mut KeyboardBatteryWarn,
+    bw_charge: &mut KeyboardBatteryChargeWarn,
+    rate: &mut ChargingRateTracker,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let system_conn = Connection::system().await?;
     let session_conn = Connection::session().await?;
     let notif = NotificationsProxy::new(&session_conn).await?;
+    let root_proxy = RootStateProxy::new(&system_conn).await?;
 
-    let root_proxy = RootStateProxy::new(&system_conn).await.ok();
+    loop {
+        let usb = root_proxy.keyboard_usb_connected().await.unwrap_or(false);
+        if usb {
+            monitor_usb_keyboard_battery(&root_proxy, &notif, bw_charge, rate).await?;
+        } else {
+            rate.reset();
+            monitor_bluetooth_keyboard_battery(
+                &system_conn,
+                &notif,
+                &root_proxy,
+                bw_discharge,
+            )
+            .await?;
+        }
+    }
+}
 
+async fn monitor_usb_keyboard_battery(
+    root_proxy: &RootStateProxy<'_>,
+    notif: &NotificationsProxy<'_>,
+    bw_charge: &mut KeyboardBatteryChargeWarn,
+    rate: &mut ChargingRateTracker,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut last_pct: u8 = 0;
+    let mut was_below_full = true;
+
+    if root_proxy.keyboard_battery_present().await.unwrap_or(false) {
+        let pct = root_proxy.keyboard_battery_percentage().await.unwrap_or(0);
+        let charging = root_proxy.keyboard_battery_charging().await.unwrap_or(false);
+        let full = root_proxy.keyboard_battery_full().await.unwrap_or(false);
+        last_pct = pct;
+        was_below_full = !is_keyboard_battery_full(pct, full);
+        if pct < CHARGE_MILESTONE_PCT_HALF {
+            bw_charge.reset_for_new_charge();
+        }
+        rate.reset();
+        if charging {
+            rate.record(pct);
+        }
+        let _ = on_usb_battery_update(
+            notif,
+            pct,
+            charging,
+            full,
+            &mut last_pct,
+            &mut was_below_full,
+            bw_charge,
+            rate,
+        )
+        .await;
+    } else {
+        bw_charge.reset_for_new_charge();
+        rate.reset();
+    }
+
+    let mut pct_stream = root_proxy
+        .receive_keyboard_battery_percentage_changed()
+        .await;
+    let mut charging_stream = root_proxy
+        .receive_keyboard_battery_charging_changed()
+        .await;
+    let mut full_stream = root_proxy.receive_keyboard_battery_full_changed().await;
+    let mut usb_stream = root_proxy.receive_keyboard_usb_connected_changed().await;
+    let mut pct_poll = interval_at(
+        Instant::now() + Duration::from_secs(BATTERY_POLL_SECS),
+        Duration::from_secs(BATTERY_POLL_SECS),
+    );
+    pct_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    loop {
+        if !root_proxy.keyboard_usb_connected().await.unwrap_or(false) {
+            return Ok(());
+        }
+
+        tokio::select! {
+            _ = pct_stream.next() => {}
+            _ = charging_stream.next() => {}
+            _ = full_stream.next() => {}
+            _ = usb_stream.next() => {
+                if !root_proxy.keyboard_usb_connected().await.unwrap_or(false) {
+                    return Ok(());
+                }
+            }
+            _ = pct_poll.tick() => {}
+        }
+
+        if !root_proxy.keyboard_battery_present().await.unwrap_or(false) {
+            continue;
+        }
+
+        let pct = root_proxy.keyboard_battery_percentage().await.unwrap_or(last_pct);
+        let charging = root_proxy.keyboard_battery_charging().await.unwrap_or(false);
+        let full = root_proxy.keyboard_battery_full().await.unwrap_or(false);
+
+        let _ = on_usb_battery_update(
+            notif,
+            pct,
+            charging,
+            full,
+            &mut last_pct,
+            &mut was_below_full,
+            bw_charge,
+            rate,
+        )
+        .await;
+    }
+}
+
+async fn monitor_bluetooth_keyboard_battery(
+    system_conn: &Connection,
+    notif: &NotificationsProxy<'_>,
+    root_proxy: &RootStateProxy<'_>,
+    bw_discharge: &mut KeyboardBatteryWarn,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let device_path = loop {
-        if let Some(p) = find_keyboard_bluez_path(&system_conn).await {
+        if let Some(p) = find_keyboard_bluez_path(system_conn).await {
             break p;
         }
         tokio::time::sleep(Duration::from_secs(10)).await;
     };
 
-    let battery_proxy = BlueZBatteryProxy::builder(&system_conn)
+    let battery_proxy = BlueZBatteryProxy::builder(system_conn)
         .destination("org.bluez")?
         .path(device_path.as_str())?
         .build()
         .await?;
 
-    let device_proxy = BlueZDeviceProxy::builder(&system_conn)
+    let device_proxy = BlueZDeviceProxy::builder(system_conn)
         .destination("org.bluez")?
         .path(device_path.as_str())?
         .build()
@@ -766,23 +1250,13 @@ async fn battery_monitor_inner(
 
     let mut last_pct: u8;
     let mut was_below_full: bool;
-    let mut prev_usb_attached: bool = false;
 
     match battery_proxy.percentage().await {
         Ok(pct) => {
             last_pct = pct;
-            was_below_full = pct < 100;
-            let usb = match root_proxy.as_ref() {
-                Some(p) => p.keyboard_attached().await.unwrap_or(false),
-                None => false,
-            };
-            if usb {
-                prev_usb_attached = true;
-            } else {
-                prev_usb_attached = false;
-                bw.clear_recovered(pct);
-                maybe_emit_battery_warning_detached_bt(&notif, pct, bw).await;
-            }
+            was_below_full = pct < BATTERY_FULL_PCT_THRESHOLD;
+            bw_discharge.clear_recovered(pct);
+            maybe_emit_battery_warning_detached_bt(notif, pct, bw_discharge).await;
             {
                 let chain = keyboard_display_notif_state();
                 let mut st = chain.lock().await;
@@ -804,18 +1278,9 @@ async fn battery_monitor_inner(
     pct_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
-        let usb_attached = match root_proxy.as_ref() {
-            Some(p) => p.keyboard_attached().await.unwrap_or(false),
-            None => false,
-        };
-
-        if usb_attached && !prev_usb_attached {
-            *bw = KeyboardBatteryWarn::default();
-            let chain = keyboard_display_notif_state();
-            let mut st = chain.lock().await;
-            st.had_battery_tier_while_usb_detached = false;
+        if root_proxy.keyboard_usb_connected().await.unwrap_or(false) {
+            return Ok(());
         }
-        prev_usb_attached = usb_attached;
 
         tokio::select! {
             Some(change) = battery_stream.next() => {
@@ -823,14 +1288,14 @@ async fn battery_monitor_inner(
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                if on_battery_pct_update(&notif, pct, &mut last_pct, &mut was_below_full, bw, usb_attached).await {
+                if on_battery_pct_update(notif, pct, &mut last_pct, &mut was_below_full, bw_discharge, false).await {
                     continue;
                 }
             }
 
             _ = pct_poll.tick() => {
                 let pct = battery_proxy.percentage().await.unwrap_or(last_pct);
-                let _ = on_battery_pct_update(&notif, pct, &mut last_pct, &mut was_below_full, bw, usb_attached).await;
+                let _ = on_battery_pct_update(notif, pct, &mut last_pct, &mut was_below_full, bw_discharge, false).await;
             }
 
             Some(change) = connected_stream.next() => {
@@ -843,10 +1308,7 @@ async fn battery_monitor_inner(
                     return Ok(());
                 }
 
-                let usb_attached_now = match root_proxy.as_ref() {
-                    Some(p) => p.keyboard_attached().await.unwrap_or(false),
-                    None => false,
-                };
+                let usb_attached_now = root_proxy.keyboard_usb_connected().await.unwrap_or(false);
 
                 if !usb_attached_now {
                     let (had_tier, last_known) = {
@@ -863,7 +1325,7 @@ async fn battery_monitor_inner(
                             &format!("Last known battery percentage: {pct_txt}."),
                         ]);
                         let _ = notify_keyboard_display_chain(
-                            &notif,
+                            notif,
                             "dialog-warning",
                             "Bluetooth keyboard disconnected",
                             &body,
@@ -878,7 +1340,7 @@ async fn battery_monitor_inner(
                             "Attach it via USB to check or recharge.",
                         ]);
                         let _ = notify_keyboard_display_transient_fresh(
-                            &notif,
+                            notif,
                             "dialog-warning",
                             "Keyboard disconnected",
                             &body,

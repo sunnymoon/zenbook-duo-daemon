@@ -31,7 +31,7 @@ struct DisplayApplyGuard {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum AckEvent {
-    KeyboardAttached(bool),
+    KeyboardPogoDocked(bool),
     DesiredSecondaryApplied(bool),
 }
 
@@ -153,6 +153,7 @@ pub enum OperatorCommand {
     ToggleKeyboardBacklight,
     /// 0 = off, 1 = low, 2 = medium, 3 = high
     SetKeyboardBacklightLevel(u8),
+    SetDesiredPrimary(String),
     ToggleSecondaryDisplay,
     SetSecondaryDisplay(bool),
 }
@@ -160,13 +161,62 @@ pub enum OperatorCommand {
 #[zbus::interface(name = "asus.zenbook.duo.State")]
 impl RootStateInterface {
     #[zbus(property)]
+    fn keyboard_usb_connected(&self) -> bool {
+        self.state_manager.is_usb_keyboard_connected()
+    }
+
+    #[zbus(property)]
+    fn keyboard_pogo_docked(&self) -> bool {
+        self.state_manager.is_keyboard_pogo_docked()
+    }
+
+    /// Backward-compatible alias: **pogo dock on bottom panel**, not side USB charge.
+    #[zbus(property)]
     fn keyboard_attached(&self) -> bool {
-        self.state_manager.is_usb_keyboard_attached()
+        self.state_manager.is_keyboard_pogo_docked()
     }
 
     #[zbus(property)]
     fn bluetooth_connected(&self) -> bool {
         self.state_manager.is_bluetooth_connected()
+    }
+
+    /// `true` when battery level is known (USB vendor report or BlueZ `Battery1`).
+    #[zbus(property)]
+    fn keyboard_battery_present(&self) -> bool {
+        self.state_manager.keyboard_battery_percentage().is_some()
+    }
+
+    /// 0–100 when [`Self::keyboard_battery_present`] is true; otherwise 0.
+    #[zbus(property)]
+    fn keyboard_battery_percentage(&self) -> u8 {
+        self.state_manager
+            .keyboard_battery_percentage()
+            .unwrap_or(0)
+    }
+
+    /// Side-USB charge in progress (from vendor `0x5a 0x3d` status byte); always false on Bluetooth.
+    #[zbus(property)]
+    fn keyboard_battery_charging(&self) -> bool {
+        self.state_manager.is_keyboard_battery_charging()
+    }
+
+    /// Full on USB (firmware flag or SOC ≥ threshold) or on Bluetooth when SOC ≥ threshold.
+    #[zbus(property)]
+    fn keyboard_battery_full(&self) -> bool {
+        self.state_manager.is_keyboard_battery_full()
+    }
+
+    /// Microphone mute LED on the keyboard (synced with PulseAudio default source mute when available).
+    #[zbus(property)]
+    fn mic_mute_led(&self) -> bool {
+        self.state_manager.get_mic_mute_led()
+    }
+
+    /// Keyboard backlight level: 0 = off, 1 = low, 2 = medium, 3 = high.
+    #[zbus(property)]
+    fn keyboard_backlight_level(&self) -> u8 {
+        self.state_manager.get_keyboard_backlight().level()
     }
 
     #[zbus(property)]
@@ -284,14 +334,23 @@ impl RootStateInterface {
         Ok(())
     }
 
-    async fn acknowledge_keyboard_attached(
+    async fn acknowledge_keyboard_pogo_docked(
         &self,
         value: bool,
         #[zbus(header)] header: Header<'_>,
     ) -> fdo::Result<()> {
         self.ensure_registered_sender(&header).await?;
-        let _ = self.ack_tx.send(AckEvent::KeyboardAttached(value));
+        let _ = self.ack_tx.send(AckEvent::KeyboardPogoDocked(value));
         Ok(())
+    }
+
+    /// Deprecated alias for [`Self::acknowledge_keyboard_pogo_docked`].
+    async fn acknowledge_keyboard_attached(
+        &self,
+        value: bool,
+        #[zbus(header)] header: Header<'_>,
+    ) -> fdo::Result<()> {
+        self.acknowledge_keyboard_pogo_docked(value, header).await
     }
 
     async fn acknowledge_desired_secondary_applied(
@@ -448,6 +507,38 @@ impl RootStateInterface {
         Ok(())
     }
 
+    async fn set_desired_primary(
+        &self,
+        primary: String,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+    ) -> fdo::Result<()> {
+        self.require_operator(&header, connection).await?;
+        if let Err(e) = crate::state::validate_desired_primary(&primary) {
+            return Err(fdo::Error::Failed(e));
+        }
+        if self.state_manager.get_desired_primary().as_deref() == Some(primary.as_str()) {
+            return Ok(());
+        }
+        crate::secondary_display::pause_brightness_sync_for(std::time::Duration::from_secs(4));
+        self.state_manager.set_desired_primary(&primary).await;
+        info!("Operator: desired_primary set to {primary}");
+        match notify_desired_primary_changed().await {
+            Ok(true) => {
+                info!("Published desired_primary={primary} (session registered)");
+            }
+            Ok(false) => {
+                warn!(
+                    "Persisted desired_primary={primary}; no session registered yet — apply when GNOME session connects"
+                );
+            }
+            Err(e) => {
+                warn!("Failed to publish desired_primary update: {e}");
+            }
+        }
+        Ok(())
+    }
+
     async fn set_secondary_display_desired(
         &self,
         enabled: bool,
@@ -459,6 +550,17 @@ impl RootStateInterface {
             .await;
         Ok(())
     }
+
+    /// Same as [`Self::set_secondary_display_desired`]; name matches D-Bus property `DesiredSecondaryEnabled`.
+    async fn set_desired_secondary_enabled(
+        &self,
+        enabled: bool,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+    ) -> fdo::Result<()> {
+        self.set_secondary_display_desired(enabled, header, connection)
+            .await
+    }
 }
 
 #[proxy(
@@ -468,6 +570,7 @@ impl RootStateInterface {
 )]
 trait RootState {
     fn register_session(&self, session_id: u64) -> zbus::Result<()>;
+    fn acknowledge_keyboard_pogo_docked(&self, value: bool) -> zbus::Result<()>;
     fn acknowledge_keyboard_attached(&self, value: bool) -> zbus::Result<()>;
     fn acknowledge_desired_secondary_applied(&self, value: bool) -> zbus::Result<()>;
     fn acknowledge_secondary_sysfs_poweroff_ready(&self) -> zbus::Result<()>;
@@ -479,14 +582,40 @@ trait RootState {
     fn set_mic_mute_led(&self, enabled: bool) -> zbus::Result<()>;
     fn toggle_keyboard_backlight(&self) -> zbus::Result<()>;
     fn set_keyboard_backlight_level(&self, level: u8) -> zbus::Result<()>;
+    fn set_desired_primary(&self, primary: String) -> zbus::Result<()>;
     fn toggle_secondary_display(&self) -> zbus::Result<()>;
     fn set_secondary_display_desired(&self, enabled: bool) -> zbus::Result<()>;
+    fn set_desired_secondary_enabled(&self, enabled: bool) -> zbus::Result<()>;
+
+    #[zbus(property)]
+    fn keyboard_usb_connected(&self) -> zbus::Result<bool>;
+
+    #[zbus(property)]
+    fn keyboard_pogo_docked(&self) -> zbus::Result<bool>;
 
     #[zbus(property)]
     fn keyboard_attached(&self) -> zbus::Result<bool>;
 
     #[zbus(property)]
     fn bluetooth_connected(&self) -> zbus::Result<bool>;
+
+    #[zbus(property)]
+    fn keyboard_battery_present(&self) -> zbus::Result<bool>;
+
+    #[zbus(property)]
+    fn keyboard_battery_percentage(&self) -> zbus::Result<u8>;
+
+    #[zbus(property)]
+    fn keyboard_battery_charging(&self) -> zbus::Result<bool>;
+
+    #[zbus(property)]
+    fn keyboard_battery_full(&self) -> zbus::Result<bool>;
+
+    #[zbus(property)]
+    fn mic_mute_led(&self) -> zbus::Result<bool>;
+
+    #[zbus(property)]
+    fn keyboard_backlight_level(&self) -> zbus::Result<u8>;
 
     #[zbus(property)]
     fn desired_primary(&self) -> zbus::Result<String>;
@@ -510,7 +639,7 @@ trait RootState {
     fn display_apply_paused(&self) -> zbus::Result<bool>;
 }
 
-async fn emit_keyboard_attached_changed() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+async fn emit_keyboard_usb_connected_changed() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let Some(handle) = get_root_handle().await else {
         return Ok(false);
     };
@@ -523,10 +652,123 @@ async fn emit_keyboard_attached_changed() -> Result<bool, Box<dyn std::error::Er
     iface_ref
         .get()
         .await
+        .keyboard_usb_connected_changed(iface_ref.signal_emitter())
+        .await?;
+
+    Ok(handle.registered.load(Ordering::SeqCst))
+}
+
+async fn emit_keyboard_pogo_docked_changed() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(handle) = get_root_handle().await else {
+        return Ok(false);
+    };
+
+    let iface_ref = handle
+        .connection
+        .object_server()
+        .interface::<_, RootStateInterface>(ROOT_DBUS_PATH)
+        .await?;
+    iface_ref
+        .get()
+        .await
+        .keyboard_pogo_docked_changed(iface_ref.signal_emitter())
+        .await?;
+    iface_ref
+        .get()
+        .await
         .keyboard_attached_changed(iface_ref.signal_emitter())
         .await?;
 
     Ok(handle.registered.load(Ordering::SeqCst))
+}
+
+pub async fn notify_keyboard_usb_connected_changed(
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    emit_keyboard_usb_connected_changed().await
+}
+
+pub async fn notify_keyboard_pogo_docked_changed(
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    emit_keyboard_pogo_docked_changed().await
+}
+
+async fn emit_keyboard_battery_changed() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(handle) = get_root_handle().await else {
+        return Ok(false);
+    };
+
+    let iface_ref = handle
+        .connection
+        .object_server()
+        .interface::<_, RootStateInterface>(ROOT_DBUS_PATH)
+        .await?;
+    let iface = iface_ref.get().await;
+    let emitter = iface_ref.signal_emitter();
+    iface
+        .keyboard_battery_present_changed(&emitter)
+        .await?;
+    iface
+        .keyboard_battery_percentage_changed(&emitter)
+        .await?;
+    iface
+        .keyboard_battery_charging_changed(&emitter)
+        .await?;
+    iface.keyboard_battery_full_changed(&emitter).await?;
+
+    Ok(handle.registered.load(Ordering::SeqCst))
+}
+
+pub async fn notify_keyboard_battery_changed(
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    emit_keyboard_battery_changed().await
+}
+
+async fn emit_mic_mute_led_changed() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(handle) = get_root_handle().await else {
+        return Ok(false);
+    };
+
+    let iface_ref = handle
+        .connection
+        .object_server()
+        .interface::<_, RootStateInterface>(ROOT_DBUS_PATH)
+        .await?;
+    iface_ref
+        .get()
+        .await
+        .mic_mute_led_changed(iface_ref.signal_emitter())
+        .await?;
+
+    Ok(handle.registered.load(Ordering::SeqCst))
+}
+
+pub async fn notify_mic_mute_led_changed(
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    emit_mic_mute_led_changed().await
+}
+
+async fn emit_keyboard_backlight_changed() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(handle) = get_root_handle().await else {
+        return Ok(false);
+    };
+
+    let iface_ref = handle
+        .connection
+        .object_server()
+        .interface::<_, RootStateInterface>(ROOT_DBUS_PATH)
+        .await?;
+    iface_ref
+        .get()
+        .await
+        .keyboard_backlight_level_changed(iface_ref.signal_emitter())
+        .await?;
+
+    Ok(handle.registered.load(Ordering::SeqCst))
+}
+
+pub async fn notify_keyboard_backlight_changed(
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    emit_keyboard_backlight_changed().await
 }
 
 async fn emit_bluetooth_connected_changed() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
@@ -732,14 +974,30 @@ async fn watch_prepare_for_sleep(
             state_manager.suspend_end();
             activity_notifier.notify();
 
-            let current_usb_attached =
-                crate::keyboard_usb::find_wired_keyboard(&config).await.is_some();
-            let reported_attached = state_manager.is_usb_keyboard_attached();
-            if current_usb_attached != reported_attached {
-                info!(
-                    "Post-resume keyboard state mismatch: usb_attached={current_usb_attached}, reported={reported_attached} — updating state"
-                );
-                state_manager.set_usb_keyboard_attached(current_usb_attached);
+            match crate::keyboard_usb::find_wired_keyboard(&config).await {
+                Some(keyboard) => {
+                    let pogo = crate::usb_keyboard_ports::keyboard_on_pogo_dock_async(
+                        keyboard.bus_id(),
+                        keyboard.device_address(),
+                    )
+                    .await;
+                    let usb = state_manager.is_usb_keyboard_connected();
+                    let docked = state_manager.is_keyboard_pogo_docked();
+                    if !usb || pogo != docked {
+                        info!(
+                            "Post-resume keyboard state mismatch: usb_connected=true pogo_docked={pogo} (was usb={usb} pogo={docked}) — updating"
+                        );
+                        state_manager.set_usb_keyboard_connection(true, pogo);
+                    }
+                }
+                None => {
+                    if state_manager.is_usb_keyboard_connected()
+                        || state_manager.is_keyboard_pogo_docked()
+                    {
+                        info!("Post-resume: no USB keyboard enumerated — clearing connection state");
+                        state_manager.set_usb_keyboard_connection(false, false);
+                    }
+                }
             }
         }
     }
@@ -819,29 +1077,29 @@ async fn recv_matching_ack(
     .unwrap_or(false)
 }
 
-/// Subscribe to the root ACK broadcast **before** emitting `keyboard_attached` so a fast session
-/// `acknowledge_keyboard_attached` is not missed (late `broadcast` subscribers do not see past sends).
+/// Subscribe to the root ACK broadcast **before** emitting `keyboard_pogo_docked` so a fast session
+/// `acknowledge_keyboard_pogo_docked` is not missed (late `broadcast` subscribers do not see past sends).
 ///
 /// Returns `(registered_with_root, ack_received)`.
-pub async fn notify_keyboard_attached_changed_wait(
-    attached: bool,
+pub async fn notify_keyboard_pogo_docked_changed_wait(
+    docked: bool,
     timeout: Duration,
 ) -> (bool, bool) {
     let mut rx = match get_root_handle().await {
         Some(h) => h.ack_tx.subscribe(),
         None => return (false, false),
     };
-    let registered = match emit_keyboard_attached_changed().await {
+    let registered = match emit_keyboard_pogo_docked_changed().await {
         Ok(v) => v,
         Err(e) => {
-            warn!("KeyboardAttached: emit keyboard_attached_changed failed: {e}");
+            warn!("KeyboardPogoDocked: emit keyboard_pogo_docked_changed failed: {e}");
             false
         }
     };
     if !registered {
         return (false, false);
     }
-    let acked = recv_matching_ack(&mut rx, AckEvent::KeyboardAttached(attached), timeout).await;
+    let acked = recv_matching_ack(&mut rx, AckEvent::KeyboardPogoDocked(docked), timeout).await;
     (true, acked)
 }
 
@@ -1063,11 +1321,47 @@ pub async fn query_root_state_for_cli() -> Result<Vec<(String, String)>, String>
         .map_err(|e| format!("cannot attach to {}: {e}", ROOT_DBUS_SERVICE))?;
 
     let mut rows = Vec::new();
+    push_root_state_property(
+        &mut rows,
+        "keyboard_usb_connected",
+        proxy.keyboard_usb_connected().await,
+    );
+    push_root_state_property(
+        &mut rows,
+        "keyboard_pogo_docked",
+        proxy.keyboard_pogo_docked().await,
+    );
     push_root_state_property(&mut rows, "keyboard_attached", proxy.keyboard_attached().await);
     push_root_state_property(
         &mut rows,
         "bluetooth_connected",
         proxy.bluetooth_connected().await,
+    );
+    push_root_state_property(
+        &mut rows,
+        "keyboard_battery_present",
+        proxy.keyboard_battery_present().await,
+    );
+    push_root_state_property(
+        &mut rows,
+        "keyboard_battery_percentage",
+        proxy.keyboard_battery_percentage().await,
+    );
+    push_root_state_property(
+        &mut rows,
+        "keyboard_battery_charging",
+        proxy.keyboard_battery_charging().await,
+    );
+    push_root_state_property(
+        &mut rows,
+        "keyboard_battery_full",
+        proxy.keyboard_battery_full().await,
+    );
+    push_root_state_property(&mut rows, "mic_mute_led", proxy.mic_mute_led().await);
+    push_root_state_property(
+        &mut rows,
+        "keyboard_backlight_level",
+        proxy.keyboard_backlight_level().await,
     );
     push_root_state_property(&mut rows, "desired_primary", proxy.desired_primary().await);
     push_root_state_property(
@@ -1115,9 +1409,10 @@ pub async fn run_operator_command(cmd: OperatorCommand) -> Result<(), String> {
         OperatorCommand::SetKeyboardBacklightLevel(level) => {
             proxy.set_keyboard_backlight_level(level).await
         }
+        OperatorCommand::SetDesiredPrimary(primary) => proxy.set_desired_primary(primary).await,
         OperatorCommand::ToggleSecondaryDisplay => proxy.toggle_secondary_display().await,
         OperatorCommand::SetSecondaryDisplay(enabled) => {
-            proxy.set_secondary_display_desired(enabled).await
+            proxy.set_desired_secondary_enabled(enabled).await
         }
     }
     .map_err(|e| e.to_string())
@@ -1141,16 +1436,20 @@ async fn wait_for_internal_ack(
     }
 }
 
-async fn apply_keyboard_update(
+async fn apply_keyboard_usb_update(kb_usb_tx: &broadcast::Sender<bool>, value: bool) {
+    kb_usb_tx.send(value).ok();
+}
+
+async fn apply_keyboard_pogo_update(
     proxy: &RootStateProxy<'_>,
-    kb_tx: &broadcast::Sender<bool>,
+    kb_pogo_tx: &broadcast::Sender<bool>,
     kb_result_rx: &Arc<Mutex<mpsc::Receiver<()>>>,
     value: bool,
 ) {
-    kb_tx.send(value).ok();
-    if wait_for_internal_ack(kb_result_rx, Duration::from_secs(5), "keyboard handler").await {
-        if let Err(e) = proxy.acknowledge_keyboard_attached(value).await {
-            warn!("SESSION DBus: failed to acknowledge keyboard_attached={value}: {e}");
+    kb_pogo_tx.send(value).ok();
+    if wait_for_internal_ack(kb_result_rx, Duration::from_secs(5), "keyboard pogo handler").await {
+        if let Err(e) = proxy.acknowledge_keyboard_pogo_docked(value).await {
+            warn!("SESSION DBus: failed to acknowledge keyboard_pogo_docked={value}: {e}");
         }
     }
 }
@@ -1210,7 +1509,8 @@ pub async fn run_session_client(
     desired_secondary: Arc<RwLock<bool>>,
     desired_primary_tx: broadcast::Sender<String>,
     desired_secondary_tx: broadcast::Sender<bool>,
-    kb_tx: broadcast::Sender<bool>,
+    kb_usb_tx: broadcast::Sender<bool>,
+    kb_pogo_tx: broadcast::Sender<bool>,
     secondary_result_rx: Arc<Mutex<mpsc::Receiver<()>>>,
     kb_result_rx: Arc<Mutex<mpsc::Receiver<()>>>,
     mut ambient_report_rx: mpsc::Receiver<bool>,
@@ -1288,7 +1588,14 @@ pub async fn run_session_client(
             }
         };
 
-        let mut keyboard_changes = proxy.inner().receive_property_changed("KeyboardAttached").await;
+        let mut keyboard_usb_changes = proxy
+            .inner()
+            .receive_property_changed("KeyboardUsbConnected")
+            .await;
+        let mut keyboard_pogo_changes = proxy
+            .inner()
+            .receive_property_changed("KeyboardPogoDocked")
+            .await;
         let mut desired_secondary_changes = proxy
             .inner()
             .receive_property_changed("DesiredSecondaryEnabled")
@@ -1296,9 +1603,19 @@ pub async fn run_session_client(
         let mut desired_primary_changes = proxy.inner().receive_property_changed("DesiredPrimary").await;
         let mut display_brightness_changes = proxy.inner().receive_property_changed("DisplayBrightness").await;
 
-        match proxy.keyboard_attached().await {
-            Ok(value) => apply_keyboard_update(&proxy, &kb_tx, &kb_result_rx, value).await,
-            Err(e) => warn!("SESSION DBus: failed to read initial keyboard_attached property: {e}"),
+        match proxy.keyboard_usb_connected().await {
+            Ok(value) => apply_keyboard_usb_update(&kb_usb_tx, value).await,
+            Err(e) => warn!(
+                "SESSION DBus: failed to read initial keyboard_usb_connected property: {e}"
+            ),
+        }
+        match proxy.keyboard_pogo_docked().await {
+            Ok(value) => {
+                apply_keyboard_pogo_update(&proxy, &kb_pogo_tx, &kb_result_rx, value).await;
+            }
+            Err(e) => warn!(
+                "SESSION DBus: failed to read initial keyboard_pogo_docked property: {e}"
+            ),
         }
 
         match proxy.desired_secondary_enabled().await {
@@ -1349,11 +1666,20 @@ pub async fn run_session_client(
                         None => reconnect = true,
                     }
                 }
-                change = keyboard_changes.next() => {
+                change = keyboard_usb_changes.next() => {
                     match change {
                         Some(change) => match change.get().await {
-                            Ok(value) => apply_keyboard_update(&proxy, &kb_tx, &kb_result_rx, value).await,
-                            Err(e) => warn!("SESSION DBus: failed to decode KeyboardAttached change: {e}"),
+                            Ok(value) => apply_keyboard_usb_update(&kb_usb_tx, value).await,
+                            Err(e) => warn!("SESSION DBus: failed to decode KeyboardUsbConnected change: {e}"),
+                        },
+                        None => reconnect = true,
+                    }
+                }
+                change = keyboard_pogo_changes.next() => {
+                    match change {
+                        Some(change) => match change.get().await {
+                            Ok(value) => apply_keyboard_pogo_update(&proxy, &kb_pogo_tx, &kb_result_rx, value).await,
+                            Err(e) => warn!("SESSION DBus: failed to decode KeyboardPogoDocked change: {e}"),
                         },
                         None => reconnect = true,
                     }

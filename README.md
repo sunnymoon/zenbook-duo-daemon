@@ -257,6 +257,8 @@ zenbook-duo-daemon control mic-mute-led-toggle
 zenbook-duo-daemon control mic-mute-led true
 zenbook-duo-daemon control keyboard-backlight-toggle
 zenbook-duo-daemon control keyboard-backlight-set medium
+zenbook-duo-daemon control desired-primary-set eDP-2
+zenbook-duo-daemon control desired-secondary-enabled true
 zenbook-duo-daemon control secondary-display-toggle
 zenbook-duo-daemon control secondary-display false
 zenbook-duo-daemon resume-display-applies

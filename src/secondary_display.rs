@@ -57,14 +57,14 @@ pub async fn apply_secondary_sysfs_poweroff_when_desired_off(
     state_manager: &KeyboardStateManager,
 ) {
     if state_manager.is_secondary_display_desired_enabled() {
-        if !state_manager.is_usb_keyboard_attached() {
+        if !state_manager.is_keyboard_pogo_docked() {
             info!(
-                "ROOT [secondary sysfs] Moment B (session-stable D-Bus ack): NOT writing `off` — desired_secondary_enabled is true and USB keyboard is not attached (policy: do not cut platform power while undocked with secondary still wanted)"
+                "ROOT [secondary sysfs] Moment B (session-stable D-Bus ack): NOT writing `off` — desired_secondary_enabled is true and keyboard is not pogo-docked (policy: do not cut platform power while undocked with secondary still wanted)"
             );
             return;
         }
         info!(
-            "ROOT [secondary sysfs] Moment B (session-stable D-Bus ack): desired_secondary_enabled is still true but USB keyboard is attached — will write sysfs `off` if needed (clamshell / docked power save)"
+            "ROOT [secondary sysfs] Moment B (session-stable D-Bus ack): desired_secondary_enabled is still true but keyboard is pogo-docked — will write sysfs `off` if needed (clamshell / docked power save)"
         );
     }
     let Some(status_path) = SECONDARY_STATUS_PATH.get() else {

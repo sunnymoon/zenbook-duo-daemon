@@ -483,7 +483,7 @@ fn mutter_dual_internal_primary_wedge(logical: &[LogicalMonitor]) -> bool {
 /// apply** without re-validating on hardware; see README.
 async fn apply_desired_display_state(
     display: &DisplayConfigProxy<'_>,
-    keyboard_attached: bool,
+    keyboard_pogo_docked: bool,
     desired_secondary_enabled: bool,
     desired_primary: &str,
     desired_transform: u32,
@@ -542,12 +542,12 @@ async fn apply_desired_display_state(
 
         let edp2_physically_available = all_modes.contains_key("eDP-2");
         let edp2_should_be_enabled =
-            edp2_physically_available && desired_secondary_enabled && !keyboard_attached;
+            edp2_physically_available && desired_secondary_enabled && !keyboard_pogo_docked;
 
         let mut edp1_scale = read_edp1_scale(&logical);
 
         let desired_primary_effective = if desired_primary == "eDP-2" {
-            if !edp2_physically_available || !desired_secondary_enabled || keyboard_attached {
+            if !edp2_physically_available || !desired_secondary_enabled || keyboard_pogo_docked {
                 "eDP-1".to_string()
             } else {
                 "eDP-2".to_string()
@@ -1140,7 +1140,7 @@ async fn reconcile_display_state(
     display: &DisplayConfigProxy<'_>,
     desired_primary: &Arc<tokio::sync::RwLock<String>>,
     desired_secondary: &Arc<tokio::sync::RwLock<bool>>,
-    keyboard_attached: bool,
+    keyboard_pogo_docked: bool,
     apply_busy: &Arc<AtomicBool>,
     apply_serial: &Arc<tokio::sync::Mutex<()>>,
 ) -> Result<bool, DisplayApplyError> {
@@ -1171,7 +1171,7 @@ async fn reconcile_display_state(
 
     let changed = apply_desired_display_state(
         display,
-        keyboard_attached,
+        keyboard_pogo_docked,
         desired_secondary_enabled,
         &desired_primary_value,
         desired_transform,
@@ -1188,13 +1188,13 @@ async fn attempt_display_recovery(
     conn: &Connection,
     desired_primary: &Arc<tokio::sync::RwLock<String>>,
     desired_secondary: &Arc<tokio::sync::RwLock<bool>>,
-    keyboard_attached: &Arc<tokio::sync::RwLock<bool>>,
+    keyboard_pogo_docked: &Arc<tokio::sync::RwLock<bool>>,
 ) -> Result<(), DisplayApplyError> {
     let display = DisplayConfigProxy::new(conn)
         .await
         .map_err(|e| DisplayApplyError::Apply(e.to_string()))?;
 
-    let kb_before = *keyboard_attached.read().await;
+    let kb_before = *keyboard_pogo_docked.read().await;
     let sec_before = *desired_secondary.read().await;
     let pri_before = desired_primary.read().await.clone();
 
@@ -1224,7 +1224,7 @@ async fn attempt_display_recovery(
     )
     .await?;
 
-    let kb_after = *keyboard_attached.read().await;
+    let kb_after = *keyboard_pogo_docked.read().await;
     let sec_after = *desired_secondary.read().await;
     let pri_after = desired_primary.read().await.clone();
     if (kb_before, sec_before, pri_before) != (kb_after, sec_after, pri_after) {
@@ -1242,7 +1242,7 @@ fn ensure_display_recovery_task(
     conn: &Connection,
     desired_primary: &Arc<tokio::sync::RwLock<String>>,
     desired_secondary: &Arc<tokio::sync::RwLock<bool>>,
-    keyboard_attached: &Arc<tokio::sync::RwLock<bool>>,
+    keyboard_pogo_docked: &Arc<tokio::sync::RwLock<bool>>,
     reason: &'static str,
     apply_busy: Arc<AtomicBool>,
     apply_serial: Arc<tokio::sync::Mutex<()>>,
@@ -1257,7 +1257,7 @@ fn ensure_display_recovery_task(
     let conn = conn.clone();
     let desired_primary = Arc::clone(desired_primary);
     let desired_secondary = Arc::clone(desired_secondary);
-    let keyboard_attached = Arc::clone(keyboard_attached);
+    let keyboard_pogo_docked = Arc::clone(keyboard_pogo_docked);
     *recovery_task = Some(tokio::spawn(async move {
         apply_busy.store(true, Ordering::SeqCst);
         let _campaign_apply_idle = ApplyBusyClear(&apply_busy);
@@ -1270,7 +1270,7 @@ fn ensure_display_recovery_task(
                 &conn,
                 &desired_primary,
                 &desired_secondary,
-                &keyboard_attached,
+                &keyboard_pogo_docked,
             )
             .await
             {
@@ -1389,6 +1389,7 @@ pub async fn run(
     kb_result_tx: tokio::sync::mpsc::Sender<()>,
     desired_primary: Arc<tokio::sync::RwLock<String>>,
     desired_secondary: Arc<tokio::sync::RwLock<bool>>,
+    tablet_config: crate::config::TabletMappingConfig,
 ) {
     let conn = loop {
         match Connection::session().await {
@@ -1434,8 +1435,8 @@ pub async fn run(
     );
 
     let mut recovery_task: Option<tokio::task::JoinHandle<()>> = None;
-    let mut keyboard_attached = false;
-    let keyboard_attached_state = Arc::new(tokio::sync::RwLock::new(false));
+    let mut keyboard_pogo_docked = false;
+    let keyboard_pogo_docked_state = Arc::new(tokio::sync::RwLock::new(false));
     let mut keyboard_state_initialized = false;
     let mut delayed_reconciles_deepness: u32 = 0;
     let mut quiet_until: Option<tokio::time::Instant> = None;
@@ -1471,7 +1472,7 @@ pub async fn run(
                     &display,
                     &desired_primary,
                     &desired_secondary,
-                    keyboard_attached,
+                    keyboard_pogo_docked,
                     &apply_busy,
                     &apply_serial,
                 )
@@ -1488,7 +1489,7 @@ pub async fn run(
                             let sec_desired = *desired_secondary.read().await;
                             if !sec_desired {
                                 true
-                            } else if keyboard_attached {
+                            } else if keyboard_pogo_docked {
                                 match display.get_current_state().await {
                                     Ok(st) => {
                                         let has_edp2 = logical_layout_includes_edp2(&st);
@@ -1496,7 +1497,7 @@ pub async fn run(
                                             false
                                         } else {
                                             info!(
-                                                "Display: docked USB keyboard and Mutter layout omit eDP-2 — notifying root for sysfs secondary power save (desired_secondary still true)"
+                                                "Display: pogo-docked keyboard and Mutter layout omit eDP-2 — notifying root for sysfs secondary power save (desired_secondary still true)"
                                             );
                                             true
                                         }
@@ -1517,6 +1518,22 @@ pub async fn run(
                                 crate::dbus_state::notify_secondary_sysfs_poweroff_ready().await
                             {
                                 warn!("Display: secondary sysfs poweroff ready notify failed: {e}");
+                            }
+                        }
+                        if tablet_config.enable {
+                            match display.get_current_state().await {
+                                Ok(st) => {
+                                    let prim = desired_primary.read().await.clone();
+                                    super::tablet_mapping::reapply_after_reconcile(
+                                        &tablet_config,
+                                        &prim,
+                                        &st.1,
+                                    )
+                                    .await;
+                                }
+                                Err(e) => {
+                                    warn!("Tablet mapping: get_current_state after reconcile: {e}");
+                                }
                             }
                         }
                         info!(
@@ -1540,7 +1557,7 @@ pub async fn run(
                             &conn,
                             &desired_primary,
                             &desired_secondary,
-                            &keyboard_attached_state,
+                            &keyboard_pogo_docked_state,
                             pending_reason,
                             Arc::clone(&apply_busy),
                             Arc::clone(&apply_serial),
@@ -1612,10 +1629,10 @@ pub async fn run(
             },
             msg = kb_rx.recv() => match msg {
                 Ok(attached) => {
-                    let previous_keyboard_attached = keyboard_attached;
-                    keyboard_attached = attached;
-                    *keyboard_attached_state.write().await = attached;
-                    info!("Display: keyboard_attached={attached}");
+                    let previous_keyboard_pogo_docked = keyboard_pogo_docked;
+                    keyboard_pogo_docked = attached;
+                    *keyboard_pogo_docked_state.write().await = attached;
+                    info!("Display: keyboard_pogo_docked={attached}");
                     // ACK is receive-only; display apply is performed by debounced reconciler.
                     let _ = kb_result_tx.send(()).await;
 
@@ -1625,8 +1642,8 @@ pub async fn run(
                             info!("Display: initial keyboard state sync is detached; skipping detach restore actions");
                             continue;
                         }
-                    } else if attached == previous_keyboard_attached {
-                        info!("Display: keyboard_attached unchanged; skipping duplicate edge handling");
+                    } else if attached == previous_keyboard_pogo_docked {
+                        info!("Display: keyboard_pogo_docked unchanged; skipping duplicate edge handling");
                         continue;
                     }
 
@@ -1646,7 +1663,7 @@ pub async fn run(
                     schedule_reconcile(
                         &mut debounce_deadline,
                         &mut pending_reason,
-                        "keyboard attach state update",
+                        "keyboard pogo dock state update",
                         RECONCILE_DEBOUNCE_MS,
                     );
                 }

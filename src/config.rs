@@ -116,10 +116,67 @@ impl KeyFunction {
     }
 }
 
+/// How to map ASUS Zenbook Duo integrated pen (`04f3:4447` / `04f3:4448`) to internal panels in GNOME.
+///
+/// GNOME stores this under `org.gnome.desktop.peripherals.tablet` relocatable schemas
+/// (`…/tablets/<vid>:<pid>/` `output` key = EDID triple for the chosen logical monitor).
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TabletMapMode {
+    /// `04f3:4447` → **eDP-1**, `04f3:4448` → **eDP-2** (physical pairing on the UX8406 stack).
+    #[default]
+    OneToOne,
+    /// Both pen devices follow whichever internal connector is currently **primary** (`desired_primary`).
+    AllToPrimary,
+}
+
+/// Maps xhci hub port indices (`lsusb -t` port number) to pogo dock.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct UsbKeyboardPortsConfig {
+    /// Hub port numbers when the keyboard is on the bottom panel (pogo). UX8406CA: `6`.
+    #[serde(default = "default_pogo_dock_hub_ports", alias = "pogo_dock_devpaths")]
+    pub pogo_dock_hub_ports: Vec<String>,
+}
+
+fn default_pogo_dock_hub_ports() -> Vec<String> {
+    vec!["6".to_string()]
+}
+
+impl Default for UsbKeyboardPortsConfig {
+    fn default() -> Self {
+        Self {
+            pogo_dock_hub_ports: default_pogo_dock_hub_ports(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TabletMappingConfig {
+    /// When `true`, the session daemon reapplies GNOME tablet `output` mappings after each
+    /// successful display reconcile (and on the same cadence as layout stabilisation).
+    #[serde(default)]
+    pub enable: bool,
+    #[serde(default)]
+    pub mode: TabletMapMode,
+}
+
+impl Default for TabletMappingConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            mode: TabletMapMode::default(),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
     usb_vendor_id: String,
     usb_product_id: String,
+    #[serde(default)]
+    pub usb_keyboard_ports: UsbKeyboardPortsConfig,
+    #[serde(default)]
+    pub tablet: TabletMappingConfig,
     pub fn_lock: bool,
     pub keyboard_backlight_key: KeyFunction,
     pub brightness_down_key: KeyFunction,
@@ -171,6 +228,8 @@ impl Default for Config {
         Self {
             usb_vendor_id: "0b05".to_string(),
             usb_product_id: get_usb_product_id(),
+            usb_keyboard_ports: UsbKeyboardPortsConfig::default(),
+            tablet: TabletMappingConfig::default(),
             fn_lock: true,
             keyboard_backlight_key: KeyFunction::KeyboardBacklight(true),
             brightness_down_key: KeyFunction::KeyBind(vec![EV_KEY::KEY_BRIGHTNESSDOWN]),
@@ -218,6 +277,13 @@ impl Config {
 #
 # fn_lock = true             # To input F1-F12, you need to press Fn + F1-F12
 # idle_timeout_seconds = 300 # 5 minutes, set to 0 to disable idle detection
+#
+# [usb_keyboard_ports]                   # Hub port = lsusb -t port (see `usb_keyboard_ports.rs`)
+# pogo_dock_hub_ports = [\"6\"]          # UX8406CA: 6 = bottom pogo, 4 = side charge (not pogo)
+#
+# [tablet]                               # Optional: GNOME Wayland pen → panel mapping (see README)
+# enable = false                         # When true, reapplies after each successful display reconcile
+# mode = \"one_to_one\"                  # or \"all_to_primary\" — see `TabletMapMode` in `src/config.rs`
         ".trim();
         let config_str = format!("{}\n\n\n{}", help, config_str);
 
