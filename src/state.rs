@@ -1,3 +1,4 @@
+use crate::config::{TabletMapMode, TabletMappingConfig, tablet_mode_from_str, tablet_mode_to_str};
 use crate::events::Event;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -27,6 +28,10 @@ struct PersistedDisplayState {
     desired_display_attachment: Option<String>,
     /// `mirror` | `joined`
     desired_display_layout: Option<String>,
+    /// GNOME pen → panel remapping (`src/session/tablet_mapping.rs`).
+    tablet_mapping_enabled: Option<bool>,
+    /// `one_to_one` | `all_to_primary`
+    tablet_mapping_mode: Option<String>,
 }
 
 /// Serializes all display-state JSON read/modify/write so concurrent tasks cannot clobber fields.
@@ -131,6 +136,19 @@ async fn load_backlight_disk() -> KeyboardBacklightState {
     }
 }
 
+fn resolve_tablet_mapping_config(
+    snap: &PersistedDisplayState,
+    defaults: TabletMappingConfig,
+) -> TabletMappingConfig {
+    let enable = snap.tablet_mapping_enabled.unwrap_or(defaults.enable);
+    let mode = snap
+        .tablet_mapping_mode
+        .as_deref()
+        .and_then(|s| tablet_mode_from_str(s).ok())
+        .unwrap_or(defaults.mode);
+    TabletMappingConfig { enable, mode }
+}
+
 fn get_desired_display_mode_from_snapshot(snap: &PersistedDisplayState) -> (String, String) {
     (
         snap.desired_display_attachment
@@ -217,6 +235,10 @@ struct InnerState {
     keyboard_battery_pct: Option<u8>,
     keyboard_battery_charging: bool,
     keyboard_battery_full: bool,
+    tablet_mapping_enabled: bool,
+    tablet_mapping_mode: TabletMapMode,
+    /// Incremented by operator `ApplyTabletMapping`; session watches for immediate pen remap.
+    tablet_mapping_apply_nonce: u32,
 }
 
 /// Shared state manager that maintains keyboard state across attach/detach cycles
@@ -230,6 +252,7 @@ impl KeyboardStateManager {
     pub async fn new(
         is_usb_connected: bool,
         is_pogo_docked: bool,
+        tablet_defaults: TabletMappingConfig,
         sender: broadcast::Sender<Event>,
     ) -> Self {
         let snap = read_display_state_file_inner().await;
@@ -242,6 +265,7 @@ impl KeyboardStateManager {
         };
 
         let (desired_display_attachment, desired_display_layout) = get_desired_display_mode_from_snapshot(&snap);
+        let tablet_mapping = resolve_tablet_mapping_config(&snap, tablet_defaults);
 
         if snap.ambient_light_enabled.is_none() {
             let enabled = ambient_light_enabled;
@@ -285,8 +309,106 @@ impl KeyboardStateManager {
                 keyboard_battery_pct,
                 keyboard_battery_charging,
                 keyboard_battery_full,
+                tablet_mapping_enabled: tablet_mapping.enable,
+                tablet_mapping_mode: tablet_mapping.mode,
+                tablet_mapping_apply_nonce: 0,
             })),
             sender,
+        }
+    }
+
+    pub fn get_tablet_mapping_config(&self) -> TabletMappingConfig {
+        let state = self.state.read().unwrap();
+        TabletMappingConfig {
+            enable: state.tablet_mapping_enabled,
+            mode: state.tablet_mapping_mode,
+        }
+    }
+
+    pub fn tablet_mapping_mode_string(&self) -> String {
+        let state = self.state.read().unwrap();
+        tablet_mode_to_str(state.tablet_mapping_mode).to_string()
+    }
+
+    pub fn tablet_mapping_apply_nonce(&self) -> u32 {
+        self.state.read().unwrap().tablet_mapping_apply_nonce
+    }
+
+    pub async fn set_tablet_mapping_enabled(&self, enabled: bool) {
+        {
+            let mut state = self.state.write().unwrap();
+            if state.tablet_mapping_enabled == enabled {
+                return;
+            }
+            state.tablet_mapping_enabled = enabled;
+        }
+        with_display_state(|snap| {
+            snap.tablet_mapping_enabled = Some(enabled);
+        })
+        .await;
+        Self::notify_tablet_mapping_changed_async();
+    }
+
+    pub async fn set_tablet_mapping_mode(&self, mode: TabletMapMode) {
+        {
+            let mut state = self.state.write().unwrap();
+            if state.tablet_mapping_mode == mode {
+                return;
+            }
+            state.tablet_mapping_mode = mode;
+        }
+        let mode_str = tablet_mode_to_str(mode).to_string();
+        with_display_state(|snap| {
+            snap.tablet_mapping_mode = Some(mode_str);
+        })
+        .await;
+        Self::notify_tablet_mapping_changed_async();
+    }
+
+    /// Cycle `one_to_one` ↔ `all_to_primary`. No-op when mapping is disabled.
+    pub async fn toggle_tablet_mapping_mode(&self) -> Option<TabletMapMode> {
+        let next = {
+            let state = self.state.read().unwrap();
+            if !state.tablet_mapping_enabled {
+                return None;
+            }
+            match state.tablet_mapping_mode {
+                TabletMapMode::OneToOne => TabletMapMode::AllToPrimary,
+                TabletMapMode::AllToPrimary => TabletMapMode::OneToOne,
+            }
+        };
+        self.set_tablet_mapping_mode(next).await;
+        Some(next)
+    }
+
+    pub async fn bump_tablet_mapping_apply_nonce(&self) -> u32 {
+        let nonce = {
+            let mut state = self.state.write().unwrap();
+            state.tablet_mapping_apply_nonce = state.tablet_mapping_apply_nonce.wrapping_add(1);
+            state.tablet_mapping_apply_nonce
+        };
+        Self::notify_tablet_mapping_apply_nonce_async();
+        nonce
+    }
+
+    fn notify_tablet_mapping_changed_async() {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(e) = crate::dbus_state::notify_tablet_mapping_changed().await {
+                    log::warn!("Failed to publish tablet mapping update: {e}");
+                }
+            });
+        }
+    }
+
+    fn notify_tablet_mapping_apply_nonce_async() {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(e) = crate::dbus_state::notify_tablet_mapping_apply_nonce_changed().await
+                {
+                    log::warn!("Failed to publish tablet mapping apply nonce: {e}");
+                }
+            });
         }
     }
 
@@ -551,7 +673,7 @@ impl KeyboardStateManager {
                     "side USB"
                 }
             };
-            log::info!(
+            log::debug!(
                 "{port}: keyboard battery D-Bus updated to {pct}% charging={charging} full={full} (5a 3d status=0x{status:02x})"
             );
             if let Ok(handle) = tokio::runtime::Handle::try_current() {

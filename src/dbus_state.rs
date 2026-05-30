@@ -13,6 +13,9 @@ use zbus::{MatchRule, MessageStream, connection, proxy, Connection};
 use crate::config::Config;
 use crate::idle_detection::ActivityNotifier;
 use crate::polkit;
+use crate::config::{
+    tablet_mode_from_str, tablet_mode_to_str, TabletMapMode, TabletMappingConfig,
+};
 use crate::state::{KeyboardBacklightState, KeyboardStateManager};
 
 pub const ROOT_DBUS_SERVICE: &str = "asus.zenbook.duo";
@@ -154,6 +157,10 @@ pub enum OperatorCommand {
     /// 0 = off, 1 = low, 2 = medium, 3 = high
     SetKeyboardBacklightLevel(u8),
     SetDesiredPrimary(String),
+    SetTabletMappingEnabled(bool),
+    SetTabletMappingMode(String),
+    ToggleTabletMappingMode,
+    ApplyTabletMapping,
     ToggleSecondaryDisplay,
     SetSecondaryDisplay(bool),
 }
@@ -217,6 +224,24 @@ impl RootStateInterface {
     #[zbus(property)]
     fn keyboard_backlight_level(&self) -> u8 {
         self.state_manager.get_keyboard_backlight().level()
+    }
+
+    /// GNOME pen → panel remapping master switch (see `src/session/tablet_mapping.rs`).
+    #[zbus(property)]
+    fn tablet_mapping_enabled(&self) -> bool {
+        self.state_manager.get_tablet_mapping_config().enable
+    }
+
+    /// `one_to_one` or `all_to_primary`.
+    #[zbus(property)]
+    fn tablet_mapping_mode(&self) -> String {
+        self.state_manager.tablet_mapping_mode_string()
+    }
+
+    /// Bumped by [`Self::apply_tablet_mapping`] so the session re-runs gsettings remap.
+    #[zbus(property)]
+    fn tablet_mapping_apply_nonce(&self) -> u32 {
+        self.state_manager.tablet_mapping_apply_nonce()
     }
 
     #[zbus(property)]
@@ -507,6 +532,64 @@ impl RootStateInterface {
         Ok(())
     }
 
+    async fn set_tablet_mapping_enabled(
+        &self,
+        enabled: bool,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+    ) -> fdo::Result<()> {
+        self.require_operator(&header, connection).await?;
+        self.state_manager
+            .set_tablet_mapping_enabled(enabled)
+            .await;
+        info!("Operator: tablet_mapping_enabled={enabled}");
+        Ok(())
+    }
+
+    async fn set_tablet_mapping_mode(
+        &self,
+        mode: String,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+    ) -> fdo::Result<()> {
+        self.require_operator(&header, connection).await?;
+        let parsed = tablet_mode_from_str(&mode).map_err(fdo::Error::Failed)?;
+        self.state_manager.set_tablet_mapping_mode(parsed).await;
+        info!("Operator: tablet_mapping_mode={mode}");
+        Ok(())
+    }
+
+    async fn toggle_tablet_mapping_mode(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+    ) -> fdo::Result<()> {
+        self.require_operator(&header, connection).await?;
+        match self.state_manager.toggle_tablet_mapping_mode().await {
+            Some(mode) => {
+                info!(
+                    "Operator: tablet_mapping_mode toggled to {}",
+                    crate::config::tablet_mode_to_str(mode)
+                );
+            }
+            None => {
+                info!("Operator: tablet_mapping_mode toggle ignored (mapping disabled)");
+            }
+        }
+        Ok(())
+    }
+
+    async fn apply_tablet_mapping(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+    ) -> fdo::Result<()> {
+        self.require_operator(&header, connection).await?;
+        let nonce = self.state_manager.bump_tablet_mapping_apply_nonce().await;
+        info!("Operator: apply_tablet_mapping nonce={nonce}");
+        Ok(())
+    }
+
     async fn set_desired_primary(
         &self,
         primary: String,
@@ -583,6 +666,10 @@ trait RootState {
     fn toggle_keyboard_backlight(&self) -> zbus::Result<()>;
     fn set_keyboard_backlight_level(&self, level: u8) -> zbus::Result<()>;
     fn set_desired_primary(&self, primary: String) -> zbus::Result<()>;
+    fn set_tablet_mapping_enabled(&self, enabled: bool) -> zbus::Result<()>;
+    fn set_tablet_mapping_mode(&self, mode: String) -> zbus::Result<()>;
+    fn toggle_tablet_mapping_mode(&self) -> zbus::Result<()>;
+    fn apply_tablet_mapping(&self) -> zbus::Result<()>;
     fn toggle_secondary_display(&self) -> zbus::Result<()>;
     fn set_secondary_display_desired(&self, enabled: bool) -> zbus::Result<()>;
     fn set_desired_secondary_enabled(&self, enabled: bool) -> zbus::Result<()>;
@@ -616,6 +703,15 @@ trait RootState {
 
     #[zbus(property)]
     fn keyboard_backlight_level(&self) -> zbus::Result<u8>;
+
+    #[zbus(property)]
+    fn tablet_mapping_enabled(&self) -> zbus::Result<bool>;
+
+    #[zbus(property)]
+    fn tablet_mapping_mode(&self) -> zbus::Result<String>;
+
+    #[zbus(property)]
+    fn tablet_mapping_apply_nonce(&self) -> zbus::Result<u32>;
 
     #[zbus(property)]
     fn desired_primary(&self) -> zbus::Result<String>;
@@ -769,6 +865,56 @@ async fn emit_keyboard_backlight_changed() -> Result<bool, Box<dyn std::error::E
 pub async fn notify_keyboard_backlight_changed(
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     emit_keyboard_backlight_changed().await
+}
+
+async fn emit_tablet_mapping_changed() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(handle) = get_root_handle().await else {
+        return Ok(false);
+    };
+
+    let iface_ref = handle
+        .connection
+        .object_server()
+        .interface::<_, RootStateInterface>(ROOT_DBUS_PATH)
+        .await?;
+    let iface = iface_ref.get().await;
+    let emitter = iface_ref.signal_emitter();
+    iface
+        .tablet_mapping_enabled_changed(&emitter)
+        .await?;
+    iface.tablet_mapping_mode_changed(&emitter).await?;
+
+    Ok(handle.registered.load(Ordering::SeqCst))
+}
+
+pub async fn notify_tablet_mapping_changed(
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    emit_tablet_mapping_changed().await
+}
+
+async fn emit_tablet_mapping_apply_nonce_changed(
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(handle) = get_root_handle().await else {
+        return Ok(false);
+    };
+
+    let iface_ref = handle
+        .connection
+        .object_server()
+        .interface::<_, RootStateInterface>(ROOT_DBUS_PATH)
+        .await?;
+    iface_ref
+        .get()
+        .await
+        .tablet_mapping_apply_nonce_changed(iface_ref.signal_emitter())
+        .await?;
+
+    Ok(handle.registered.load(Ordering::SeqCst))
+}
+
+pub async fn notify_tablet_mapping_apply_nonce_changed(
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    emit_tablet_mapping_apply_nonce_changed().await
 }
 
 async fn emit_bluetooth_connected_changed() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
@@ -1363,6 +1509,21 @@ pub async fn query_root_state_for_cli() -> Result<Vec<(String, String)>, String>
         "keyboard_backlight_level",
         proxy.keyboard_backlight_level().await,
     );
+    push_root_state_property(
+        &mut rows,
+        "tablet_mapping_enabled",
+        proxy.tablet_mapping_enabled().await,
+    );
+    push_root_state_property(
+        &mut rows,
+        "tablet_mapping_mode",
+        proxy.tablet_mapping_mode().await,
+    );
+    push_root_state_property(
+        &mut rows,
+        "tablet_mapping_apply_nonce",
+        proxy.tablet_mapping_apply_nonce().await,
+    );
     push_root_state_property(&mut rows, "desired_primary", proxy.desired_primary().await);
     push_root_state_property(
         &mut rows,
@@ -1410,6 +1571,12 @@ pub async fn run_operator_command(cmd: OperatorCommand) -> Result<(), String> {
             proxy.set_keyboard_backlight_level(level).await
         }
         OperatorCommand::SetDesiredPrimary(primary) => proxy.set_desired_primary(primary).await,
+        OperatorCommand::SetTabletMappingEnabled(enabled) => {
+            proxy.set_tablet_mapping_enabled(enabled).await
+        }
+        OperatorCommand::SetTabletMappingMode(mode) => proxy.set_tablet_mapping_mode(mode).await,
+        OperatorCommand::ToggleTabletMappingMode => proxy.toggle_tablet_mapping_mode().await,
+        OperatorCommand::ApplyTabletMapping => proxy.apply_tablet_mapping().await,
         OperatorCommand::ToggleSecondaryDisplay => proxy.toggle_secondary_display().await,
         OperatorCommand::SetSecondaryDisplay(enabled) => {
             proxy.set_desired_secondary_enabled(enabled).await
@@ -1503,6 +1670,43 @@ fn coalesce_latest_ambient_value(
     }
 }
 
+async fn sync_tablet_mapping_from_root(
+    proxy: &RootStateProxy<'_>,
+    tablet_config: &Arc<RwLock<TabletMappingConfig>>,
+    tablet_remap_tx: &broadcast::Sender<()>,
+) {
+    let Ok(enabled) = proxy.tablet_mapping_enabled().await else {
+        return;
+    };
+    let Ok(mode_s) = proxy.tablet_mapping_mode().await else {
+        return;
+    };
+    let mode = tablet_mode_from_str(&mode_s).unwrap_or(TabletMapMode::OneToOne);
+    let new_cfg = TabletMappingConfig { enable: enabled, mode };
+    let should_remap = {
+        let mut guard = tablet_config.write().await;
+        if *guard == new_cfg {
+            false
+        } else {
+            *guard = new_cfg;
+            true
+        }
+    };
+    if should_remap {
+        info!(
+            "SESSION DBus: tablet mapping synced enabled={enabled} mode={}",
+            tablet_mode_to_str(mode)
+        );
+        let _ = tablet_remap_tx.send(());
+    }
+}
+
+fn request_tablet_remap(tablet_remap_tx: &broadcast::Sender<()>) {
+    if tablet_remap_tx.send(()).is_ok() {
+        info!("SESSION DBus: tablet mapping immediate reapply requested");
+    }
+}
+
 pub async fn run_session_client(
     session_id: u64,
     desired_primary: Arc<RwLock<String>>,
@@ -1514,6 +1718,8 @@ pub async fn run_session_client(
     secondary_result_rx: Arc<Mutex<mpsc::Receiver<()>>>,
     kb_result_rx: Arc<Mutex<mpsc::Receiver<()>>>,
     mut ambient_report_rx: mpsc::Receiver<bool>,
+    tablet_config: Arc<RwLock<TabletMappingConfig>>,
+    tablet_remap_tx: broadcast::Sender<()>,
 ) {
     let mut latest_ambient_value = None;
 
@@ -1602,6 +1808,18 @@ pub async fn run_session_client(
             .await;
         let mut desired_primary_changes = proxy.inner().receive_property_changed("DesiredPrimary").await;
         let mut display_brightness_changes = proxy.inner().receive_property_changed("DisplayBrightness").await;
+        let mut tablet_enabled_changes = proxy
+            .inner()
+            .receive_property_changed::<bool>("TabletMappingEnabled")
+            .await;
+        let mut tablet_mode_changes = proxy
+            .inner()
+            .receive_property_changed::<String>("TabletMappingMode")
+            .await;
+        let mut tablet_apply_nonce_changes = proxy
+            .inner()
+            .receive_property_changed::<u32>("TabletMappingApplyNonce")
+            .await;
 
         match proxy.keyboard_usb_connected().await {
             Ok(value) => apply_keyboard_usb_update(&kb_usb_tx, value).await,
@@ -1646,6 +1864,8 @@ pub async fn run_session_client(
             Ok(_) => {}
             Err(e) => warn!("SESSION DBus: failed to read initial display_brightness property: {e}"),
         }
+
+        sync_tablet_mapping_from_root(&proxy, &tablet_config, &tablet_remap_tx).await;
 
         let mut reconnect = false;
         while !reconnect {
@@ -1721,6 +1941,47 @@ pub async fn run_session_client(
                             }
                             Ok(_) => {}
                             Err(e) => warn!("SESSION DBus: failed to decode DisplayBrightness change: {e}"),
+                        },
+                        None => reconnect = true,
+                    }
+                }
+                change = tablet_enabled_changes.next() => {
+                    match change {
+                        Some(change) => match change.get().await {
+                            Ok(_) => {
+                                sync_tablet_mapping_from_root(
+                                    &proxy,
+                                    &tablet_config,
+                                    &tablet_remap_tx,
+                                )
+                                .await;
+                            }
+                            Err(e) => warn!("SESSION DBus: failed to decode TabletMappingEnabled change: {e}"),
+                        },
+                        None => reconnect = true,
+                    }
+                }
+                change = tablet_mode_changes.next() => {
+                    match change {
+                        Some(change) => match change.get().await {
+                            Ok(_) => {
+                                sync_tablet_mapping_from_root(
+                                    &proxy,
+                                    &tablet_config,
+                                    &tablet_remap_tx,
+                                )
+                                .await;
+                            }
+                            Err(e) => warn!("SESSION DBus: failed to decode TabletMappingMode change: {e}"),
+                        },
+                        None => reconnect = true,
+                    }
+                }
+                change = tablet_apply_nonce_changes.next() => {
+                    match change {
+                        Some(change) => match change.get().await {
+                            Ok(_) => request_tablet_remap(&tablet_remap_tx),
+                            Err(e) => warn!("SESSION DBus: failed to decode TabletMappingApplyNonce change: {e}"),
                         },
                         None => reconnect = true,
                     }

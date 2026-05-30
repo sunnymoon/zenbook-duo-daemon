@@ -9,7 +9,9 @@ from the `zenbook-duo-daemon` directly in the GNOME UI.
 |---|---|
 | **Top-bar status area** (right side) | Keyboard icon + battery status. Shows `%` (+⚡ when charging) when a battery sample exists; otherwise shows a keyboard state marker. |
 | **Quick Settings panel** (the dropdown) | A "Zenbook Keyboard" tile showing keyboard state (`Attached (pogo)`, `USB connected`, `Bluetooth mode`, `Detached`) and battery status, plus a nested display-policy submenu. |
-| **Quick Settings actions** | Toggle second display desired state from the tile itself, synced **Mic mute LED** switch, **Keyboard backlight** selector (Off/Low/Medium/High), and **Primary panel** selector (`eDP-1` / `eDP-2`). Second-display toggle is disabled while pogo-attached. |
+| **Quick Settings actions** | Toggle second display desired state from the tile itself, synced **Mic mute LED** switch, **Keyboard backlight** selector (Off/Low/Medium/High), **Primary panel** selector (`eDP-1` / `eDP-2`), and **Stylus / tablet mapping** controls. Second-display toggle is disabled while pogo-attached. |
+
+> The tablet mapping controls are shown only when the daemon exposes the tablet D-Bus fields; otherwise the submenu stays disabled as "daemon pending".
 
 ## D-Bus interface consumed
 
@@ -24,11 +26,13 @@ Properties read: `KeyboardUsbConnected`, `KeyboardPogoDocked`,
 `BluetoothConnected`, `KeyboardBatteryPresent`, `KeyboardBatteryPercentage`,
 `KeyboardBatteryCharging`, `KeyboardBatteryFull`, `DesiredPrimary`,
 `DesiredSecondaryEnabled`, `DesiredDisplayAttachment`, `DesiredDisplayLayout`,
-`DisplayBrightness`, `DisplayApplyPaused`, `MicMuteLed`, `KeyboardBacklightLevel`.
+`DisplayBrightness`, `DisplayApplyPaused`, `TabletMappingEnabled`,
+`TabletMappingMode`, `TabletMappingApplyNonce`, `MicMuteLed`, `KeyboardBacklightLevel`.
 
 Methods called (from Quick Settings actions): `SetSecondaryDisplayDesired(bool)`,
-`SetDesiredPrimary(string)`, `SetMicMuteLed(bool)`, and
-`SetKeyboardBacklightLevel(byte)`.
+`SetDesiredPrimary(string)`, `SetTabletMappingEnabled(bool)`,
+`SetTabletMappingMode(string)`, `ApplyTabletMapping()`,
+`SetMicMuteLed(bool)`, and `SetKeyboardBacklightLevel(byte)`.
 
 ## Requirements
 

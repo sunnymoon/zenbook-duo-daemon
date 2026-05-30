@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
-use crate::config::Config;
+use crate::config::{Config, TabletMappingConfig};
 
 pub async fn run() {
     let (kb_usb_tx, _) = broadcast::channel::<bool>(8);
@@ -31,16 +31,19 @@ pub async fn run() {
     let desired_primary = Arc::new(tokio::sync::RwLock::new(String::from("eDP-1")));
     let desired_secondary = Arc::new(tokio::sync::RwLock::new(true));
 
-    let tablet_cfg = match Config::try_read(&PathBuf::from(crate::config::DEFAULT_CONFIG_PATH)).await {
+    let tablet_defaults = match Config::try_read(&PathBuf::from(crate::config::DEFAULT_CONFIG_PATH)).await
+    {
         Ok(c) => c.tablet,
         Err(e) => {
             warn!(
                 "Session: could not read {} for [tablet] settings (using defaults): {e}",
                 crate::config::DEFAULT_CONFIG_PATH
             );
-            Default::default()
+            TabletMappingConfig::default()
         }
     };
+    let tablet_config = Arc::new(tokio::sync::RwLock::new(tablet_defaults));
+    let (tablet_remap_tx, tablet_remap_rx) = broadcast::channel::<()>(8);
 
     let session_id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -68,7 +71,8 @@ pub async fn run() {
         kb_result_tx.clone(),
         desired_primary.clone(),
         desired_secondary.clone(),
-        tablet_cfg,
+        Arc::clone(&tablet_config),
+        tablet_remap_rx,
     ));
     tokio::spawn(notifications::run(kb_usb_tx.subscribe(), kb_pogo_tx.subscribe()));
     tokio::spawn(notifications::run_battery_monitor());
@@ -86,6 +90,8 @@ pub async fn run() {
         let kb_pogo_tx_clone = kb_pogo_tx.clone();
         let secondary_result_rx = Arc::clone(&secondary_result_rx);
         let kb_result_rx = Arc::clone(&kb_result_rx);
+        let tablet_config_clone = Arc::clone(&tablet_config);
+        let tablet_remap_tx_clone = tablet_remap_tx.clone();
         tokio::spawn(async move {
             crate::dbus_state::run_session_client(
                 session_id,
@@ -98,6 +104,8 @@ pub async fn run() {
                 secondary_result_rx,
                 kb_result_rx,
                 ambient_report_rx,
+                tablet_config_clone,
+                tablet_remap_tx_clone,
             )
             .await;
         });

@@ -1380,6 +1380,25 @@ fn schedule_reconcile(
     *debounce_deadline = Some(new_deadline);
 }
 
+/// Re-run GNOME tablet `output` gsettings from current Mutter state (operator / D-Bus driven).
+pub async fn reapply_tablet_mapping_now(
+    display: &DisplayConfigProxy<'_>,
+    desired_primary: &str,
+    tablet_config: &crate::config::TabletMappingConfig,
+) {
+    if !tablet_config.enable {
+        info!("Tablet mapping: immediate reapply skipped (disabled)");
+        return;
+    }
+    match display.get_current_state().await {
+        Ok(st) => {
+            super::tablet_mapping::reapply_after_reconcile(tablet_config, desired_primary, &st.1)
+                .await;
+        }
+        Err(e) => warn!("Tablet mapping: get_current_state for immediate reapply: {e}"),
+    }
+}
+
 pub async fn run(
     mut orient_rx: broadcast::Receiver<String>,
     mut kb_rx: broadcast::Receiver<bool>,
@@ -1389,7 +1408,8 @@ pub async fn run(
     kb_result_tx: tokio::sync::mpsc::Sender<()>,
     desired_primary: Arc<tokio::sync::RwLock<String>>,
     desired_secondary: Arc<tokio::sync::RwLock<bool>>,
-    tablet_config: crate::config::TabletMappingConfig,
+    tablet_config: Arc<tokio::sync::RwLock<crate::config::TabletMappingConfig>>,
+    mut tablet_remap_rx: broadcast::Receiver<()>,
 ) {
     let conn = loop {
         match Connection::session().await {
@@ -1520,19 +1540,22 @@ pub async fn run(
                                 warn!("Display: secondary sysfs poweroff ready notify failed: {e}");
                             }
                         }
-                        if tablet_config.enable {
-                            match display.get_current_state().await {
-                                Ok(st) => {
-                                    let prim = desired_primary.read().await.clone();
-                                    super::tablet_mapping::reapply_after_reconcile(
-                                        &tablet_config,
-                                        &prim,
-                                        &st.1,
-                                    )
-                                    .await;
-                                }
-                                Err(e) => {
-                                    warn!("Tablet mapping: get_current_state after reconcile: {e}");
+                        {
+                            let tc = tablet_config.read().await.clone();
+                            if tc.enable {
+                                match display.get_current_state().await {
+                                    Ok(st) => {
+                                        let prim = desired_primary.read().await.clone();
+                                        super::tablet_mapping::reapply_after_reconcile(
+                                            &tc,
+                                            &prim,
+                                            &st.1,
+                                        )
+                                        .await;
+                                    }
+                                    Err(e) => {
+                                        warn!("Tablet mapping: get_current_state after reconcile: {e}");
+                                    }
                                 }
                             }
                         }
@@ -1670,6 +1693,11 @@ pub async fn run(
                 Err(broadcast::error::RecvError::Lagged(n)) => warn!("Keyboard handler lagged by {n}"),
                 Err(broadcast::error::RecvError::Closed) => break,
             },
+            _ = tablet_remap_rx.recv() => {
+                let tc = tablet_config.read().await.clone();
+                let prim = desired_primary.read().await.clone();
+                reapply_tablet_mapping_now(&display, &prim, &tc).await;
+            }
             msg = desired_primary_rx.recv() => match msg {
                 Ok(desired) => {
                     *desired_primary.write().await = desired;

@@ -26,6 +26,9 @@
  *   DesiredDisplayLayout
  *   DisplayBrightness
  *   DisplayApplyPaused
+ *   TabletMappingEnabled
+ *   TabletMappingMode
+ *   TabletMappingApplyNonce
  *   MicMuteLed
  *   KeyboardBacklightLevel
  *
@@ -35,6 +38,10 @@
  *   SetKeyboardBacklightLevel(y)
  *   SetSecondaryDisplayDesired(bool)
  *   SetDesiredPrimary(string)
+ *   SetTabletMappingEnabled(bool)
+ *   SetTabletMappingMode(string)
+ *   ToggleTabletMappingMode()
+ *   ApplyTabletMapping()
  */
 
 import GObject from 'gi://GObject';
@@ -73,6 +80,14 @@ const DBUS_XML = `
     <method name="SetDesiredPrimary">
       <arg name="primary" type="s" direction="in"/>
     </method>
+    <method name="SetTabletMappingEnabled">
+      <arg name="enabled" type="b" direction="in"/>
+    </method>
+    <method name="SetTabletMappingMode">
+      <arg name="mode" type="s" direction="in"/>
+    </method>
+    <method name="ToggleTabletMappingMode"/>
+    <method name="ApplyTabletMapping"/>
     <property name="KeyboardUsbConnected" type="b" access="read"/>
     <property name="KeyboardPogoDocked" type="b" access="read"/>
     <property name="BluetoothConnected" type="b" access="read"/>
@@ -88,6 +103,9 @@ const DBUS_XML = `
     <property name="DesiredDisplayLayout" type="s" access="read"/>
     <property name="DisplayBrightness" type="u" access="read"/>
     <property name="DisplayApplyPaused" type="b" access="read"/>
+    <property name="TabletMappingEnabled" type="b" access="read"/>
+    <property name="TabletMappingMode" type="s" access="read"/>
+    <property name="TabletMappingApplyNonce" type="u" access="read"/>
   </interface>
 </node>`;
 
@@ -156,7 +174,7 @@ function displayAttachmentText(value) {
     case 'all_connected':
         return 'All connected';
     default:
-        return value;
+        return value ?? 'unknown';
     }
 }
 
@@ -167,7 +185,18 @@ function displayLayoutText(value) {
     case 'joined':
         return 'Joined';
     default:
-        return value;
+        return value ?? 'unknown';
+    }
+}
+
+function tabletMappingModeText(value) {
+    switch (value) {
+    case 'one_to_one':
+        return 'Match panels';
+    case 'all_to_primary':
+        return 'All to primary';
+    default:
+        return value ?? 'unknown';
     }
 }
 
@@ -230,6 +259,52 @@ class ZenbookKeyboardBatteryToggle extends QuickMenuToggle {
             this._primaryMenu.menu.addMenuItem(item);
             this._primaryMenuItems.set(primary, item);
         }
+        this._tabletMenu = new PopupMenu.PopupSubMenuMenuItem('Stylus / tablet mapping');
+        this._tabletStatusItem = new PopupMenu.PopupMenuItem('Enabled: unknown', {
+            reactive: false,
+            can_focus: false,
+        });
+        this._tabletModeItem = new PopupMenu.PopupMenuItem('Mode: unknown', {
+            reactive: false,
+            can_focus: false,
+        });
+        this._tabletNonceItem = new PopupMenu.PopupMenuItem('Last apply nonce: unknown', {
+            reactive: false,
+            can_focus: false,
+        });
+        this._tabletRefreshItem = new PopupMenu.PopupMenuItem('Refresh pens now');
+        this._tabletRefreshItem.connect('activate', () => {
+            this._extension.callMethod('ApplyTabletMapping', GLib.Variant.new('()', []));
+        });
+        this._suppressTabletToggle = false;
+        this._tabletEnableItem = new PopupMenu.PopupSwitchMenuItem('Stylus panel mapping', false);
+        this._tabletEnableItem.connect('toggled', (_item, state) => {
+            if (this._suppressTabletToggle)
+                return;
+            this._extension.callMethod(
+                'SetTabletMappingEnabled',
+                GLib.Variant.new('(b)', [state]),
+            );
+        });
+        this._tabletModeMenu = new PopupMenu.PopupSubMenuMenuItem('Mapping mode');
+        this._tabletModeItems = new Map();
+        for (const mode of ['one_to_one', 'all_to_primary']) {
+            const item = new PopupMenu.PopupMenuItem(tabletMappingModeText(mode));
+            item.connect('activate', () => {
+                this._extension.callMethod(
+                    'SetTabletMappingMode',
+                    GLib.Variant.new('(s)', [mode]),
+                );
+            });
+            this._tabletModeMenu.menu.addMenuItem(item);
+            this._tabletModeItems.set(mode, item);
+        }
+        this._tabletMenu.menu.addMenuItem(this._tabletStatusItem);
+        this._tabletMenu.menu.addMenuItem(this._tabletModeItem);
+        this._tabletMenu.menu.addMenuItem(this._tabletNonceItem);
+        this._tabletMenu.menu.addMenuItem(this._tabletEnableItem);
+        this._tabletMenu.menu.addMenuItem(this._tabletModeMenu);
+        this._tabletMenu.menu.addMenuItem(this._tabletRefreshItem);
         this._suppressMicToggle = false;
         this._micItem = new PopupMenu.PopupSwitchMenuItem('Microphone muted (LED)', false);
         this._micItem.connect('toggled', (_item, state) => {
@@ -265,6 +340,7 @@ class ZenbookKeyboardBatteryToggle extends QuickMenuToggle {
         this._displayMenu.menu.addMenuItem(this._displayPausedItem);
         this._displayMenu.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         this._displayMenu.menu.addMenuItem(this._primaryMenu);
+        this.menu.addMenuItem(this._tabletMenu);
         this.menu.addMenuItem(this._backlightMenu);
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         this.menu.addMenuItem(this._micItem);
@@ -307,6 +383,18 @@ class ZenbookKeyboardBatteryToggle extends QuickMenuToggle {
             state.displayBrightness === null ? 'unknown' : state.displayBrightness
         }`;
         const pausedText = `Apply paused: ${state.displayApplyPaused ? 'yes' : 'no'}`;
+        const tabletEnabledText = `Enabled: ${
+            state.tabletMappingEnabled === null
+                ? 'unknown'
+                : (state.tabletMappingEnabled ? 'yes' : 'no')
+        }`;
+        const tabletModeText = `Mode: ${tabletMappingModeText(state.tabletMappingMode)}`;
+        const tabletNonceText = `Last apply nonce: ${
+            state.tabletMappingApplyNonce === null ? 'unknown' : state.tabletMappingApplyNonce
+        }`;
+        const tabletKnown = state.tabletMappingEnabled !== null
+            && state.tabletMappingMode !== null
+            && state.tabletMappingApplyNonce !== null;
 
         this.subtitle = `${connectedText} · ${batteryText}`;
         this._stateItem.label.text = `Keyboard: ${connectedText}`;
@@ -316,6 +404,13 @@ class ZenbookKeyboardBatteryToggle extends QuickMenuToggle {
         this._displayLayoutItem.label.text = layoutText;
         this._displayBrightnessItem.label.text = brightnessText;
         this._displayPausedItem.label.text = pausedText;
+        this._tabletStatusItem.label.text = tabletEnabledText;
+        this._tabletModeItem.label.text = tabletModeText;
+        this._tabletNonceItem.label.text = tabletNonceText;
+        this._tabletMenu.label.text = tabletKnown
+            ? 'Stylus / tablet mapping'
+            : 'Stylus / tablet mapping (daemon pending)';
+        this._tabletMenu.setSensitive(tabletKnown);
 
         if (state.keyboardBatteryPresent) {
             this.iconName = batteryIconName(
@@ -356,6 +451,13 @@ class ZenbookKeyboardBatteryToggle extends QuickMenuToggle {
                     : PopupMenu.Ornament.NONE,
             );
         }
+        for (const [mode, item] of this._tabletModeItems.entries()) {
+            item.setOrnament(
+                mode === state.tabletMappingMode
+                    ? PopupMenu.Ornament.DOT
+                    : PopupMenu.Ornament.NONE,
+            );
+        }
 
         if (state.micMuteLed === null) {
             this._micItem.setSensitive(false);
@@ -365,6 +467,18 @@ class ZenbookKeyboardBatteryToggle extends QuickMenuToggle {
             this._micItem.setToggleState(state.micMuteLed);
             this._suppressMicToggle = false;
         }
+
+        if (state.tabletMappingEnabled === null) {
+            this._tabletEnableItem.setSensitive(false);
+        } else {
+            this._tabletEnableItem.setSensitive(true);
+            this._suppressTabletToggle = true;
+            this._tabletEnableItem.setToggleState(state.tabletMappingEnabled);
+            this._suppressTabletToggle = false;
+        }
+
+        this._tabletModeMenu.setSensitive(tabletKnown && state.tabletMappingEnabled);
+        this._tabletRefreshItem.setSensitive(tabletKnown && state.tabletMappingEnabled);
     }
 });
 
@@ -541,6 +655,9 @@ export default class ZenbookDuoExtension extends Extension {
         const desiredLayoutVar = get('DesiredDisplayLayout');
         const brightnessVar = get('DisplayBrightness');
         const displayPausedVar = get('DisplayApplyPaused');
+        const tabletMappingEnabledVar = get('TabletMappingEnabled');
+        const tabletMappingModeVar = get('TabletMappingMode');
+        const tabletMappingApplyNonceVar = get('TabletMappingApplyNonce');
         const micMuteVar = get('MicMuteLed');
         const backlightLevelVar = get('KeyboardBacklightLevel');
 
@@ -558,6 +675,11 @@ export default class ZenbookDuoExtension extends Extension {
             desiredDisplayLayout: variantValue(desiredLayoutVar, 'joined'),
             displayBrightness: brightnessVar ? brightnessVar.deepUnpack() : null,
             displayApplyPaused: variantValue(displayPausedVar, false),
+            tabletMappingEnabled: tabletMappingEnabledVar ? tabletMappingEnabledVar.get_boolean() : null,
+            tabletMappingMode: tabletMappingModeVar ? tabletMappingModeVar.deepUnpack() : null,
+            tabletMappingApplyNonce: tabletMappingApplyNonceVar
+                ? tabletMappingApplyNonceVar.deepUnpack()
+                : null,
             micMuteLed: micMuteVar ? micMuteVar.get_boolean() : null,
             keyboardBacklightLevel: backlightLevelVar ? backlightLevelVar.get_byte() : null,
         };

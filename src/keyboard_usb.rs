@@ -70,7 +70,7 @@ async fn run_usb_battery_get_poll(
 ) {
     if let Some((pct, status)) = poll_usb_battery_via_get_report(&device).await {
         if state_manager.is_keyboard_pogo_docked() {
-            info!(
+            debug!(
                 "POGO: keyboard battery from HID GET_REPORT poll (5a 3d): {pct}% status=0x{status:02x}"
             );
         }
@@ -89,7 +89,7 @@ async fn run_usb_battery_get_poll(
                 }
                 if let Some((pct, status)) = poll_usb_battery_via_get_report(&device).await {
                     if state_manager.is_keyboard_pogo_docked() {
-                        info!(
+                        debug!(
                             "POGO: keyboard battery from HID GET_REPORT poll (5a 3d): {pct}% status=0x{status:02x}"
                         );
                     }
@@ -347,13 +347,14 @@ async fn parse_keyboard_data(
     if let Some((pct, status)) = parse_usb_battery_report(data) {
         if plausible_usb_battery_sample(pct, status) {
             if state_manager.is_keyboard_pogo_docked() {
-                info!(
+                debug!(
                     "POGO: keyboard battery vendor report 5a 3d (interrupt IN): {pct}% status=0x{status:02x}"
                 );
+            } else {
+                debug!(
+                    "USB battery report: {pct}% status=0x{status:02x} raw={data:?}"
+                );
             }
-            debug!(
-                "USB battery report: {pct}% status=0x{status:02x} raw={data:?}"
-            );
             state_manager.set_keyboard_battery_usb(pct, status);
             return;
         }

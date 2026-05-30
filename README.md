@@ -258,6 +258,10 @@ zenbook-duo-daemon control mic-mute-led true
 zenbook-duo-daemon control keyboard-backlight-toggle
 zenbook-duo-daemon control keyboard-backlight-set medium
 zenbook-duo-daemon control desired-primary-set eDP-2
+zenbook-duo-daemon control tablet-mapping-enable true
+zenbook-duo-daemon control tablet-mapping-mode one-to-one
+zenbook-duo-daemon control tablet-mapping-mode-toggle
+zenbook-duo-daemon control tablet-mapping-apply
 zenbook-duo-daemon control desired-secondary-enabled true
 zenbook-duo-daemon control secondary-display-toggle
 zenbook-duo-daemon control secondary-display false

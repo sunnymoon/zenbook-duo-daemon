@@ -150,7 +150,7 @@ impl Default for UsbKeyboardPortsConfig {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TabletMappingConfig {
     /// When `true`, the session daemon reapplies GNOME tablet `output` mappings after each
     /// successful display reconcile (and on the same cadence as layout stabilisation).
@@ -163,9 +163,26 @@ pub struct TabletMappingConfig {
 impl Default for TabletMappingConfig {
     fn default() -> Self {
         Self {
-            enable: false,
+            enable: true,
             mode: TabletMapMode::default(),
         }
+    }
+}
+
+pub fn tablet_mode_to_str(mode: TabletMapMode) -> &'static str {
+    match mode {
+        TabletMapMode::OneToOne => "one_to_one",
+        TabletMapMode::AllToPrimary => "all_to_primary",
+    }
+}
+
+pub fn tablet_mode_from_str(mode: &str) -> Result<TabletMapMode, String> {
+    match mode {
+        "one_to_one" => Ok(TabletMapMode::OneToOne),
+        "all_to_primary" => Ok(TabletMapMode::AllToPrimary),
+        other => Err(format!(
+            "tablet mapping mode must be one_to_one or all_to_primary, got {other}"
+        )),
     }
 }
 
@@ -282,7 +299,7 @@ impl Config {
 # pogo_dock_hub_ports = [\"6\"]          # UX8406CA: 6 = bottom pogo, 4 = side charge (not pogo)
 #
 # [tablet]                               # Optional: GNOME Wayland pen → panel mapping (see README)
-# enable = false                         # When true, reapplies after each successful display reconcile
+# enable = true                          # When true, reapplies after each successful display reconcile
 # mode = \"one_to_one\"                  # or \"all_to_primary\" — see `TabletMapMode` in `src/config.rs`
         ".trim();
         let config_str = format!("{}\n\n\n{}", help, config_str);

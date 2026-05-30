@@ -69,6 +69,23 @@ impl DesiredPrimaryArg {
     }
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum TabletMappingModeArg {
+    #[value(name = "one-to-one")]
+    OneToOne,
+    #[value(name = "all-to-primary")]
+    AllToPrimary,
+}
+
+impl TabletMappingModeArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::OneToOne => "one_to_one",
+            Self::AllToPrimary => "all_to_primary",
+        }
+    }
+}
+
 /// Backlight level for `control keyboard-backlight set`.
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum BacklightLevelArg {
@@ -110,6 +127,20 @@ enum ControlCmd {
         #[arg(value_enum)]
         primary: DesiredPrimaryArg,
     },
+    /// Enable or disable GNOME stylus → panel mapping
+    TabletMappingEnable {
+        #[arg(action = clap::ArgAction::Set, value_parser = clap::value_parser!(bool))]
+        on: bool,
+    },
+    /// Stylus mapping mode: `one-to-one` (4447→eDP-1, 4448→eDP-2) or `all-to-primary`
+    TabletMappingMode {
+        #[arg(value_enum)]
+        mode: TabletMappingModeArg,
+    },
+    /// Cycle stylus mapping mode (no-op when mapping disabled)
+    TabletMappingModeToggle,
+    /// Re-apply gsettings pen mapping now (session)
+    TabletMappingApply,
     /// Toggle desired secondary (bottom) internal display
     SecondaryDisplayToggle,
     /// Enable or disable desired secondary display (`true` / `false`)
@@ -196,6 +227,14 @@ async fn main() {
                 ControlCmd::DesiredPrimarySet { primary } => {
                     OperatorCommand::SetDesiredPrimary(primary.as_str().to_string())
                 }
+                ControlCmd::TabletMappingEnable { on } => {
+                    OperatorCommand::SetTabletMappingEnabled(on)
+                }
+                ControlCmd::TabletMappingMode { mode } => {
+                    OperatorCommand::SetTabletMappingMode(mode.as_str().to_string())
+                }
+                ControlCmd::TabletMappingModeToggle => OperatorCommand::ToggleTabletMappingMode,
+                ControlCmd::TabletMappingApply => OperatorCommand::ApplyTabletMapping,
                 ControlCmd::SecondaryDisplayToggle => OperatorCommand::ToggleSecondaryDisplay,
                 ControlCmd::SecondaryDisplay { on } | ControlCmd::DesiredSecondaryEnabled { on } => {
                     OperatorCommand::SetSecondaryDisplay(on)
@@ -261,8 +300,13 @@ async fn run_daemon(config_path: PathBuf) {
                 keyboard.device_address(),
             )
             .await;
-            let state_manager =
-                KeyboardStateManager::new(true, pogo_docked, event_sender.clone()).await;
+            let state_manager = KeyboardStateManager::new(
+                true,
+                pogo_docked,
+                config.tablet.clone(),
+                event_sender.clone(),
+            )
+            .await;
             let activity_notifier = start_idle_detection_task(&config, state_manager.clone());
 
             let current_usb_keyboard = start_usb_keyboard_task(
@@ -277,8 +321,13 @@ async fn run_daemon(config_path: PathBuf) {
             .await;
             (state_manager, activity_notifier, Some(current_usb_keyboard))
         } else {
-            let state_manager =
-                KeyboardStateManager::new(false, false, event_sender.clone()).await;
+            let state_manager = KeyboardStateManager::new(
+                false,
+                false,
+                config.tablet.clone(),
+                event_sender.clone(),
+            )
+            .await;
             let activity_notifier = start_idle_detection_task(&config, state_manager.clone());
 
             (state_manager, activity_notifier, None)
