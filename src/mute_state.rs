@@ -11,18 +11,46 @@ use crate::state::KeyboardStateManager;
 
 pub fn start_listen_mute_state_thread(state_manager: KeyboardStateManager) {
     thread::spawn(move || {
+        let mut consecutive_failures = 0u32;
         loop {
             if let Some((uid, pa_socket_path)) = find_pulseaudio_socket_path() {
                 info!("Found pulseaudio socket path: {:?}", pa_socket_path);
                 if let Err(e) = listen_mute_state(pa_socket_path, uid, state_manager.clone()) {
                     warn!("Error listening to mute state: {:?}", e);
+                    consecutive_failures += 1;
+                    // Exponential backoff: 1s, 2s, 4s, 8s, capped at 60s
+                    let backoff_secs = std::cmp::min(2u64.pow(consecutive_failures), 60);
+                    info!("Backing off for {} seconds before retrying mute state listener", backoff_secs);
+                    thread::sleep(Duration::from_secs(backoff_secs));
+                } else {
+                    // Success: reset backoff counter
+                    consecutive_failures = 0;
                 }
 
                 state_manager.set_mic_mute_led(false);
+            } else {
+                // PulseAudio socket not found, back off
+                consecutive_failures = (consecutive_failures + 1).min(60);
+                let backoff_secs = std::cmp::min(2u64.pow(consecutive_failures.saturating_sub(1)), 60);
+                thread::sleep(Duration::from_secs(backoff_secs));
             }
-            thread::sleep(Duration::from_secs(1));
         }
     });
+}
+
+pub fn set_default_source_mute(enabled: bool) -> Result<(), String> {
+    with_default_source_client(|client| client.set_default_source_muted(enabled))
+        .map_err(|e| format!("set default source mute: {e}"))
+}
+
+pub fn toggle_default_source_mute() -> Result<bool, String> {
+    with_default_source_client(|client| {
+        let current = client.get_is_default_source_muted()?;
+        let next = !current;
+        client.set_default_source_muted(next)?;
+        Ok(next)
+    })
+    .map_err(|e| format!("toggle default source mute: {e}"))
 }
 
 fn find_pulseaudio_socket_path() -> Option<(u32, PathBuf)> {
@@ -51,6 +79,19 @@ fn find_pulseaudio_socket_path() -> Option<(u32, PathBuf)> {
         }
     }
     None
+}
+
+fn with_default_source_client<F, T>(mut f: F) -> Result<T, ProtocolError>
+where
+    F: FnMut(&mut PulseAudioClient) -> Result<T, ProtocolError>,
+{
+    let (uid, pa_socket_path) = find_pulseaudio_socket_path()
+        .ok_or_else(|| ProtocolError::Invalid("no user PulseAudio socket found".into()))?;
+    let user = get_user_by_uid(uid).ok_or_else(|| ProtocolError::Invalid("user not found".into()))?;
+    let cookie_path = user.home_dir().join(".config/pulse/cookie");
+    let cookie = std::fs::read(cookie_path)?;
+    let mut client = PulseAudioClient::new(&pa_socket_path, cookie)?;
+    f(&mut client)
 }
 
 fn listen_mute_state(
@@ -178,5 +219,21 @@ impl PulseAudioClient {
             self.protocol_version,
         )?;
         Ok(response.muted)
+    }
+
+    pub fn set_default_source_muted(&mut self, muted: bool) -> Result<(), ProtocolError> {
+        protocol::write_command_message(
+            self.sock.get_mut(),
+            self.seq,
+            &protocol::Command::SetSourceMute(protocol::SetDeviceMuteParams {
+                device_index: None,
+                device_name: Some(DEFAULT_SOURCE.into()),
+                mute: muted,
+            }),
+            self.protocol_version,
+        )?;
+        self.seq += 1;
+        let _ = protocol::read_ack_message(&mut self.sock)?;
+        Ok(())
     }
 }

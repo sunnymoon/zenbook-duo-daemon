@@ -344,6 +344,7 @@ async fn run_daemon(config_path: PathBuf) {
         state_manager.clone(),
         config.clone(),
         activity_notifier.clone(),
+        virtual_keyboard.clone(),
     )
     .await
     {

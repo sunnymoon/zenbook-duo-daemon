@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use evdev_rs::enums::EV_KEY;
 use futures::StreamExt;
 use log::{error, info, warn};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
@@ -106,6 +107,7 @@ struct RootStateInterface {
     registered: Arc<AtomicBool>,
     ack_tx: broadcast::Sender<AckEvent>,
     apply_guard: Arc<Mutex<DisplayApplyGuard>>,
+    virtual_keyboard: Arc<Mutex<crate::virtual_keyboard::VirtualKeyboard>>,
 }
 
 impl RootStateInterface {
@@ -115,6 +117,7 @@ impl RootStateInterface {
         registered: Arc<AtomicBool>,
         ack_tx: broadcast::Sender<AckEvent>,
         apply_guard: Arc<Mutex<DisplayApplyGuard>>,
+        virtual_keyboard: Arc<Mutex<crate::virtual_keyboard::VirtualKeyboard>>,
     ) -> Self {
         Self {
             state_manager,
@@ -122,6 +125,7 @@ impl RootStateInterface {
             registered,
             ack_tx,
             apply_guard,
+            virtual_keyboard,
         }
     }
 
@@ -553,7 +557,9 @@ impl RootStateInterface {
         #[zbus(connection)] connection: &Connection,
     ) -> fdo::Result<()> {
         self.require_operator(&header, connection).await?;
-        self.state_manager.toggle_mic_mute_led();
+        let muted = crate::mute_state::toggle_default_source_mute()
+            .map_err(|e| fdo::Error::Failed(format!("toggle microphone mute: {e}")))?;
+        self.state_manager.set_mic_mute_led(muted);
         Ok(())
     }
 
@@ -564,7 +570,15 @@ impl RootStateInterface {
         #[zbus(connection)] connection: &Connection,
     ) -> fdo::Result<()> {
         self.require_operator(&header, connection).await?;
+        crate::mute_state::set_default_source_mute(enabled)
+            .map_err(|e| fdo::Error::Failed(format!("set microphone mute: {e}")))?;
         self.state_manager.set_mic_mute_led(enabled);
+        
+        // Send KEY_MICMUTE keyboard event so GNOME shows the overlay
+        let mut keyboard = self.virtual_keyboard.lock().await;
+        keyboard.release_prev_and_press_keys(&[EV_KEY::KEY_MICMUTE]);
+        keyboard.release_all_keys();
+        
         Ok(())
     }
 
@@ -1282,6 +1296,7 @@ pub async fn start_root_service(
     state_manager: KeyboardStateManager,
     config: Config,
     activity_notifier: ActivityNotifier,
+    virtual_keyboard: Arc<Mutex<crate::virtual_keyboard::VirtualKeyboard>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let registration = Arc::new(RwLock::new(None));
     let registered = Arc::new(AtomicBool::new(false));
@@ -1298,6 +1313,7 @@ pub async fn start_root_service(
                 registered.clone(),
                 ack_tx.clone(),
                 apply_guard,
+                virtual_keyboard,
             ),
         )?
         .build()
