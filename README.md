@@ -257,11 +257,14 @@ You can configure:
 
 The **root** daemon must be running. Commands call **D-Bus** on `asus.zenbook.duo`. The calling process must pass **Polkit** for `org.zenbook.duo.operator` (typically: **active local graphical session** or **root**). See `zenbook-duo-daemon --help` and `control --help`.
 
-Read all root **properties** (keyboard, battery, display desire, tablet mapping, session registration):
+Read all root **properties** (keyboard, battery, display desire, tablet mapping, session registration / health):
 
 ```bash
 zenbook-duo-daemon state
 ```
+
+`state` includes `session_quiet`, which turns true when the registered session has gone quiet for
+long enough that the extension should warn about stale session-side updates.
 
 Examples:
 

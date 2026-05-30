@@ -25,6 +25,7 @@ pub const ROOT_DBUS_PATH: &str = "/asus/zenbook/duo/State";
 /// bounding bursts that destabilize KMS.
 const DISPLAY_APPLY_GUARD_MAX_ATTEMPTS: u32 = 15;
 const DISPLAY_APPLY_GUARD_DECAY_SECS: u64 = 5;
+const SESSION_HEALTH_STALE_USEC: u64 = 30_000_000;
 
 #[derive(Default)]
 struct DisplayApplyGuard {
@@ -360,6 +361,16 @@ impl RootStateInterface {
             .as_ref()
             .map(|s| s.last_seen_usec)
             .unwrap_or(0)
+    }
+
+    #[zbus(property)]
+    async fn session_quiet(&self) -> bool {
+        let Some(session) = self.registration.read().await.as_ref().cloned() else {
+            return false;
+        };
+
+        let now = session_now_usec();
+        now.saturating_sub(session.last_seen_usec) > SESSION_HEALTH_STALE_USEC
     }
 
     async fn register_session(
@@ -812,6 +823,9 @@ trait RootState {
 
     #[zbus(property)]
     fn session_last_seen_usec(&self) -> zbus::Result<u64>;
+
+    #[zbus(property)]
+    fn session_quiet(&self) -> zbus::Result<bool>;
 }
 
 async fn emit_keyboard_usb_connected_changed() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
@@ -1676,6 +1690,7 @@ pub async fn query_root_state_for_cli() -> Result<Vec<(String, String)>, String>
         "session_last_seen_usec",
         proxy.session_last_seen_usec().await,
     );
+    push_root_state_property(&mut rows, "session_quiet", proxy.session_quiet().await);
 
     Ok(rows)
 }

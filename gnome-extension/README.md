@@ -10,7 +10,7 @@ from the `zenbook-duo-daemon` directly in the GNOME UI.
 | **Top-bar status area** (right side) | Keyboard icon + battery status. Shows `%` (+⚡ when charging) when a battery sample exists; otherwise shows a keyboard state marker. |
 | **Quick Settings panel** (the dropdown) | A "Zenbook Keyboard" tile showing keyboard state (`Attached (pogo)`, `USB connected`, `Bluetooth mode`, `Detached`) and battery status, plus a nested display-policy submenu. |
 | **Quick Settings actions** | Toggle second display desired state from the tile itself, synced **Mic mute LED** switch, **Keyboard backlight** selector (Off/Low/Medium/High), **Primary panel** selector (`eDP-1` / `eDP-2`), and **Stylus / tablet mapping** controls. Second-display toggle is disabled while pogo-attached. |
-| **Daemon/session status** | In the tile menu, shows `Root: up/unreachable` and session link status (`linked`, `not registered`, or `daemon update pending`), plus owner/id when available. |
+| **Daemon/session status** | In the tile menu, shows `Root: up/unreachable` and session link status (`linked`, `quiet`, `not registered`, or `daemon update pending`), plus owner/id and last-seen age when available. |
 
 > The tablet mapping controls are shown only when the daemon exposes the tablet D-Bus fields; otherwise the submenu stays disabled as "daemon pending".
 
@@ -29,8 +29,8 @@ Properties read: `KeyboardUsbConnected`, `KeyboardPogoDocked`,
 `DesiredSecondaryEnabled`, `DesiredDisplayAttachment`, `DesiredDisplayLayout`,
 `DisplayBrightness`, `DisplayApplyPaused`, `TabletMappingEnabled`,
 `TabletMappingMode`, `TabletMappingApplyNonce`, `SessionRegistered`,
-`SessionOwner`, `SessionId`, `SessionLastSeenUsec`, `MicMuteLed`,
-`KeyboardBacklightLevel`.
+`SessionOwner`, `SessionId`, `SessionLastSeenUsec`, `SessionQuiet`,
+`MicMuteLed`, `KeyboardBacklightLevel`.
 
 Methods called (from Quick Settings actions): `SetSecondaryDisplayDesired(bool)`,
 `SetDesiredPrimary(string)`, `SetTabletMappingEnabled(bool)`,

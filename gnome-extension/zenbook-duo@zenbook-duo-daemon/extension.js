@@ -114,6 +114,7 @@ const DBUS_XML = `
     <property name="SessionOwner" type="s" access="read"/>
     <property name="SessionId" type="t" access="read"/>
     <property name="SessionLastSeenUsec" type="t" access="read"/>
+    <property name="SessionQuiet" type="b" access="read"/>
   </interface>
 </node>`;
 
@@ -167,6 +168,15 @@ function connectionStateText(state) {
     if (state.bluetoothConnected)
         return 'Bluetooth mode';
     return 'Detached';
+}
+
+function formatSessionAge(ageSeconds) {
+    if (ageSeconds < 60)
+        return `${ageSeconds}s`;
+
+    const minutes = Math.floor(ageSeconds / 60);
+    const seconds = ageSeconds % 60;
+    return seconds === 0 ? `${minutes}m` : `${minutes}m ${seconds}s`;
 }
 
 function variantValue(variant, fallback) {
@@ -419,10 +429,12 @@ class ZenbookKeyboardBatteryToggle extends QuickMenuToggle {
         const tabletNonceText = `Last apply nonce: ${
             state.tabletMappingApplyNonce === null ? 'unknown' : state.tabletMappingApplyNonce
         }`;
-        const staleSession = state.sessionRegistered === true
+        const sessionAgeSeconds = state.sessionRegistered === true
             && state.sessionLastSeenUsec !== null
             && state.sessionLastSeenUsec > 0
-            && (state.nowUsec - state.sessionLastSeenUsec) > 30_000_000;
+            ? Math.max(0, Math.floor((state.nowUsec - state.sessionLastSeenUsec) / 1_000_000))
+            : null;
+        const staleSession = state.sessionQuiet === true;
         const tabletKnown = state.tabletMappingEnabled !== null
             && state.tabletMappingMode !== null
             && state.tabletMappingApplyNonce !== null;
@@ -438,11 +450,14 @@ class ZenbookKeyboardBatteryToggle extends QuickMenuToggle {
             this._daemonDetailItem.label.text = 'Session details unavailable';
         } else if (state.sessionRegistered) {
             this._daemonStatusItem.label.text = staleSession
-                ? 'Root: up · Session: linked (session quiet)'
+                ? 'Root: up · Session: quiet'
                 : 'Root: up · Session: linked';
             const ownerText = state.sessionOwner || 'unknown owner';
             const idText = state.sessionId === null ? 'unknown id' : `id ${state.sessionId}`;
-            this._daemonDetailItem.label.text = `${ownerText} · ${idText}`;
+            const ageText = sessionAgeSeconds === null
+                ? ''
+                : ` · last seen ${formatSessionAge(sessionAgeSeconds)} ago`;
+            this._daemonDetailItem.label.text = `${ownerText} · ${idText}${ageText}`;
         } else {
             this._daemonStatusItem.label.text = 'Root: up · Session: not registered';
             this._daemonDetailItem.label.text = 'No active session daemon registration';
@@ -620,6 +635,7 @@ export default class ZenbookDuoExtension extends Extension {
             sessionOwner: null,
             sessionId: null,
             sessionLastSeenUsec: null,
+            sessionQuiet: null,
             micMuteLed: null,
             keyboardBacklightLevel: null,
         };
@@ -635,6 +651,11 @@ export default class ZenbookDuoExtension extends Extension {
             this._indicator.quickSettingsItems.forEach(i => i.destroy());
             this._indicator.destroy();
             this._indicator = null;
+        }
+
+        if (this._healthTimerId) {
+            GLib.Source.remove(this._healthTimerId);
+            this._healthTimerId = 0;
         }
     }
 
@@ -674,6 +695,17 @@ export default class ZenbookDuoExtension extends Extension {
                 // Initial read
                 this._refresh();
 
+                if (!this._healthTimerId) {
+                    this._healthTimerId = GLib.timeout_add_seconds(
+                        GLib.PRIORITY_DEFAULT,
+                        10,
+                        () => {
+                            this._refresh();
+                            return GLib.SOURCE_CONTINUE;
+                        },
+                    );
+                }
+
                 // Watch for property changes pushed by the daemon.
                 this._propChangeId = this._proxy.connect(
                     'g-properties-changed',
@@ -698,6 +730,11 @@ export default class ZenbookDuoExtension extends Extension {
                 this._nameOwnerId = null;
             }
             this._proxy = null;
+        }
+
+        if (this._healthTimerId) {
+            GLib.Source.remove(this._healthTimerId);
+            this._healthTimerId = 0;
         }
     }
 
@@ -752,6 +789,7 @@ export default class ZenbookDuoExtension extends Extension {
         const sessionOwnerVar = get('SessionOwner');
         const sessionIdVar = get('SessionId');
         const sessionLastSeenUsecVar = get('SessionLastSeenUsec');
+        const sessionQuietVar = get('SessionQuiet');
         const micMuteVar = get('MicMuteLed');
         const backlightLevelVar = get('KeyboardBacklightLevel');
         const rootReachable = Boolean(this._proxy.get_name_owner());
@@ -781,6 +819,7 @@ export default class ZenbookDuoExtension extends Extension {
             sessionOwner: sessionOwnerVar ? sessionOwnerVar.deepUnpack() : null,
             sessionId: numberFromVariantValue(sessionIdVar),
             sessionLastSeenUsec: numberFromVariantValue(sessionLastSeenUsecVar),
+            sessionQuiet: sessionQuietVar ? sessionQuietVar.get_boolean() : null,
             micMuteLed: micMuteVar ? micMuteVar.get_boolean() : null,
             keyboardBacklightLevel: backlightLevelVar ? backlightLevelVar.get_byte() : null,
         };
