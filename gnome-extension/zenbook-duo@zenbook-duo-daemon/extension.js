@@ -37,15 +37,11 @@
  *   KeyboardBacklightLevel
  *
  * Methods used by UI actions:
- *   ToggleMicMuteLed
- *   SetMicMuteLed(bool)
+ *   SetMicMute(bool)
  *   SetKeyboardBacklightLevel(y)
  *   SetSecondaryDisplayDesired(bool)
  *   SetDesiredPrimary(string)
- *   SetTabletMappingEnabled(bool)
  *   SetTabletMappingMode(string)
- *   ToggleTabletMappingMode()
- *   ApplyTabletMapping()
  */
 
 import GObject from 'gi://GObject';
@@ -71,8 +67,8 @@ const DBUS_INTERFACE = 'asus.zenbook.duo.State';
 const DBUS_XML = `
 <node>
   <interface name="asus.zenbook.duo.State">
-    <method name="ToggleMicMuteLed"/>
-    <method name="SetMicMuteLed">
+    <method name="ToggleMicMute"/>
+    <method name="SetMicMute">
       <arg name="enabled" type="b" direction="in"/>
     </method>
     <method name="SetKeyboardBacklightLevel">
@@ -84,14 +80,9 @@ const DBUS_XML = `
     <method name="SetDesiredPrimary">
       <arg name="primary" type="s" direction="in"/>
     </method>
-    <method name="SetTabletMappingEnabled">
-      <arg name="enabled" type="b" direction="in"/>
-    </method>
     <method name="SetTabletMappingMode">
       <arg name="mode" type="s" direction="in"/>
     </method>
-    <method name="ToggleTabletMappingMode"/>
-    <method name="ApplyTabletMapping"/>
     <property name="KeyboardUsbConnected" type="b" access="read"/>
     <property name="KeyboardPogoDocked" type="b" access="read"/>
     <property name="BluetoothConnected" type="b" access="read"/>
@@ -120,53 +111,73 @@ const DBUS_XML = `
 
 const BACKLIGHT_LABELS = ['Off', 'Low', 'Medium', 'High'];
 
-// ── Battery icon helpers ───────────────────────────────────────────────────
-
-/**
- * Returns a Adwaita/symbolic icon name that matches the battery level and
- * charging state, following the same naming convention GNOME uses for the
- * built-in battery indicator.
- *
- * @param {number}  pct       0-100
- * @param {boolean} charging  side-USB charge in progress
- * @param {boolean} full      battery is full / at threshold
- */
-function batteryIconName(pct, charging, full) {
-    if (full || pct >= 95)
-        return charging ? 'battery-level-100-charging-symbolic' : 'battery-full-symbolic';
-
-    // Round to nearest 10 for the levelled icons (10, 20, … 90)
-    const level = Math.max(0, Math.min(100, Math.round(pct / 10) * 10));
-
-    if (charging)
-        return `battery-level-${level}-charging-symbolic`;
-
-    if (pct <= 10)
-        return 'battery-empty-symbolic';
-    if (pct <= 20)
-        return 'battery-caution-symbolic';
-
-    return `battery-level-${level}-symbolic`;
+function batterySeverity(present, pct) {
+    if (!present)
+        return 'unknown';
+    if (pct < 5)
+        return 'critical';
+    if (pct < 10)
+        return 'severe';
+    if (pct < 25)
+        return 'warning';
+    return 'normal';
 }
 
-/**
- * Human-readable status string shown inside the Quick Settings card.
- */
-function batteryStatusText(pct, charging, full) {
-    if (full)
-        return `Full (${pct}%)`;
-    if (charging)
-        return `Charging — ${pct}%`;
-    return `${pct}%`;
+function updateSeverityStyle(actor, prefix, severity) {
+    const classes = [`${prefix}-warning`, `${prefix}-severe`, `${prefix}-critical`];
+    for (const klass of classes)
+        actor.remove_style_class_name(klass);
+    switch (severity) {
+    case 'warning':
+        actor.add_style_class_name(`${prefix}-warning`);
+        break;
+    case 'severe':
+        actor.add_style_class_name(`${prefix}-severe`);
+        break;
+    case 'critical':
+        actor.add_style_class_name(`${prefix}-critical`);
+        break;
+    default:
+        break;
+    }
+}
+
+function updateHealthStyle(actor, status) {
+    const classes = ['zenbook-status-on', 'zenbook-status-off', 'zenbook-status-warn'];
+    for (const klass of classes)
+        actor.remove_style_class_name(klass);
+    switch (status) {
+    case 'on':
+        actor.add_style_class_name('zenbook-status-on');
+        break;
+    case 'off':
+        actor.add_style_class_name('zenbook-status-off');
+        break;
+    case 'warn':
+        actor.add_style_class_name('zenbook-status-warn');
+        break;
+    default:
+        break;
+    }
+}
+
+function connectionStateShortText(state) {
+    if (state.keyboardPogoDocked)
+        return 'Pogo';
+    if (state.keyboardUsbConnected)
+        return 'USB';
+    if (state.bluetoothConnected)
+        return 'BT';
+    return 'Detached';
 }
 
 function connectionStateText(state) {
     if (state.keyboardPogoDocked)
-        return 'Attached (pogo)';
+        return 'Attached via pogo';
     if (state.keyboardUsbConnected)
         return 'USB connected';
     if (state.bluetoothConnected)
-        return 'Bluetooth mode';
+        return 'Bluetooth connected';
     return 'Detached';
 }
 
@@ -187,44 +198,8 @@ function numberFromVariantValue(variant) {
     if (!variant)
         return null;
     const value = variant.deepUnpack();
-    if (typeof value === 'bigint')
-        return Number(value);
+    // Keep bigints as-is to avoid precision loss; return other types as-is
     return value;
-}
-
-function displayAttachmentText(value) {
-    switch (value) {
-    case 'builtin_only':
-        return 'Built-in only';
-    case 'external_only':
-        return 'External only';
-    case 'all_connected':
-        return 'All connected';
-    default:
-        return value ?? 'unknown';
-    }
-}
-
-function displayLayoutText(value) {
-    switch (value) {
-    case 'mirror':
-        return 'Mirror';
-    case 'joined':
-        return 'Joined';
-    default:
-        return value ?? 'unknown';
-    }
-}
-
-function tabletMappingModeText(value) {
-    switch (value) {
-    case 'one_to_one':
-        return 'Match panels';
-    case 'all_to_primary':
-        return 'All to primary';
-    default:
-        return value ?? 'unknown';
-    }
 }
 
 // ── Quick Settings card ────────────────────────────────────────────────────
@@ -233,120 +208,56 @@ const ZenbookKeyboardBatteryToggle = GObject.registerClass(
 class ZenbookKeyboardBatteryToggle extends QuickMenuToggle {
     _init(extension) {
         super._init({
-            title: 'Zenbook Keyboard',
+            title: 'Duo Kbd',
             iconName: 'input-keyboard-symbolic',
             toggleMode: true,
         });
         this._extension = extension;
-        this.menu.setHeader('input-keyboard-symbolic', 'Zenbook Duo');
+        this.menu.setHeader('input-keyboard-symbolic', 'Zenbook Duo Kbd');
 
-        this._stateItem = new PopupMenu.PopupMenuItem('Keyboard: Detached', {
+        this._healthItem = new PopupMenu.PopupImageMenuItem('Root unavailable', 'dialog-error-symbolic', {
             reactive: false,
             can_focus: false,
         });
-        this._batteryItem = new PopupMenu.PopupMenuItem('Battery: Unknown', {
+        this._linkItem = new PopupMenu.PopupImageMenuItem('Keyboard detached', 'input-keyboard-symbolic', {
             reactive: false,
             can_focus: false,
         });
-        this._daemonStatusItem = new PopupMenu.PopupMenuItem('Root: unreachable', {
+        this._batteryItem = new PopupMenu.PopupImageMenuItem('Battery unknown', 'input-keyboard-symbolic', {
             reactive: false,
             can_focus: false,
         });
-        this._daemonDetailItem = new PopupMenu.PopupMenuItem('Session: unknown', {
+        this._availabilityItem = new PopupMenu.PopupImageMenuItem('Second display available', 'video-display-symbolic', {
             reactive: false,
             can_focus: false,
         });
-        this._availabilityItem = new PopupMenu.PopupMenuItem('Second display: available', {
-            reactive: false,
-            can_focus: false,
+        this._primaryTopItem = new PopupMenu.PopupMenuItem('Use top panel as primary');
+        this._primaryTopItem.connect('activate', () => {
+            this._extension.callMethod('SetDesiredPrimary', GLib.Variant.new('(s)', ['eDP-1']));
         });
-        this._displayMenu = new PopupMenu.PopupSubMenuMenuItem('Display policy');
-        this._displayPrimaryItem = new PopupMenu.PopupMenuItem('Primary: eDP-1', {
-            reactive: false,
-            can_focus: false,
+        this._primaryBottomItem = new PopupMenu.PopupMenuItem('Use bottom panel as primary');
+        this._primaryBottomItem.connect('activate', () => {
+            this._extension.callMethod('SetDesiredPrimary', GLib.Variant.new('(s)', ['eDP-2']));
         });
-        this._displayAttachmentItem = new PopupMenu.PopupMenuItem('Attachment: builtin_only', {
-            reactive: false,
-            can_focus: false,
-        });
-        this._displayLayoutItem = new PopupMenu.PopupMenuItem('Layout: joined', {
-            reactive: false,
-            can_focus: false,
-        });
-        this._displayBrightnessItem = new PopupMenu.PopupMenuItem('Brightness: unknown', {
-            reactive: false,
-            can_focus: false,
-        });
-        this._displayPausedItem = new PopupMenu.PopupMenuItem('Apply paused: no', {
-            reactive: false,
-            can_focus: false,
-        });
-        this._primaryMenu = new PopupMenu.PopupSubMenuMenuItem('Primary panel');
-        this._primaryMenuItems = new Map();
-        for (const primary of ['eDP-1', 'eDP-2']) {
-            const item = new PopupMenu.PopupMenuItem(primary);
-            item.connect('activate', () => {
-                this._extension.callMethod(
-                    'SetDesiredPrimary',
-                    GLib.Variant.new('(s)', [primary]),
-                );
-            });
-            this._primaryMenu.menu.addMenuItem(item);
-            this._primaryMenuItems.set(primary, item);
-        }
         this._tabletMenu = new PopupMenu.PopupSubMenuMenuItem('Stylus / tablet mapping');
-        this._tabletStatusItem = new PopupMenu.PopupMenuItem('Enabled: unknown', {
-            reactive: false,
-            can_focus: false,
-        });
-        this._tabletModeItem = new PopupMenu.PopupMenuItem('Mode: unknown', {
-            reactive: false,
-            can_focus: false,
-        });
-        this._tabletNonceItem = new PopupMenu.PopupMenuItem('Last apply nonce: unknown', {
-            reactive: false,
-            can_focus: false,
-        });
-        this._tabletRefreshItem = new PopupMenu.PopupMenuItem('Refresh pens now');
-        this._tabletRefreshItem.connect('activate', () => {
-            this._extension.callMethod('ApplyTabletMapping', GLib.Variant.new('()', []));
-        });
-        this._suppressTabletToggle = false;
-        this._tabletEnableItem = new PopupMenu.PopupSwitchMenuItem('Stylus panel mapping', false);
-        this._tabletEnableItem.connect('toggled', (_item, state) => {
-            if (this._suppressTabletToggle)
+        this._suppressMatchPanelsToggle = false;
+        this._matchPanelsItem = new PopupMenu.PopupSwitchMenuItem('Match panels', false);
+        this._matchPanelsItem.connect('toggled', (_item, state) => {
+            if (this._suppressMatchPanelsToggle)
                 return;
             this._extension.callMethod(
-                'SetTabletMappingEnabled',
-                GLib.Variant.new('(b)', [state]),
+                'SetTabletMappingMode',
+                GLib.Variant.new('(s)', [state ? 'one_to_one' : 'all_to_primary']),
             );
         });
-        this._tabletModeMenu = new PopupMenu.PopupSubMenuMenuItem('Mapping mode');
-        this._tabletModeItems = new Map();
-        for (const mode of ['one_to_one', 'all_to_primary']) {
-            const item = new PopupMenu.PopupMenuItem(tabletMappingModeText(mode));
-            item.connect('activate', () => {
-                this._extension.callMethod(
-                    'SetTabletMappingMode',
-                    GLib.Variant.new('(s)', [mode]),
-                );
-            });
-            this._tabletModeMenu.menu.addMenuItem(item);
-            this._tabletModeItems.set(mode, item);
-        }
-        this._tabletMenu.menu.addMenuItem(this._tabletStatusItem);
-        this._tabletMenu.menu.addMenuItem(this._tabletModeItem);
-        this._tabletMenu.menu.addMenuItem(this._tabletNonceItem);
-        this._tabletMenu.menu.addMenuItem(this._tabletEnableItem);
-        this._tabletMenu.menu.addMenuItem(this._tabletModeMenu);
-        this._tabletMenu.menu.addMenuItem(this._tabletRefreshItem);
+        this._tabletMenu.menu.addMenuItem(this._matchPanelsItem);
         this._suppressMicToggle = false;
-        this._micItem = new PopupMenu.PopupSwitchMenuItem('Microphone muted (LED)', false);
+        this._micItem = new PopupMenu.PopupSwitchMenuItem('Microphone muted', false);
         this._micItem.connect('toggled', (_item, state) => {
             if (this._suppressMicToggle)
                 return;
             this._extension.callMethod(
-                'SetMicMuteLed',
+                'SetMicMute',
                 GLib.Variant.new('(b)', [state]),
             );
         });
@@ -364,19 +275,13 @@ class ZenbookKeyboardBatteryToggle extends QuickMenuToggle {
             this._backlightMenuItems.set(level, item);
         }
 
-        this.menu.addMenuItem(this._stateItem);
+        this.menu.addMenuItem(this._healthItem);
+        this.menu.addMenuItem(this._linkItem);
         this.menu.addMenuItem(this._batteryItem);
-        this.menu.addMenuItem(this._daemonStatusItem);
-        this.menu.addMenuItem(this._daemonDetailItem);
         this.menu.addMenuItem(this._availabilityItem);
-        this.menu.addMenuItem(this._displayMenu);
-        this._displayMenu.menu.addMenuItem(this._displayPrimaryItem);
-        this._displayMenu.menu.addMenuItem(this._displayAttachmentItem);
-        this._displayMenu.menu.addMenuItem(this._displayLayoutItem);
-        this._displayMenu.menu.addMenuItem(this._displayBrightnessItem);
-        this._displayMenu.menu.addMenuItem(this._displayPausedItem);
-        this._displayMenu.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-        this._displayMenu.menu.addMenuItem(this._primaryMenu);
+        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        this.menu.addMenuItem(this._primaryTopItem);
+        this.menu.addMenuItem(this._primaryBottomItem);
         this.menu.addMenuItem(this._tabletMenu);
         this.menu.addMenuItem(this._backlightMenu);
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
@@ -406,92 +311,53 @@ class ZenbookKeyboardBatteryToggle extends QuickMenuToggle {
      */
     update(state) {
         const connectedText = connectionStateText(state);
+        const connectedShort = connectionStateShortText(state);
         const batteryText = state.keyboardBatteryPresent
-            ? batteryStatusText(
-                state.keyboardBatteryPercentage,
-                state.keyboardBatteryCharging,
-                state.keyboardBatteryFull,
-            )
+            ? `${state.keyboardBatteryPercentage}%${state.keyboardBatteryCharging ? ' ⚡' : ''}`
             : 'Unknown';
-        const primaryText = `Primary: ${state.desiredPrimary}`;
-        const attachmentText = `Attachment: ${displayAttachmentText(state.desiredDisplayAttachment)}`;
-        const layoutText = `Layout: ${displayLayoutText(state.desiredDisplayLayout)}`;
-        const brightnessText = `Brightness: ${
-            state.displayBrightness === null ? 'unknown' : state.displayBrightness
-        }`;
-        const pausedText = `Apply paused: ${state.displayApplyPaused ? 'yes' : 'no'}`;
-        const tabletEnabledText = `Enabled: ${
-            state.tabletMappingEnabled === null
-                ? 'unknown'
-                : (state.tabletMappingEnabled ? 'yes' : 'no')
-        }`;
-        const tabletModeText = `Mode: ${tabletMappingModeText(state.tabletMappingMode)}`;
-        const tabletNonceText = `Last apply nonce: ${
-            state.tabletMappingApplyNonce === null ? 'unknown' : state.tabletMappingApplyNonce
-        }`;
-        const sessionAgeSeconds = state.sessionRegistered === true
-            && state.sessionLastSeenUsec !== null
-            && state.sessionLastSeenUsec > 0
-            ? Math.max(0, Math.floor((state.nowUsec - state.sessionLastSeenUsec) / 1_000_000))
-            : null;
+        const severity = batterySeverity(state.keyboardBatteryPresent, state.keyboardBatteryPercentage);
+        // The daemon provides sessionQuiet to indicate stale sessions; no need to calculate age locally
         const staleSession = state.sessionQuiet === true;
-        const tabletKnown = state.tabletMappingEnabled !== null
-            && state.tabletMappingMode !== null
-            && state.tabletMappingApplyNonce !== null;
+        const tabletKnown = state.tabletMappingMode !== null;
 
-        this.subtitle = `${connectedText} · ${batteryText}`;
-        this._stateItem.label.text = `Keyboard: ${connectedText}`;
-        this._batteryItem.label.text = `Battery: ${batteryText}`;
+        this.subtitle = `${connectedShort} · ${batteryText}`;
+        this._linkItem.label.text = `Keyboard ${connectedText}`;
+        this._batteryItem.label.text = `Keyboard battery ${batteryText}`;
+        updateSeverityStyle(this._batteryItem.label, 'zenbook-kbd-battery', severity);
         if (!state.rootReachable) {
-            this._daemonStatusItem.label.text = 'Root: unreachable';
-            this._daemonDetailItem.label.text = 'Session: unknown';
+            this._healthItem.label.text = 'Root off · Session unknown';
+            updateHealthStyle(this._healthItem.label, 'off');
         } else if (state.sessionRegistered === null) {
-            this._daemonStatusItem.label.text = 'Root: up · Session: daemon update pending';
-            this._daemonDetailItem.label.text = 'Session details unavailable';
+            this._healthItem.label.text = 'Root on · Session pending';
+            updateHealthStyle(this._healthItem.label, 'warn');
         } else if (state.sessionRegistered) {
-            this._daemonStatusItem.label.text = staleSession
-                ? 'Root: up · Session: quiet'
-                : 'Root: up · Session: linked';
-            const ownerText = state.sessionOwner || 'unknown owner';
-            const idText = state.sessionId === null ? 'unknown id' : `id ${state.sessionId}`;
-            const ageText = sessionAgeSeconds === null
-                ? ''
-                : ` · last seen ${formatSessionAge(sessionAgeSeconds)} ago`;
-            this._daemonDetailItem.label.text = `${ownerText} · ${idText}${ageText}`;
+            const ageText = sessionAgeSeconds === null ? '' : ` · ${formatSessionAge(sessionAgeSeconds)} ago`;
+            this._healthItem.label.text = staleSession
+                ? `Root on · Session quiet${ageText}`
+                : `Root on · Session linked${ageText}`;
+            updateHealthStyle(this._healthItem.label, staleSession ? 'warn' : 'on');
         } else {
-            this._daemonStatusItem.label.text = 'Root: up · Session: not registered';
-            this._daemonDetailItem.label.text = 'No active session daemon registration';
+            this._healthItem.label.text = 'Root on · Session off';
+            updateHealthStyle(this._healthItem.label, 'off');
         }
-        this._displayPrimaryItem.label.text = primaryText;
-        this._displayAttachmentItem.label.text = attachmentText;
-        this._displayLayoutItem.label.text = layoutText;
-        this._displayBrightnessItem.label.text = brightnessText;
-        this._displayPausedItem.label.text = pausedText;
-        this._tabletStatusItem.label.text = tabletEnabledText;
-        this._tabletModeItem.label.text = tabletModeText;
-        this._tabletNonceItem.label.text = tabletNonceText;
-        this._tabletMenu.label.text = tabletKnown
-            ? 'Stylus / tablet mapping'
-            : 'Stylus / tablet mapping (daemon pending)';
+        this._tabletMenu.label.text = tabletKnown ? 'Stylus / tablet mapping' : 'Stylus / tablet mapping (pending)';
         this._tabletMenu.setSensitive(tabletKnown);
+        this._primaryTopItem.setOrnament(
+            state.desiredPrimary === 'eDP-1' ? PopupMenu.Ornament.DOT : PopupMenu.Ornament.NONE,
+        );
+        this._primaryBottomItem.setOrnament(
+            state.desiredPrimary === 'eDP-2' ? PopupMenu.Ornament.DOT : PopupMenu.Ornament.NONE,
+        );
 
-        if (state.keyboardBatteryPresent) {
-            this.iconName = batteryIconName(
-                state.keyboardBatteryPercentage,
-                state.keyboardBatteryCharging,
-                state.keyboardBatteryFull,
-            );
-        } else {
-            this.iconName = 'input-keyboard-symbolic';
-        }
+        this.iconName = 'input-keyboard-symbolic';
 
         this.checked = state.desiredSecondaryEnabled;
         if (state.keyboardPogoDocked) {
-            this.setSensitive(false);
-            this._availabilityItem.label.text = 'Second display: unavailable while attached';
+            this.sensitive = false;
+            this._availabilityItem.label.text = 'Second display unavailable while attached';
         } else {
-            this.setSensitive(true);
-            this._availabilityItem.label.text = 'Second display: available';
+            this.sensitive = true;
+            this._availabilityItem.label.text = 'Second display available';
         }
 
         const hasLink = state.keyboardUsbConnected || state.keyboardPogoDocked || state.bluetoothConnected;
@@ -507,21 +373,6 @@ class ZenbookKeyboardBatteryToggle extends QuickMenuToggle {
                     : PopupMenu.Ornament.NONE,
             );
         }
-        for (const [primary, item] of this._primaryMenuItems.entries()) {
-            item.setOrnament(
-                primary === state.desiredPrimary
-                    ? PopupMenu.Ornament.DOT
-                    : PopupMenu.Ornament.NONE,
-            );
-        }
-        for (const [mode, item] of this._tabletModeItems.entries()) {
-            item.setOrnament(
-                mode === state.tabletMappingMode
-                    ? PopupMenu.Ornament.DOT
-                    : PopupMenu.Ornament.NONE,
-            );
-        }
-
         if (state.micMuteLed === null) {
             this._micItem.setSensitive(false);
         } else {
@@ -531,17 +382,12 @@ class ZenbookKeyboardBatteryToggle extends QuickMenuToggle {
             this._suppressMicToggle = false;
         }
 
-        if (state.tabletMappingEnabled === null) {
-            this._tabletEnableItem.setSensitive(false);
-        } else {
-            this._tabletEnableItem.setSensitive(true);
-            this._suppressTabletToggle = true;
-            this._tabletEnableItem.setToggleState(state.tabletMappingEnabled);
-            this._suppressTabletToggle = false;
+        this._matchPanelsItem.setSensitive(tabletKnown);
+        if (tabletKnown) {
+            this._suppressMatchPanelsToggle = true;
+            this._matchPanelsItem.setToggleState(state.tabletMappingMode === 'one_to_one');
+            this._suppressMatchPanelsToggle = false;
         }
-
-        this._tabletModeMenu.setSensitive(tabletKnown && state.tabletMappingEnabled);
-        this._tabletRefreshItem.setSensitive(tabletKnown && state.tabletMappingEnabled);
     }
 });
 
@@ -577,21 +423,20 @@ class ZenbookKeyboardBatteryIndicator extends SystemIndicator {
     update(state) {
         const hasLink = state.keyboardUsbConnected || state.keyboardPogoDocked || state.bluetoothConnected;
         const show = hasLink || state.keyboardBatteryPresent;
+        const severity = batterySeverity(state.keyboardBatteryPresent, state.keyboardBatteryPercentage);
         this._panelIcon.visible = show;
         this._panelLabel.visible = show;
 
         if (state.keyboardBatteryPresent) {
-            this._panelIcon.icon_name = batteryIconName(
-                state.keyboardBatteryPercentage,
-                state.keyboardBatteryCharging,
-                state.keyboardBatteryFull,
-            );
+            this._panelIcon.icon_name = 'input-keyboard-symbolic';
             const suffix = state.keyboardBatteryCharging ? '⚡' : '';
             this._panelLabel.text = `${state.keyboardBatteryPercentage}%${suffix}`;
         } else {
             this._panelIcon.icon_name = 'input-keyboard-symbolic';
             this._panelLabel.text = hasLink ? '—' : '';
         }
+        updateSeverityStyle(this._panelLabel, 'zenbook-kbd-battery', severity);
+        updateSeverityStyle(this._panelIcon, 'zenbook-kbd-battery', severity);
 
         this._toggle.update(state);
     }
@@ -764,6 +609,9 @@ export default class ZenbookDuoExtension extends Extension {
      * them to the indicator.
      */
     _refresh() {
+        // Guard against calls during or after disable()
+        if (!this._indicator || !this._proxy)
+            return;
         if (!this._proxy || !this._indicator)
             return;
 
