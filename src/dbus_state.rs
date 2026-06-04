@@ -3,7 +3,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use evdev_rs::enums::EV_KEY;
 use futures::StreamExt;
 use log::{error, info, warn};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
@@ -107,7 +106,6 @@ struct RootStateInterface {
     registered: Arc<AtomicBool>,
     ack_tx: broadcast::Sender<AckEvent>,
     apply_guard: Arc<Mutex<DisplayApplyGuard>>,
-    virtual_keyboard: Arc<Mutex<crate::virtual_keyboard::VirtualKeyboard>>,
 }
 
 impl RootStateInterface {
@@ -117,7 +115,6 @@ impl RootStateInterface {
         registered: Arc<AtomicBool>,
         ack_tx: broadcast::Sender<AckEvent>,
         apply_guard: Arc<Mutex<DisplayApplyGuard>>,
-        virtual_keyboard: Arc<Mutex<crate::virtual_keyboard::VirtualKeyboard>>,
     ) -> Self {
         Self {
             state_manager,
@@ -125,7 +122,6 @@ impl RootStateInterface {
             registered,
             ack_tx,
             apply_guard,
-            virtual_keyboard,
         }
     }
 
@@ -173,8 +169,8 @@ impl RootStateInterface {
 /// One-shot commands forwarded to the running root daemon (see CLI `control` / legacy shell scripts).
 #[derive(Debug, Clone)]
 pub enum OperatorCommand {
-    ToggleMicMuteLed,
-    SetMicMuteLed(bool),
+    ToggleMicMute,
+    SetMicMute(bool),
     ToggleKeyboardBacklight,
     /// 0 = off, 1 = low, 2 = medium, 3 = high
     SetKeyboardBacklightLevel(u8),
@@ -551,7 +547,7 @@ impl RootStateInterface {
         Ok(())
     }
 
-    async fn toggle_mic_mute_led(
+    async fn toggle_mic_mute(
         &self,
         #[zbus(header)] header: Header<'_>,
         #[zbus(connection)] connection: &Connection,
@@ -563,7 +559,7 @@ impl RootStateInterface {
         Ok(())
     }
 
-    async fn set_mic_mute_led(
+    async fn set_mic_mute(
         &self,
         enabled: bool,
         #[zbus(header)] header: Header<'_>,
@@ -573,12 +569,6 @@ impl RootStateInterface {
         crate::mute_state::set_default_source_mute(enabled)
             .map_err(|e| fdo::Error::Failed(format!("set microphone mute: {e}")))?;
         self.state_manager.set_mic_mute_led(enabled);
-        
-        // Send KEY_MICMUTE keyboard event so GNOME shows the overlay
-        let mut keyboard = self.virtual_keyboard.lock().await;
-        keyboard.release_prev_and_press_keys(&[EV_KEY::KEY_MICMUTE]);
-        keyboard.release_all_keys();
-        
         Ok(())
     }
 
@@ -753,8 +743,8 @@ trait RootState {
     fn report_observed_display_mode(&self, attachment: String, layout: String) -> zbus::Result<()>;
     fn register_display_apply_attempt(&self) -> zbus::Result<bool>;
     fn resume_display_applies(&self) -> zbus::Result<()>;
-    fn toggle_mic_mute_led(&self) -> zbus::Result<()>;
-    fn set_mic_mute_led(&self, enabled: bool) -> zbus::Result<()>;
+    fn toggle_mic_mute(&self) -> zbus::Result<()>;
+    fn set_mic_mute(&self, enabled: bool) -> zbus::Result<()>;
     fn toggle_keyboard_backlight(&self) -> zbus::Result<()>;
     fn set_keyboard_backlight_level(&self, level: u8) -> zbus::Result<()>;
     fn set_desired_primary(&self, primary: String) -> zbus::Result<()>;
@@ -1296,7 +1286,6 @@ pub async fn start_root_service(
     state_manager: KeyboardStateManager,
     config: Config,
     activity_notifier: ActivityNotifier,
-    virtual_keyboard: Arc<Mutex<crate::virtual_keyboard::VirtualKeyboard>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let registration = Arc::new(RwLock::new(None));
     let registered = Arc::new(AtomicBool::new(false));
@@ -1313,7 +1302,6 @@ pub async fn start_root_service(
                 registered.clone(),
                 ack_tx.clone(),
                 apply_guard,
-                virtual_keyboard,
             ),
         )?
         .build()
@@ -1720,8 +1708,8 @@ pub async fn run_operator_command(cmd: OperatorCommand) -> Result<(), String> {
         .map_err(|e| format!("Connect to {}: {e}", ROOT_DBUS_SERVICE))?;
 
     match cmd {
-        OperatorCommand::ToggleMicMuteLed => proxy.toggle_mic_mute_led().await,
-        OperatorCommand::SetMicMuteLed(enabled) => proxy.set_mic_mute_led(enabled).await,
+        OperatorCommand::ToggleMicMute => proxy.toggle_mic_mute().await,
+        OperatorCommand::SetMicMute(enabled) => proxy.set_mic_mute(enabled).await,
         OperatorCommand::ToggleKeyboardBacklight => proxy.toggle_keyboard_backlight().await,
         OperatorCommand::SetKeyboardBacklightLevel(level) => {
             proxy.set_keyboard_backlight_level(level).await

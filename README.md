@@ -45,7 +45,7 @@ The project currently installs multiple components:
 - ✅ Bluetooth-detached keyboard handling
 - ✅ Fn-lock state restore in USB and Bluetooth mode
 - ✅ Keyboard backlight control in USB and Bluetooth mode
-- ✅ Microphone-mute LED control in USB and Bluetooth mode
+- ✅ Microphone mute control (default source) with backend-observed keyboard LED sync in USB and Bluetooth mode
 - ✅ Secondary display policy based on keyboard attachment
 - ✅ Secondary display brightness mirroring from the primary display
 - ✅ Display orientation integration through the session daemon
@@ -136,7 +136,7 @@ Implementation: `src/keyboard_bt.rs` (`start_bt_keyboard_monitor_task`, `try_sta
 | Brightness Up Key               | ✅         | ✅             | `KEY_BRIGHTNESSUP`           | ✅                    |
 | Swap Up/Down Display Key        | ✅         | ✅             | Swap primary display         | ✅                    |
 | Microphone Mute Key             | ✅         | ✅             | `KEY_MICMUTE`                | ✅                    |
-| Microphone Mute LED Control     | ✅         | ✅             | Device state restore/control | ✅                    |
+| Microphone Mute + LED Sync      | ✅         | ✅             | Source mute + LED restore    | ✅                    |
 | Emoji Picker Key                | ✅         | ✅             | `KEY_LEFTCTRL + KEY_DOT`     | ✅                    |
 | MyASUS Key                      | ✅         | ✅             | No-op by default             | ✅                    |
 | Toggle Secondary Display Key    | ✅         | ✅             | Toggle secondary display     | ✅                    |
@@ -266,11 +266,14 @@ zenbook-duo-daemon state
 `state` includes `session_quiet`, which turns true when the registered session has gone quiet for
 long enough that the extension should warn about stale session-side updates.
 
+`control mic-mute …` now toggles the default microphone source mute and keeps the keyboard mic
+LED in sync with that mute state.
+
 Examples:
 
 ```bash
-zenbook-duo-daemon control mic-mute-led-toggle
-zenbook-duo-daemon control mic-mute-led true
+zenbook-duo-daemon control mic-mute-toggle
+zenbook-duo-daemon control mic-mute true
 zenbook-duo-daemon control keyboard-backlight-toggle
 zenbook-duo-daemon control keyboard-backlight-set medium
 zenbook-duo-daemon control desired-primary-set eDP-2

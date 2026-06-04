@@ -465,19 +465,6 @@ impl KeyboardStateManager {
         }
     }
 
-    pub fn toggle_mic_mute_led(&self) {
-        {
-            let mut state = self.state.write().unwrap();
-            state.mic_mute_led = !state.mic_mute_led;
-            if !state.is_suspended {
-                self.sender
-                    .send(Event::MicMuteLed(state.mic_mute_led))
-                    .ok();
-            }
-        }
-        Self::notify_mic_mute_led_changed_async();
-    }
-
     pub fn get_mic_mute_led(&self) -> bool {
         let state = self.state.read().unwrap();
         if state.is_suspended {

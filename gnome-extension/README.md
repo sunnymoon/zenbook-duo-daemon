@@ -7,12 +7,12 @@ from the `zenbook-duo-daemon` directly in the GNOME UI.
 
 | Location | What you see |
 |---|---|
-| **Top-bar status area** (right side) | Keyboard icon + battery status. Shows `%` (+⚡ when charging) when a battery sample exists; otherwise shows a keyboard state marker. |
-| **Quick Settings panel** (the dropdown) | A "Zenbook Keyboard" tile showing keyboard state (`Attached (pogo)`, `USB connected`, `Bluetooth mode`, `Detached`) and battery status, plus a nested display-policy submenu. |
-| **Quick Settings actions** | Toggle second display desired state from the tile itself, synced **Mic mute LED** switch, **Keyboard backlight** selector (Off/Low/Medium/High), **Primary panel** selector (`eDP-1` / `eDP-2`), and **Stylus / tablet mapping** controls. Second-display toggle is disabled while pogo-attached. |
+| **Top-bar status area** (right side) | Keyboard icon + battery `%` (+⚡ when charging). Battery severity thresholds are highlighted: `<25%` warning, `<10%` severe, `<5%` critical. |
+| **Quick Settings panel** (the dropdown) | A compact "Duo Kbd" tile with short subtitle (`Pogo`, `USB`, `BT`, `Detached`), health row (`Root` / `Session`), keyboard link row, and keyboard battery row with iconography. |
+| **Quick Settings actions** | Toggle second display desired state from the tile itself, **Microphone muted** switch (sets default-source mute; the keyboard LED follows the observed backend state), **Keyboard backlight** selector (Off/Low/Medium/High), direct primary panel actions (`eDP-1` / `eDP-2`), and a **Match panels** stylus-mapping switch. Second-display toggle is disabled while pogo-attached. |
 | **Daemon/session status** | In the tile menu, shows `Root: up/unreachable` and session link status (`linked`, `quiet`, `not registered`, or `daemon update pending`), plus owner/id and last-seen age when available. |
 
-> The tablet mapping controls are shown only when the daemon exposes the tablet D-Bus fields; otherwise the submenu stays disabled as "daemon pending".
+> The match-panels switch is shown only when the daemon exposes the tablet mapping mode field; otherwise the submenu stays disabled as "daemon pending".
 
 ## D-Bus interface consumed
 
@@ -33,11 +33,8 @@ Properties read: `KeyboardUsbConnected`, `KeyboardPogoDocked`,
 `MicMuteLed`, `KeyboardBacklightLevel`.
 
 Methods called (from Quick Settings actions): `SetSecondaryDisplayDesired(bool)`,
-`SetDesiredPrimary(string)`, `SetTabletMappingEnabled(bool)`,
-`SetTabletMappingMode(string)`, `ToggleTabletMappingMode()`,
-`ApplyTabletMapping()`, `SetMicMuteLed(bool)`,
-`ToggleMicMuteLed()`, `SetKeyboardBacklightLevel(byte)`,
-`ToggleKeyboardBacklight()`.
+`SetDesiredPrimary(string)`, `SetTabletMappingMode(string)`, `SetMicMute(bool)`,
+`SetKeyboardBacklightLevel(byte)`.
 
 ## Requirements
 

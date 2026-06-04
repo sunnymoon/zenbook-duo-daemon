@@ -15,3 +15,27 @@
 .zenbook-kbd-battery-status {
     font-size: 0.9em;
 }
+
+.zenbook-kbd-battery-warning {
+    color: #f6d32d;
+}
+
+.zenbook-kbd-battery-severe {
+    color: #ff7800;
+}
+
+.zenbook-kbd-battery-critical {
+    color: #e01b24;
+}
+
+.zenbook-status-on {
+    color: #3584e4;
+}
+
+.zenbook-status-off {
+    color: #e01b24;
+}
+
+.zenbook-status-warn {
+    color: #f6d32d;
+}

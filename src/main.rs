@@ -108,10 +108,10 @@ impl BacklightLevelArg {
 
 #[derive(Subcommand, Debug, Clone)]
 enum ControlCmd {
-    /// Toggle microphone-mute LED
-    MicMuteLedToggle,
-    /// Set microphone-mute LED on or off (`true` / `false`)
-    MicMuteLed {
+    /// Toggle microphone mute
+    MicMuteToggle,
+    /// Set microphone mute on or off (`true` / `false`)
+    MicMute {
         #[arg(action = clap::ArgAction::Set, value_parser = clap::value_parser!(bool))]
         on: bool,
     },
@@ -218,8 +218,8 @@ async fn main() {
         }
         Args::Control { cmd } => {
             let op = match cmd {
-                ControlCmd::MicMuteLedToggle => OperatorCommand::ToggleMicMuteLed,
-                ControlCmd::MicMuteLed { on } => OperatorCommand::SetMicMuteLed(on),
+                ControlCmd::MicMuteToggle => OperatorCommand::ToggleMicMute,
+                ControlCmd::MicMute { on } => OperatorCommand::SetMicMute(on),
                 ControlCmd::KeyboardBacklightToggle => OperatorCommand::ToggleKeyboardBacklight,
                 ControlCmd::KeyboardBacklightSet { level } => {
                     OperatorCommand::SetKeyboardBacklightLevel(level.to_u8())
@@ -344,7 +344,6 @@ async fn run_daemon(config_path: PathBuf) {
         state_manager.clone(),
         config.clone(),
         activity_notifier.clone(),
-        virtual_keyboard.clone(),
     )
     .await
     {
