@@ -59,6 +59,13 @@ impl KeyFunction {
     ) {
         match self {
             KeyFunction::KeyBind(items) => {
+                if items.as_slice() == [EV_KEY::KEY_MICMUTE] {
+                    match crate::mute_state::toggle_default_source_mute() {
+                        Ok(muted) => state_manager.set_mic_mute_led(muted),
+                        Err(e) => warn!("KeyFunction: toggle microphone mute failed: {e}"),
+                    }
+                    return;
+                }
                 virtual_keyboard
                     .lock()
                     .await

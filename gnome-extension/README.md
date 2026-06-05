@@ -7,12 +7,12 @@ from the `zenbook-duo-daemon` directly in the GNOME UI.
 
 | Location | What you see |
 |---|---|
-| **Top-bar status area** (right side) | Keyboard icon + battery `%` (+⚡ when charging). Battery severity thresholds are highlighted: `<25%` warning, `<10%` severe, `<5%` critical. |
-| **Quick Settings panel** (the dropdown) | A compact "Duo Kbd" tile with short subtitle (`Pogo`, `USB`, `BT`, `Detached`), health row (`Root` / `Session`), keyboard link row, and keyboard battery row with iconography. |
-| **Quick Settings actions** | Toggle second display desired state from the tile itself, **Microphone muted** switch (sets default-source mute; the keyboard LED follows the observed backend state), **Keyboard backlight** selector (Off/Low/Medium/High), direct primary panel actions (`eDP-1` / `eDP-2`), and a **Match panels** stylus-mapping switch. Second-display toggle is disabled while pogo-attached. |
-| **Daemon/session status** | In the tile menu, shows `Root: up/unreachable` and session link status (`linked`, `quiet`, `not registered`, or `daemon update pending`), plus owner/id and last-seen age when available. |
+| **Top-bar status area** (right side) | Keyboard icon + battery `%`, with `⚡` while charging and `↓` while discharging over Bluetooth. Battery severity thresholds are highlighted: `<25%` warning, `<10%` severe, `<5%` critical. |
+| **Quick Settings panel** (the dropdown) | A compact **Zen Duo** tile with stacked dual-display icon, subtitle like `BT ↓ [43%]`, `USB ⚡ [23%]`, `POGO ⚡ [29%]`, or `Detached [24%]` with the cached battery portion dimmed, plus health, keyboard, and rotation status rows. |
+| **Quick Settings actions** | **Bottom/Left/Right/Top display** switch for desired on/off state, **Top display as primary** switch, **Stylus match displays** switch, a compact **Keyboard backlight** header with a single row of larger icon-and-label buttons underneath (`Off / Low / Medium / High`, reusing the medium icon for both middle levels), and **Microphone** switch (`on` = unmuted, `off` = muted; the keyboard LED follows the observed backend state). The secondary-display row stays visible and dims while pogo-attached, and switch rows stay open after toggling. |
+| **Daemon/session status** | In the tile menu, shows `Root: up/unreachable` and session link status (`linked`, `quiet`, `not registered`, or `daemon update pending`), plus owner/id and last-seen age when available. `quiet` means the registered session stopped heartbeating on D-Bus, not merely that nothing changed. |
 
-> The match-panels switch is shown only when the daemon exposes the tablet mapping mode field; otherwise the submenu stays disabled as "daemon pending".
+> The stylus-mapping switch is shown only when the daemon exposes the tablet mapping mode field; otherwise it stays disabled as "daemon pending".
 
 ## D-Bus interface consumed
 

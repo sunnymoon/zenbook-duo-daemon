@@ -206,6 +206,18 @@ impl RootStateInterface {
         self.state_manager.is_bluetooth_connected()
     }
 
+    /// Debounced effective connection state used by UI and status clients.
+    #[zbus(property)]
+    fn keyboard_connected(&self) -> bool {
+        self.state_manager.is_keyboard_connected()
+    }
+
+    /// Debounced effective connection kind: `pogo`, `usb`, `bt`, or `detached`.
+    #[zbus(property)]
+    fn keyboard_connection_type(&self) -> String {
+        self.state_manager.keyboard_connection_kind().as_str().to_string()
+    }
+
     /// `true` when battery level is known (USB vendor report or BlueZ `Battery1`).
     #[zbus(property)]
     fn keyboard_battery_present(&self) -> bool {
@@ -224,6 +236,28 @@ impl RootStateInterface {
     #[zbus(property)]
     fn keyboard_battery_charging(&self) -> bool {
         self.state_manager.is_keyboard_battery_charging()
+    }
+
+    /// `true` when any last-known battery percentage is cached in memory (persisted across detach).
+    #[zbus(property)]
+    fn keyboard_battery_last_known_present(&self) -> bool {
+        self.state_manager
+            .keyboard_battery_last_known_percentage()
+            .is_some()
+    }
+
+    /// Last known battery percentage from USB or Bluetooth; 0 when unknown.
+    #[zbus(property)]
+    fn keyboard_battery_last_known_percentage(&self) -> u8 {
+        self.state_manager
+            .keyboard_battery_last_known_percentage()
+            .unwrap_or(0)
+    }
+
+    /// UI-facing charging state: true while live firmware reports charging or the keyboard is on USB/POGO power.
+    #[zbus(property)]
+    fn keyboard_battery_effective_charging(&self) -> bool {
+        self.state_manager.is_keyboard_battery_effective_charging()
     }
 
     /// Full on USB (firmware flag or SOC ≥ threshold) or on Bluetooth when SOC ≥ threshold.
@@ -289,6 +323,11 @@ impl RootStateInterface {
         self.state_manager.get_desired_display_mode().1
     }
 
+    #[zbus(property)]
+    fn display_rotation(&self) -> String {
+        self.state_manager.display_rotation()
+    }
+
     async fn report_observed_display_mode(
         &self,
         attachment: String,
@@ -311,6 +350,26 @@ impl RootStateInterface {
         if let Err(e) = emit_desired_display_mode_changed().await {
             warn!("report_observed_display_mode: failed to emit property change: {e}");
         }
+        Ok(())
+    }
+
+    async fn report_display_rotation(
+        &self,
+        rotation: String,
+        #[zbus(header)] header: Header<'_>,
+    ) -> fdo::Result<()> {
+        self.ensure_registered_sender(&header).await?;
+        self.mark_session_activity().await;
+        let normalized = match rotation.as_str() {
+            "normal" | "left-up" | "right-up" | "inverted" => rotation,
+            "bottom-up" => "inverted".to_string(),
+            other => {
+                return Err(fdo::Error::Failed(format!(
+                    "display rotation must be normal, left-up, right-up, or inverted; got {other}"
+                )));
+            }
+        };
+        self.state_manager.set_display_rotation(normalized);
         Ok(())
     }
 
@@ -352,9 +411,10 @@ impl RootStateInterface {
             .unwrap_or(0)
     }
 
-    /// Last session-originated RPC timestamp (µs since epoch); read in UI for staleness checks.
-    #[zbus(property)]
-    async fn session_last_seen_usec(&self) -> u64 {
+        /// Last successful session heartbeat / RPC timestamp (µs since epoch); read in UI for
+        /// liveness checks.
+        #[zbus(property)]
+        async fn session_last_seen_usec(&self) -> u64 {
         self.registration
             .read()
             .await
@@ -371,6 +431,12 @@ impl RootStateInterface {
 
         let now = session_now_usec();
         now.saturating_sub(session.last_seen_usec) > SESSION_HEALTH_STALE_USEC
+    }
+
+    async fn ping_session(&self, #[zbus(header)] header: Header<'_>) -> fdo::Result<()> {
+        self.ensure_registered_sender(&header).await?;
+        self.mark_session_activity().await;
+        Ok(())
     }
 
     async fn register_session(
@@ -735,12 +801,14 @@ impl RootStateInterface {
 )]
 trait RootState {
     fn register_session(&self, session_id: u64) -> zbus::Result<()>;
+    fn ping_session(&self) -> zbus::Result<()>;
     fn acknowledge_keyboard_pogo_docked(&self, value: bool) -> zbus::Result<()>;
     fn acknowledge_keyboard_attached(&self, value: bool) -> zbus::Result<()>;
     fn acknowledge_desired_secondary_applied(&self, value: bool) -> zbus::Result<()>;
     fn acknowledge_secondary_sysfs_poweroff_ready(&self) -> zbus::Result<()>;
     fn report_ambient_light_enabled(&self, value: bool) -> zbus::Result<()>;
     fn report_observed_display_mode(&self, attachment: String, layout: String) -> zbus::Result<()>;
+    fn report_display_rotation(&self, rotation: String) -> zbus::Result<()>;
     fn register_display_apply_attempt(&self) -> zbus::Result<bool>;
     fn resume_display_applies(&self) -> zbus::Result<()>;
     fn toggle_mic_mute(&self) -> zbus::Result<()>;
@@ -767,6 +835,12 @@ trait RootState {
 
     #[zbus(property)]
     fn bluetooth_connected(&self) -> zbus::Result<bool>;
+
+    #[zbus(property)]
+    fn keyboard_connected(&self) -> zbus::Result<bool>;
+
+    #[zbus(property)]
+    fn keyboard_connection_type(&self) -> zbus::Result<String>;
 
     #[zbus(property)]
     fn keyboard_battery_present(&self) -> zbus::Result<bool>;
@@ -809,6 +883,9 @@ trait RootState {
 
     #[zbus(property)]
     fn desired_display_layout(&self) -> zbus::Result<String>;
+
+    #[zbus(property)]
+    fn display_rotation(&self) -> zbus::Result<String>;
 
     #[zbus(property)]
     fn display_brightness(&self) -> zbus::Result<u32>;
@@ -885,6 +962,53 @@ pub async fn notify_keyboard_pogo_docked_changed(
     emit_keyboard_pogo_docked_changed().await
 }
 
+async fn emit_keyboard_connection_changed() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(handle) = get_root_handle().await else {
+        return Ok(false);
+    };
+
+    let iface_ref = handle
+        .connection
+        .object_server()
+        .interface::<_, RootStateInterface>(ROOT_DBUS_PATH)
+        .await?;
+    let iface = iface_ref.get().await;
+    let emitter = iface_ref.signal_emitter();
+    iface.keyboard_connected_changed(&emitter).await?;
+    iface.keyboard_connection_type_changed(&emitter).await?;
+
+    Ok(handle.registered.load(Ordering::SeqCst))
+}
+
+pub async fn notify_keyboard_connection_changed(
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    emit_keyboard_connection_changed().await
+}
+
+async fn emit_display_rotation_changed() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(handle) = get_root_handle().await else {
+        return Ok(false);
+    };
+
+    let iface_ref = handle
+        .connection
+        .object_server()
+        .interface::<_, RootStateInterface>(ROOT_DBUS_PATH)
+        .await?;
+    iface_ref
+        .get()
+        .await
+        .display_rotation_changed(iface_ref.signal_emitter())
+        .await?;
+
+    Ok(handle.registered.load(Ordering::SeqCst))
+}
+
+pub async fn notify_display_rotation_changed(
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    emit_display_rotation_changed().await
+}
+
 async fn emit_keyboard_battery_changed() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let Some(handle) = get_root_handle().await else {
         return Ok(false);
@@ -905,6 +1029,15 @@ async fn emit_keyboard_battery_changed() -> Result<bool, Box<dyn std::error::Err
         .await?;
     iface
         .keyboard_battery_charging_changed(&emitter)
+        .await?;
+    iface
+        .keyboard_battery_last_known_present_changed(&emitter)
+        .await?;
+    iface
+        .keyboard_battery_last_known_percentage_changed(&emitter)
+        .await?;
+    iface
+        .keyboard_battery_effective_charging_changed(&emitter)
         .await?;
     iface.keyboard_battery_full_changed(&emitter).await?;
 
@@ -1566,6 +1699,28 @@ pub async fn report_observed_display_mode_from_session(
     Ok(())
 }
 
+pub async fn report_display_rotation_from_session(rotation: String) -> Result<(), String> {
+    let (connection, _) = {
+        let guard = session_registered_system_bus_cell().lock().await;
+        guard
+            .as_ref()
+            .map(|(c, sid)| (c.clone(), *sid))
+            .ok_or_else(|| {
+                "session system bus not registered yet (is the session daemon running and connected to root?)"
+                    .to_string()
+            })?
+    };
+
+    let proxy = RootStateProxy::new(&connection)
+        .await
+        .map_err(|e| format!("root state proxy for report_display_rotation: {e}"))?;
+    proxy
+        .report_display_rotation(rotation)
+        .await
+        .map_err(|e| format!("report_display_rotation: {e}"))?;
+    Ok(())
+}
+
 pub async fn resume_display_applies() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let connection = Connection::system().await?;
     let proxy = RootStateProxy::new(&connection).await?;
@@ -1613,6 +1768,16 @@ pub async fn query_root_state_for_cli() -> Result<Vec<(String, String)>, String>
         &mut rows,
         "bluetooth_connected",
         proxy.bluetooth_connected().await,
+    );
+    push_root_state_property(
+        &mut rows,
+        "keyboard_connected",
+        proxy.keyboard_connected().await,
+    );
+    push_root_state_property(
+        &mut rows,
+        "keyboard_connection_type",
+        proxy.keyboard_connection_type().await,
     );
     push_root_state_property(
         &mut rows,
@@ -1675,6 +1840,11 @@ pub async fn query_root_state_for_cli() -> Result<Vec<(String, String)>, String>
         &mut rows,
         "desired_display_layout",
         proxy.desired_display_layout().await,
+    );
+    push_root_state_property(
+        &mut rows,
+        "display_rotation",
+        proxy.display_rotation().await,
     );
     push_root_state_property(&mut rows, "display_brightness", proxy.display_brightness().await);
     push_root_state_property(
@@ -2012,8 +2182,16 @@ pub async fn run_session_client(
         sync_tablet_mapping_from_root(&proxy, &tablet_config, &tablet_remap_tx).await;
 
         let mut reconnect = false;
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         while !reconnect {
             tokio::select! {
+                _ = heartbeat.tick() => {
+                    if let Err(e) = proxy.ping_session().await {
+                        warn!("SESSION DBus: heartbeat to root daemon failed: {e}");
+                        reconnect = true;
+                    }
+                }
                 change = owner_changes.next() => {
                     match change {
                         Some(signal) => match signal.args() {

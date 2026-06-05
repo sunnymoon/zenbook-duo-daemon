@@ -10,6 +10,7 @@ use users::{get_user_by_uid, os::unix::UserExt as _};
 use crate::state::KeyboardStateManager;
 
 pub fn start_listen_mute_state_thread(state_manager: KeyboardStateManager) {
+    start_mute_state_poll_thread(state_manager.clone());
     thread::spawn(move || {
         let mut consecutive_failures = 0u32;
         loop {
@@ -33,6 +34,27 @@ pub fn start_listen_mute_state_thread(state_manager: KeyboardStateManager) {
                 consecutive_failures = (consecutive_failures + 1).min(60);
                 let backoff_secs = std::cmp::min(2u64.pow(consecutive_failures.saturating_sub(1)), 60);
                 thread::sleep(Duration::from_secs(backoff_secs));
+            }
+        }
+    });
+}
+
+fn start_mute_state_poll_thread(state_manager: KeyboardStateManager) {
+    thread::spawn(move || {
+        let mut consecutive_failures = 0u32;
+        loop {
+            match with_default_source_client(|client| client.get_is_default_source_muted()) {
+                Ok(is_muted) => {
+                    consecutive_failures = 0;
+                    state_manager.set_mic_mute_led(is_muted);
+                    thread::sleep(Duration::from_millis(250));
+                }
+                Err(e) => {
+                    warn!("Error polling mute state: {:?}", e);
+                    consecutive_failures = (consecutive_failures + 1).min(6);
+                    let backoff_secs = std::cmp::min(2u64.pow(consecutive_failures.saturating_sub(1)), 30);
+                    thread::sleep(Duration::from_secs(backoff_secs));
+                }
             }
         }
     });

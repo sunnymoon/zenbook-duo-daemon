@@ -72,6 +72,12 @@ trait RootState {
 
     #[zbus(property)]
     fn keyboard_battery_full(&self) -> zbus::Result<bool>;
+
+    #[zbus(property)]
+    fn keyboard_battery_last_known_present(&self) -> zbus::Result<bool>;
+
+    #[zbus(property)]
+    fn keyboard_battery_last_known_percentage(&self) -> zbus::Result<u8>;
 }
 
 #[proxy(
@@ -116,6 +122,27 @@ fn keyboard_display_notif_state() -> Arc<Mutex<KeyboardDisplayNotifState>> {
             }))
         })
         .clone()
+}
+
+async fn last_known_battery_text(
+    root_proxy: Option<&RootStateProxy<'_>>,
+    fallback: Option<u8>,
+) -> String {
+    if let Some(proxy) = root_proxy
+        && proxy
+            .keyboard_battery_last_known_present()
+            .await
+            .unwrap_or(false)
+    {
+        return format!(
+            "{}%",
+            proxy.keyboard_battery_last_known_percentage().await.unwrap_or(0)
+        );
+    }
+
+    fallback
+        .map(|p| format!("{p}%"))
+        .unwrap_or_else(|| "not available".to_string())
 }
 
 struct DisplayRecoveryNotifState {
@@ -533,9 +560,7 @@ pub async fn run(
                         if let Some(sys) = system_conn.as_ref() {
                             if bluetooth_connected {
                                 let pct = read_keyboard_battery_pct(sys).await;
-                                let pct_txt = pct
-                                    .map(|p| format!("{p}%"))
-                                    .unwrap_or_else(|| "unknown".to_string());
+                                let pct_txt = last_known_battery_text(root_proxy.as_ref(), pct).await;
                                 let extra =
                                     format!("discharging (current battery level: {pct_txt}).");
                                 body = append_line_sep(&body, &format!("• {extra}"));
@@ -567,9 +592,7 @@ pub async fn run(
                     let (summary, mut body, icon) = usb_charge_notification_text();
                     if let Some(chain) = Some(keyboard_display_notif_state()) {
                         let last = chain.lock().await.last_battery_pct;
-                        let pct_txt = last
-                            .map(|p| format!("{p}%"))
-                            .unwrap_or_else(|| "unknown".to_string());
+                        let pct_txt = last_known_battery_text(root_proxy.as_ref(), last).await;
                         let extra = format!("charging (last battery level: {pct_txt}).");
                         body = append_line_sep(&body, &format!("• {extra}"));
                     }
@@ -653,17 +676,13 @@ pub async fn run(
                     if docked {
                         let chain = keyboard_display_notif_state();
                         let last = chain.lock().await.last_battery_pct;
-                        let pct_txt = last
-                            .map(|p| format!("{p}%"))
-                            .unwrap_or_else(|| "unknown".to_string());
+                        let pct_txt = last_known_battery_text(root_proxy.as_ref(), last).await;
                         let extra = format!("charging (last battery level: {pct_txt}).");
                         body = append_line_sep(&body, &format!("• {extra}"));
                     } else if let Some(sys) = system_conn.as_ref() {
                         if bluetooth_connected {
                             let pct = read_keyboard_battery_pct(sys).await;
-                            let pct_txt = pct
-                                .map(|p| format!("{p}%"))
-                                .unwrap_or_else(|| "unknown".to_string());
+                            let pct_txt = last_known_battery_text(root_proxy.as_ref(), pct).await;
                             let extra = format!("discharging (current battery level: {pct_txt}).");
                             body = append_line_sep(&body, &format!("• {extra}"));
                         }
@@ -1317,9 +1336,7 @@ async fn monitor_bluetooth_keyboard_battery(
                         (st.had_battery_tier_while_usb_detached, st.last_battery_pct)
                     };
                     if had_tier {
-                        let pct_txt = last_known
-                            .map(|p| format!("{p}%"))
-                            .unwrap_or_else(|| "unknown".to_string());
+                        let pct_txt = last_known_battery_text(Some(root_proxy), last_known).await;
                         let body = bullet_lines(&[
                             "Did you disable the keyboard or did it run out of battery?",
                             &format!("Last known battery percentage: {pct_txt}."),

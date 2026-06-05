@@ -3,6 +3,7 @@ use crate::events::Event;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tokio::sync::Mutex as TokioMutex;
 
@@ -10,6 +11,7 @@ const STATE_DIR: &str = "/var/lib/zenbook-duo-daemon";
 const BACKLIGHT_STATE_FILE: &str = "/var/lib/zenbook-duo-daemon/backlight";
 const DISPLAY_STATE_FILE: &str = "/var/lib/zenbook-duo-daemon/display-state";
 const BATTERY_STATE_FILE: &str = "/var/lib/zenbook-duo-daemon/keyboard-battery";
+const KEYBOARD_CONNECTION_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Default, Serialize, Deserialize)]
 struct PersistedKeyboardBattery {
@@ -189,6 +191,29 @@ pub enum KeyboardBacklightState {
     High,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyboardConnectionKind {
+    Detached,
+    Bluetooth,
+    Usb,
+    Pogo,
+}
+
+impl KeyboardConnectionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Detached => "detached",
+            Self::Bluetooth => "bt",
+            Self::Usb => "usb",
+            Self::Pogo => "pogo",
+        }
+    }
+
+    fn is_connected(self) -> bool {
+        self != Self::Detached
+    }
+}
+
 impl KeyboardBacklightState {
     pub fn next(&self) -> Self {
         match self {
@@ -223,6 +248,8 @@ struct InnerState {
     is_usb_connected: bool,
     is_pogo_docked: bool,
     bt_connected_count: usize,
+    keyboard_last_connection_kind: KeyboardConnectionKind,
+    keyboard_disconnected_at: Option<Instant>,
     desired_secondary_display_enabled: bool,
     is_secondary_display_enabled: bool,
     ambient_light_enabled: bool,
@@ -230,11 +257,15 @@ struct InnerState {
     desired_primary: Option<String>,
     desired_display_attachment: String,
     desired_display_layout: String,
+    display_rotation: String,
     display_brightness: Option<u32>,
     /// Last keyboard battery report; USB interrupt (`0x5a 0x3d`) or BlueZ `Battery1`.
     keyboard_battery_pct: Option<u8>,
     keyboard_battery_charging: bool,
     keyboard_battery_full: bool,
+    /// Last known keyboard battery persisted from any source, kept across detach / reconnect.
+    keyboard_battery_last_known_pct: Option<u8>,
+    keyboard_battery_last_known_full: bool,
     tablet_mapping_enabled: bool,
     tablet_mapping_mode: TabletMapMode,
     /// Incremented by operator `ApplyTabletMapping`; session watches for immediate pen remap.
@@ -276,18 +307,18 @@ impl KeyboardStateManager {
         }
 
         let battery_snap = load_battery_disk().await;
-        let (keyboard_battery_pct, keyboard_battery_charging, keyboard_battery_full) =
+        let keyboard_battery_last_known_pct =
             match battery_snap {
                 Some(ref b) if b.pct > 0 || b.full => {
                     log::info!(
-                        "Keyboard battery loaded from disk at startup: {}% charging={} full={}",
+                        "Keyboard battery last known from disk at startup: {}% charging={} full={}",
                         b.pct,
                         b.charging,
                         b.full
                     );
-                    (Some(b.pct), b.charging, b.full)
+                    Some(b.pct)
                 }
-                _ => (None, false, false),
+                _ => None,
             };
 
         Self {
@@ -299,16 +330,27 @@ impl KeyboardStateManager {
                 is_usb_connected,
                 is_pogo_docked,
                 bt_connected_count: 0,
+                keyboard_last_connection_kind: if is_pogo_docked {
+                    KeyboardConnectionKind::Pogo
+                } else if is_usb_connected {
+                    KeyboardConnectionKind::Usb
+                } else {
+                    KeyboardConnectionKind::Detached
+                },
+                keyboard_disconnected_at: None,
                 desired_secondary_display_enabled,
                 is_secondary_display_enabled,
                 ambient_light_enabled,
                 desired_primary: snap.desired_primary.clone(),
                 desired_display_attachment,
                 desired_display_layout,
+                display_rotation: "normal".to_string(),
                 display_brightness: snap.display_brightness,
-                keyboard_battery_pct,
-                keyboard_battery_charging,
-                keyboard_battery_full,
+                keyboard_battery_pct: None,
+                keyboard_battery_charging: false,
+                keyboard_battery_full: false,
+                keyboard_battery_last_known_pct,
+                keyboard_battery_last_known_full: battery_snap.map(|b| b.full).unwrap_or(false),
                 tablet_mapping_enabled: tablet_mapping.enable,
                 tablet_mapping_mode: tablet_mapping.mode,
                 tablet_mapping_apply_nonce: 0,
@@ -521,9 +563,51 @@ impl KeyboardStateManager {
         .await;
     }
 
+    fn raw_keyboard_connection_kind(state: &InnerState) -> KeyboardConnectionKind {
+        if state.is_pogo_docked {
+            KeyboardConnectionKind::Pogo
+        } else if state.is_usb_connected {
+            KeyboardConnectionKind::Usb
+        } else if state.bt_connected_count > 0 {
+            KeyboardConnectionKind::Bluetooth
+        } else {
+            KeyboardConnectionKind::Detached
+        }
+    }
+
+    fn effective_keyboard_connection_kind(state: &InnerState) -> KeyboardConnectionKind {
+        let raw = Self::raw_keyboard_connection_kind(state);
+        if raw.is_connected() {
+            raw
+        } else if state
+            .keyboard_disconnected_at
+            .is_some_and(|at| at.elapsed() < KEYBOARD_CONNECTION_GRACE)
+        {
+            state.keyboard_last_connection_kind
+        } else {
+            KeyboardConnectionKind::Detached
+        }
+    }
+
+    fn update_keyboard_connection_tracking(state: &mut InnerState) -> bool {
+        let raw = Self::raw_keyboard_connection_kind(state);
+        if raw.is_connected() {
+            state.keyboard_last_connection_kind = raw;
+            state.keyboard_disconnected_at = None;
+            false
+        } else if state.keyboard_last_connection_kind.is_connected()
+            && state.keyboard_disconnected_at.is_none()
+        {
+            state.keyboard_disconnected_at = Some(Instant::now());
+            true
+        } else {
+            false
+        }
+    }
+
     /// Update USB presence and/or pogo-dock state (from hotplug / resume resync).
     pub fn set_usb_keyboard_connection(&self, usb_connected: bool, pogo_docked: bool) {
-        let (usb_changed, pogo_changed, secondary_enabled, refresh_bt_battery) = {
+        let (usb_changed, pogo_changed, secondary_enabled, refresh_bt_battery, grace_started) = {
             let mut state = self.state.write().unwrap();
             let usb_changed = state.is_usb_connected != usb_connected;
             let pogo_changed = state.is_pogo_docked != pogo_docked;
@@ -532,11 +616,9 @@ impl KeyboardStateManager {
             let refresh_bt_battery =
                 usb_changed && !usb_connected && state.bt_connected_count > 0;
             if !usb_connected {
-                if state.bt_connected_count == 0 {
-                    state.keyboard_battery_pct = None;
-                    state.keyboard_battery_charging = false;
-                    state.keyboard_battery_full = false;
-                }
+                state.keyboard_battery_pct = None;
+                state.keyboard_battery_charging = false;
+                state.keyboard_battery_full = false;
             }
             let secondary_enabled = if pogo_docked {
                 false
@@ -545,11 +627,13 @@ impl KeyboardStateManager {
             };
             let secondary_changed = state.is_secondary_display_enabled != secondary_enabled;
             state.is_secondary_display_enabled = secondary_enabled;
+            let grace_started = Self::update_keyboard_connection_tracking(&mut state);
             (
                 usb_changed,
                 pogo_changed,
                 (secondary_enabled, secondary_changed),
                 refresh_bt_battery,
+                grace_started,
             )
         };
 
@@ -577,16 +661,16 @@ impl KeyboardStateManager {
 
         if usb_changed {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                let battery_cleared = !usb_connected && !self.is_bluetooth_connected();
                 handle.spawn(async move {
                     if let Err(e) = crate::dbus_state::notify_keyboard_usb_connected_changed().await
                     {
                         log::warn!("Failed to publish keyboard_usb_connected update: {e}");
                     }
-                    if battery_cleared {
-                        if let Err(e) = crate::dbus_state::notify_keyboard_battery_changed().await {
-                            log::warn!("Failed to publish keyboard battery clear: {e}");
-                        }
+                    if let Err(e) = crate::dbus_state::notify_keyboard_battery_changed().await {
+                        log::warn!("Failed to publish keyboard battery update: {e}");
+                    }
+                    if let Err(e) = crate::dbus_state::notify_keyboard_connection_changed().await {
+                        log::warn!("Failed to publish keyboard connection update: {e}");
                     }
                 });
             }
@@ -600,8 +684,17 @@ impl KeyboardStateManager {
                     if let Err(e) = crate::dbus_state::notify_keyboard_pogo_docked_changed().await {
                         log::warn!("Failed to publish keyboard_pogo_docked update: {e}");
                     }
+                    if let Err(e) = crate::dbus_state::notify_keyboard_battery_changed().await {
+                        log::warn!("Failed to publish keyboard battery update: {e}");
+                    }
+                    if let Err(e) = crate::dbus_state::notify_keyboard_connection_changed().await {
+                        log::warn!("Failed to publish keyboard connection update: {e}");
+                    }
                 });
             }
+        }
+        if grace_started {
+            Self::schedule_keyboard_connection_refresh_async();
         }
         if secondary_enabled.1 {
             self.sender
@@ -616,10 +709,25 @@ impl KeyboardStateManager {
         state.is_usb_connected
     }
 
+    pub fn is_keyboard_connected(&self) -> bool {
+        let state = self.state.read().unwrap();
+        Self::effective_keyboard_connection_kind(&state).is_connected()
+    }
+
+    pub fn keyboard_connection_kind(&self) -> KeyboardConnectionKind {
+        let state = self.state.read().unwrap();
+        Self::effective_keyboard_connection_kind(&state)
+    }
+
     /// USB interrupt report (`0x5a 0x3d`); `None` when no source has reported yet.
     pub fn keyboard_battery_percentage(&self) -> Option<u8> {
         let state = self.state.read().unwrap();
         state.keyboard_battery_pct
+    }
+
+    pub fn keyboard_battery_last_known_percentage(&self) -> Option<u8> {
+        let state = self.state.read().unwrap();
+        state.keyboard_battery_last_known_pct
     }
 
     pub fn is_keyboard_battery_charging(&self) -> bool {
@@ -627,9 +735,39 @@ impl KeyboardStateManager {
         state.keyboard_battery_charging
     }
 
+    pub fn is_keyboard_battery_effective_charging(&self) -> bool {
+        let state = self.state.read().unwrap();
+        if state.keyboard_battery_pct.is_some() {
+            state.keyboard_battery_charging
+        } else if state.keyboard_battery_last_known_full {
+            false
+        } else {
+            state.is_usb_connected || state.is_pogo_docked
+        }
+    }
+
     pub fn is_keyboard_battery_full(&self) -> bool {
         let state = self.state.read().unwrap();
         state.keyboard_battery_full
+    }
+
+    pub fn display_rotation(&self) -> String {
+        self.state.read().unwrap().display_rotation.clone()
+    }
+
+    pub fn set_display_rotation(&self, rotation: String) {
+        let changed = {
+            let mut state = self.state.write().unwrap();
+            if state.display_rotation == rotation {
+                false
+            } else {
+                state.display_rotation = rotation;
+                true
+            }
+        };
+        if changed {
+            Self::notify_display_rotation_changed_async();
+        }
     }
 
     pub fn set_keyboard_battery_usb(&self, pct: u8, status: u8) {
@@ -644,10 +782,14 @@ impl KeyboardStateManager {
             let full = usb_battery_full(status, pct);
             let changed = state.keyboard_battery_pct != Some(pct)
                 || state.keyboard_battery_charging != charging
-                || state.keyboard_battery_full != full;
+                || state.keyboard_battery_full != full
+                || state.keyboard_battery_last_known_pct != Some(pct)
+                || state.keyboard_battery_last_known_full != full;
             state.keyboard_battery_pct = Some(pct);
             state.keyboard_battery_charging = charging;
             state.keyboard_battery_full = full;
+            state.keyboard_battery_last_known_pct = Some(pct);
+            state.keyboard_battery_last_known_full = full;
             (changed, pct, charging, full)
         };
 
@@ -674,7 +816,7 @@ impl KeyboardStateManager {
         }
     }
 
-    /// Last known keyboard battery (USB or Bluetooth) while waiting for a live sample.
+    /// Refresh the last-known keyboard battery from disk while waiting for a fresh live sample.
     pub async fn restore_keyboard_battery_from_disk(&self) {
         let Some(snap) = load_battery_disk().await else {
             return;
@@ -684,20 +826,15 @@ impl KeyboardStateManager {
         }
         let (changed, pct, charging, full) = {
             let mut state = self.state.write().unwrap();
-            if !state.is_usb_connected {
-                return;
-            }
-            let changed = state.keyboard_battery_pct != Some(snap.pct)
-                || state.keyboard_battery_charging != snap.charging
-                || state.keyboard_battery_full != snap.full;
-            state.keyboard_battery_pct = Some(snap.pct);
-            state.keyboard_battery_charging = snap.charging;
-            state.keyboard_battery_full = snap.full;
+            let changed = state.keyboard_battery_last_known_pct != Some(snap.pct)
+                || state.keyboard_battery_last_known_full != snap.full;
+            state.keyboard_battery_last_known_pct = Some(snap.pct);
+            state.keyboard_battery_last_known_full = snap.full;
             (changed, snap.pct, snap.charging, snap.full)
         };
         if changed {
             log::info!(
-                "Keyboard battery restored from disk: {pct}% charging={charging} full={full}"
+                "Keyboard battery last known restored from disk: {pct}% charging={charging} full={full}"
             );
             Self::notify_keyboard_battery_changed_async();
         }
@@ -716,10 +853,14 @@ impl KeyboardStateManager {
             let full = usb_battery_full(0, pct);
             let changed = state.keyboard_battery_pct != Some(pct)
                 || state.keyboard_battery_charging != charging
-                || state.keyboard_battery_full != full;
+                || state.keyboard_battery_full != full
+                || state.keyboard_battery_last_known_pct != Some(pct)
+                || state.keyboard_battery_last_known_full != full;
             state.keyboard_battery_pct = Some(pct);
             state.keyboard_battery_charging = charging;
             state.keyboard_battery_full = full;
+            state.keyboard_battery_last_known_pct = Some(pct);
+            state.keyboard_battery_last_known_full = full;
             (changed, full)
         };
 
@@ -764,6 +905,17 @@ impl KeyboardStateManager {
         }
     }
 
+    fn schedule_keyboard_connection_refresh_async() {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                tokio::time::sleep(KEYBOARD_CONNECTION_GRACE).await;
+                if let Err(e) = crate::dbus_state::notify_keyboard_connection_changed().await {
+                    log::warn!("Failed to publish keyboard connection grace expiry: {e}");
+                }
+            });
+        }
+    }
+
     fn notify_mic_mute_led_changed_async() {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
@@ -784,6 +936,16 @@ impl KeyboardStateManager {
         }
     }
 
+    fn notify_display_rotation_changed_async() {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(e) = crate::dbus_state::notify_display_rotation_changed().await {
+                    log::warn!("Failed to publish display rotation update: {e}");
+                }
+            });
+        }
+    }
+
     /// Bottom-panel pogo dock — clamshell / secondary display power policy.
     pub fn is_keyboard_pogo_docked(&self) -> bool {
         let state = self.state.read().unwrap();
@@ -798,16 +960,22 @@ impl KeyboardStateManager {
     /// Increments the Bluetooth refcount used for D-Bus `bluetooth_connected`.
     /// Call **once per logical BT keyboard session** (e.g. one MAC), not once per evdev sibling path.
     pub fn bluetooth_connection_started(&self) {
-        let mut state = self.state.write().unwrap();
-        let was_connected = state.bt_connected_count > 0;
-        state.bt_connected_count = state.bt_connected_count.saturating_add(1);
-        let is_connected = state.bt_connected_count > 0;
-        drop(state);
+        let (was_connected, is_connected) = {
+            let mut state = self.state.write().unwrap();
+            let was_connected = state.bt_connected_count > 0;
+            state.bt_connected_count = state.bt_connected_count.saturating_add(1);
+            let is_connected = state.bt_connected_count > 0;
+            Self::update_keyboard_connection_tracking(&mut state);
+            (was_connected, is_connected)
+        };
         if was_connected != is_connected {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
                     if let Err(e) = crate::dbus_state::notify_bluetooth_connected_changed().await {
                         log::warn!("Failed to publish bluetooth_connected update over D-Bus: {}", e);
+                    }
+                    if let Err(e) = crate::dbus_state::notify_keyboard_connection_changed().await {
+                        log::warn!("Failed to publish keyboard connection update over D-Bus: {}", e);
                     }
                 });
             }
@@ -827,7 +995,7 @@ impl KeyboardStateManager {
     /// extra `saturating_sub` calls when the count is already `0` do not wrap and do not re-emit
     /// D-Bus transitions.
     pub fn bluetooth_connection_stopped(&self) {
-        let (was_connected, is_connected, should_clear_battery) = {
+        let (was_connected, is_connected, should_clear_battery, grace_started) = {
             let mut state = self.state.write().unwrap();
             let was_connected = state.bt_connected_count > 0;
             state.bt_connected_count = state.bt_connected_count.saturating_sub(1);
@@ -839,7 +1007,8 @@ impl KeyboardStateManager {
                 state.keyboard_battery_charging = false;
                 state.keyboard_battery_full = false;
             }
-            (was_connected, is_connected, should_clear_battery)
+            let grace_started = Self::update_keyboard_connection_tracking(&mut state);
+            (was_connected, is_connected, should_clear_battery, grace_started)
         };
         if was_connected != is_connected {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -847,8 +1016,14 @@ impl KeyboardStateManager {
                     if let Err(e) = crate::dbus_state::notify_bluetooth_connected_changed().await {
                         log::warn!("Failed to publish bluetooth_connected update over D-Bus: {}", e);
                     }
+                    if let Err(e) = crate::dbus_state::notify_keyboard_connection_changed().await {
+                        log::warn!("Failed to publish keyboard connection update over D-Bus: {}", e);
+                    }
                 });
             }
+        }
+        if grace_started {
+            Self::schedule_keyboard_connection_refresh_async();
         }
         if should_clear_battery {
             Self::notify_keyboard_battery_changed_async();

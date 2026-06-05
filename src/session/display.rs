@@ -159,6 +159,15 @@ fn orientation_to_transform(orientation: &str) -> u32 {
     }
 }
 
+fn transform_to_rotation(transform: u32) -> &'static str {
+    match transform {
+        1 => "left-up",
+        2 => "inverted",
+        3 => "right-up",
+        _ => "normal",
+    }
+}
+
 /// Build Zenbook Duo logical monitors for a given transform.
 /// Physical connector placement is fixed regardless of which display is primary:
 ///   t=0 normal:    eDP-1(0,0)   eDP-2(0,lh)   stacked, eDP-2 below
@@ -1164,6 +1173,13 @@ async fn reconcile_display_state(
     let desired_transform = current_desired_transform(display)
         .await
         .map_err(|e| DisplayApplyError::Apply(e.to_string()))?;
+    if let Err(e) = crate::dbus_state::report_display_rotation_from_session(
+        transform_to_rotation(desired_transform).to_string(),
+    )
+    .await
+    {
+        warn!("Display reconcile: report_display_rotation failed: {e}");
+    }
     info!(
         "Display reconcile: persisted mode attachment={desired_attachment} layout={desired_layout}; \
          desired transform={desired_transform} (from accelerometer)"
@@ -1211,6 +1227,13 @@ async fn attempt_display_recovery(
     let desired_transform = current_desired_transform(&display)
         .await
         .map_err(|e| DisplayApplyError::Apply(e.to_string()))?;
+    if let Err(e) = crate::dbus_state::report_display_rotation_from_session(
+        transform_to_rotation(desired_transform).to_string(),
+    )
+    .await
+    {
+        warn!("Display recovery: report_display_rotation failed: {e}");
+    }
 
     apply_desired_display_state(
         &display,

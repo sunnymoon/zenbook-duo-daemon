@@ -19,6 +19,9 @@
  *   KeyboardBatteryPresent
  *   KeyboardBatteryPercentage
  *   KeyboardBatteryCharging
+ *   KeyboardBatteryLastKnownPresent
+ *   KeyboardBatteryLastKnownPercentage
+ *   KeyboardBatteryEffectiveCharging
  *   KeyboardBatteryFull
  *   DesiredPrimary
  *   DesiredSecondaryEnabled
@@ -31,7 +34,6 @@
  *   TabletMappingApplyNonce
  *   SessionRegistered
  *   SessionOwner
- *   SessionId
  *   SessionLastSeenUsec
  *   MicMuteLed
  *   KeyboardBacklightLevel
@@ -49,6 +51,7 @@ import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
 import St from 'gi://St';
 import Clutter from 'gi://Clutter';
+import Pango from 'gi://Pango';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
@@ -86,9 +89,14 @@ const DBUS_XML = `
     <property name="KeyboardUsbConnected" type="b" access="read"/>
     <property name="KeyboardPogoDocked" type="b" access="read"/>
     <property name="BluetoothConnected" type="b" access="read"/>
+    <property name="KeyboardConnected" type="b" access="read"/>
+    <property name="KeyboardConnectionType" type="s" access="read"/>
     <property name="KeyboardBatteryPresent" type="b" access="read"/>
     <property name="KeyboardBatteryPercentage" type="y" access="read"/>
     <property name="KeyboardBatteryCharging" type="b" access="read"/>
+    <property name="KeyboardBatteryLastKnownPresent" type="b" access="read"/>
+    <property name="KeyboardBatteryLastKnownPercentage" type="y" access="read"/>
+    <property name="KeyboardBatteryEffectiveCharging" type="b" access="read"/>
     <property name="KeyboardBatteryFull" type="b" access="read"/>
     <property name="DesiredPrimary" type="s" access="read"/>
     <property name="DesiredSecondaryEnabled" type="b" access="read"/>
@@ -96,6 +104,7 @@ const DBUS_XML = `
     <property name="KeyboardBacklightLevel" type="y" access="read"/>
     <property name="DesiredDisplayAttachment" type="s" access="read"/>
     <property name="DesiredDisplayLayout" type="s" access="read"/>
+    <property name="DisplayRotation" type="s" access="read"/>
     <property name="DisplayBrightness" type="u" access="read"/>
     <property name="DisplayApplyPaused" type="b" access="read"/>
     <property name="TabletMappingEnabled" type="b" access="read"/>
@@ -103,14 +112,19 @@ const DBUS_XML = `
     <property name="TabletMappingApplyNonce" type="u" access="read"/>
     <property name="SessionRegistered" type="b" access="read"/>
     <property name="SessionOwner" type="s" access="read"/>
-    <property name="SessionId" type="t" access="read"/>
     <property name="SessionLastSeenUsec" type="t" access="read"/>
     <property name="SessionQuiet" type="b" access="read"/>
   </interface>
 </node>`;
 
 const BACKLIGHT_LABELS = ['Off', 'Low', 'Medium', 'High'];
-
+const BACKLIGHT_ICONS = [
+    'keyboard-brightness-off-symbolic',
+    'keyboard-brightness-medium-symbolic',
+    'keyboard-brightness-medium-symbolic',
+    'keyboard-brightness-high-symbolic',
+];
+const ZENBOOK_TILE_TITLE = 'Zen Duo';
 function batterySeverity(present, pct) {
     if (!present)
         return 'unknown';
@@ -161,24 +175,80 @@ function updateHealthStyle(actor, status) {
     }
 }
 
-function connectionStateShortText(state) {
-    if (state.keyboardPogoDocked)
-        return 'Pogo';
-    if (state.keyboardUsbConnected)
+function setDimmed(actor, dimmed) {
+    if (dimmed)
+        actor.add_style_class_name('zenbook-dimmed');
+    else
+        actor.remove_style_class_name('zenbook-dimmed');
+}
+
+function enableStickyToggle(item) {
+    item.activate = event => {
+        if (item._switch?.mapped)
+            item.toggle();
+
+        if (event?.type?.() === Clutter.EventType.KEY_PRESS &&
+            event.get_key_symbol() === Clutter.KEY_space)
+            return;
+    };
+}
+
+function escapeMarkup(text) {
+    return GLib.markup_escape_text(text, -1);
+}
+
+function connectionStateShortText(kind) {
+    if (kind === 'pogo')
+        return 'POGO';
+    if (kind === 'usb')
         return 'USB';
-    if (state.bluetoothConnected)
+    if (kind === 'bt')
         return 'BT';
     return 'Detached';
 }
 
-function connectionStateText(state) {
-    if (state.keyboardPogoDocked)
+function connectionStateText(kind) {
+    if (kind === 'pogo')
         return 'Attached via pogo';
-    if (state.keyboardUsbConnected)
+    if (kind === 'usb')
         return 'USB connected';
-    if (state.bluetoothConnected)
+    if (kind === 'bt')
         return 'Bluetooth connected';
     return 'Detached';
+}
+
+function secondaryDisplayLabel(rotation) {
+    switch (rotation) {
+    case 'left-up':
+        return 'Left display';
+    case 'right-up':
+        return 'Right display';
+    case 'inverted':
+        return 'Top display';
+    default:
+        return 'Bottom display';
+    }
+}
+
+function rotationStatusText(rotation) {
+    switch (rotation) {
+    case 'left-up':
+        return 'Rotation: left up';
+    case 'right-up':
+        return 'Rotation: right up';
+    case 'inverted':
+        return 'Rotation: inverted';
+    default:
+        return 'Rotation: none';
+    }
+}
+
+function keyboardBatteryIndicator(connectionKind, charging) {
+    if (charging)
+        return '⚡';
+    if (connectionKind === 'bt')
+        return '↓';
+    return '';
 }
 
 function formatSessionAge(ageSeconds) {
@@ -207,41 +277,66 @@ function numberFromVariantValue(variant) {
 const ZenbookKeyboardBatteryToggle = GObject.registerClass(
 class ZenbookKeyboardBatteryToggle extends QuickMenuToggle {
     _init(extension) {
+        const duoIcon = new Gio.FileIcon({
+            file: Gio.File.new_for_path(`${extension.path}/duo-display-symbolic.svg`),
+        });
         super._init({
-            title: 'Duo Kbd',
-            iconName: 'input-keyboard-symbolic',
+            title: ZENBOOK_TILE_TITLE,
+            gicon: duoIcon,
             toggleMode: true,
         });
+        this._zenbookDuoMarker = true;
         this._extension = extension;
-        this.menu.setHeader('input-keyboard-symbolic', 'Zenbook Duo Kbd');
+        this._duoIcon = duoIcon;
+        this.menu.setHeader(this._duoIcon, 'Zenbook Duo');
+        const container = this.get_first_child();
+        this._contentsToggle = container ? container.get_first_child() : null;
+        this._subtitleLabel = this._contentsToggle?._subtitle ?? null;
 
         this._healthItem = new PopupMenu.PopupImageMenuItem('Root unavailable', 'dialog-error-symbolic', {
             reactive: false,
             can_focus: false,
         });
-        this._linkItem = new PopupMenu.PopupImageMenuItem('Keyboard detached', 'input-keyboard-symbolic', {
+        this._statusItem = new PopupMenu.PopupImageMenuItem('Keyboard [ Detached ]', 'input-keyboard-symbolic', {
             reactive: false,
             can_focus: false,
         });
-        this._batteryItem = new PopupMenu.PopupImageMenuItem('Battery unknown', 'input-keyboard-symbolic', {
+        this._suppressSecondaryDisplayToggle = false;
+        this._secondaryDisplayItem = new PopupMenu.PopupSwitchMenuItem('Secondary display', false);
+        this._secondaryDisplayItem.connect('toggled', (_item, state) => {
+            if (this._suppressSecondaryDisplayToggle)
+                return;
+            if (!this._extension.state?.rootReachable)
+                return;
+            if (this._extension.state.keyboardPogoDocked) {
+                this._suppressSecondaryDisplayToggle = true;
+                this._secondaryDisplayItem.setToggleState(this._extension.state.desiredSecondaryEnabled);
+                this._suppressSecondaryDisplayToggle = false;
+                return;
+            }
+            this._extension.callMethod(
+                'SetSecondaryDisplayDesired',
+                GLib.Variant.new('(b)', [state]),
+            );
+        });
+        enableStickyToggle(this._secondaryDisplayItem);
+        this._suppressPrimaryToggle = false;
+        this._rotationItem = new PopupMenu.PopupImageMenuItem('Rotation: none', 'object-rotate-right-symbolic', {
             reactive: false,
             can_focus: false,
         });
-        this._availabilityItem = new PopupMenu.PopupImageMenuItem('Second display available', 'video-display-symbolic', {
-            reactive: false,
-            can_focus: false,
+        this._primaryTopItem = new PopupMenu.PopupSwitchMenuItem('Top display as primary', false);
+        this._primaryTopItem.connect('toggled', (_item, state) => {
+            if (this._suppressPrimaryToggle)
+                return;
+            this._extension.callMethod(
+                'SetDesiredPrimary',
+                GLib.Variant.new('(s)', [state ? 'eDP-1' : 'eDP-2']),
+            );
         });
-        this._primaryTopItem = new PopupMenu.PopupMenuItem('Use top panel as primary');
-        this._primaryTopItem.connect('activate', () => {
-            this._extension.callMethod('SetDesiredPrimary', GLib.Variant.new('(s)', ['eDP-1']));
-        });
-        this._primaryBottomItem = new PopupMenu.PopupMenuItem('Use bottom panel as primary');
-        this._primaryBottomItem.connect('activate', () => {
-            this._extension.callMethod('SetDesiredPrimary', GLib.Variant.new('(s)', ['eDP-2']));
-        });
-        this._tabletMenu = new PopupMenu.PopupSubMenuMenuItem('Stylus / tablet mapping');
+        enableStickyToggle(this._primaryTopItem);
         this._suppressMatchPanelsToggle = false;
-        this._matchPanelsItem = new PopupMenu.PopupSwitchMenuItem('Match panels', false);
+        this._matchPanelsItem = new PopupMenu.PopupSwitchMenuItem('Stylus match displays', false);
         this._matchPanelsItem.connect('toggled', (_item, state) => {
             if (this._suppressMatchPanelsToggle)
                 return;
@@ -250,55 +345,102 @@ class ZenbookKeyboardBatteryToggle extends QuickMenuToggle {
                 GLib.Variant.new('(s)', [state ? 'one_to_one' : 'all_to_primary']),
             );
         });
-        this._tabletMenu.menu.addMenuItem(this._matchPanelsItem);
+        enableStickyToggle(this._matchPanelsItem);
         this._suppressMicToggle = false;
-        this._micItem = new PopupMenu.PopupSwitchMenuItem('Microphone muted', false);
+        this._micItem = new PopupMenu.PopupSwitchMenuItem('Microphone', false);
         this._micItem.connect('toggled', (_item, state) => {
             if (this._suppressMicToggle)
                 return;
             this._extension.callMethod(
                 'SetMicMute',
-                GLib.Variant.new('(b)', [state]),
+                GLib.Variant.new('(b)', [!state]),
             );
         });
-        this._backlightMenu = new PopupMenu.PopupSubMenuMenuItem('Keyboard backlight');
-        this._backlightMenuItems = new Map();
+        enableStickyToggle(this._micItem);
+        this._sendBacklightLevel = level => {
+            this._extension.callMethod(
+                'SetKeyboardBacklightLevel',
+                GLib.Variant.new('(y)', [level]),
+            );
+        };
+        this._backlightRowLabel = new St.Label({
+            text: 'Backlight',
+            style_class: 'zenbook-backlight-row-label',
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        this._backlightRowIcon = new St.Icon({
+            icon_name: 'input-keyboard-symbolic',
+            style_class: 'popup-menu-icon',
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        const backlightBox = new St.BoxLayout({
+            style_class: 'zenbook-backlight-box',
+            vertical: true,
+            x_expand: true,
+        });
+        const backlightHeaderBox = new St.BoxLayout({
+            style_class: 'zenbook-backlight-row',
+            x_expand: true,
+        });
+        backlightHeaderBox.add_child(this._backlightRowIcon);
+        backlightHeaderBox.add_child(this._backlightRowLabel);
+        this._backlightTickButtons = new Map();
+        const tickBox = new St.BoxLayout({
+            style_class: 'zenbook-backlight-ticks',
+            x_expand: true,
+        });
         for (let level = 0; level <= 3; level++) {
-            const item = new PopupMenu.PopupMenuItem(BACKLIGHT_LABELS[level]);
-            item.connect('activate', () => {
-                this._extension.callMethod(
-                    'SetKeyboardBacklightLevel',
-                    GLib.Variant.new('(y)', [level]),
-                );
+            const icon = new St.Icon({
+                icon_name: BACKLIGHT_ICONS[level],
+                style_class: 'zenbook-backlight-level-icon',
             });
-            this._backlightMenu.menu.addMenuItem(item);
-            this._backlightMenuItems.set(level, item);
+            const label = new St.Label({
+                text: BACKLIGHT_LABELS[level],
+                style_class: 'zenbook-backlight-level-label',
+                x_align: Clutter.ActorAlign.CENTER,
+            });
+            const buttonContent = new St.BoxLayout({
+                style_class: 'zenbook-backlight-level-content',
+                vertical: true,
+                x_align: Clutter.ActorAlign.CENTER,
+                y_align: Clutter.ActorAlign.CENTER,
+            });
+            buttonContent.add_child(icon);
+            buttonContent.add_child(label);
+            const button = new St.Button({
+                style_class: 'icon-button zenbook-backlight-level-button',
+                x_expand: true,
+                can_focus: true,
+            });
+            button.set_child(buttonContent);
+            button.connect('clicked', () => this._sendBacklightLevel(level));
+            const levelBox = new St.BoxLayout({
+                style_class: 'zenbook-backlight-level',
+                x_expand: true,
+            });
+            levelBox.add_child(button);
+            tickBox.add_child(levelBox);
+            this._backlightTickButtons.set(level, button);
         }
+        backlightBox.add_child(backlightHeaderBox);
+        backlightBox.add_child(tickBox);
+        this._backlightButtonsItem = new PopupMenu.PopupBaseMenuItem({reactive: false});
+        this._backlightButtonsItem.add_child(backlightBox);
 
         this.menu.addMenuItem(this._healthItem);
-        this.menu.addMenuItem(this._linkItem);
-        this.menu.addMenuItem(this._batteryItem);
-        this.menu.addMenuItem(this._availabilityItem);
+        this.menu.addMenuItem(this._statusItem);
+        this.menu.addMenuItem(this._rotationItem);
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        this.menu.addMenuItem(this._secondaryDisplayItem);
         this.menu.addMenuItem(this._primaryTopItem);
-        this.menu.addMenuItem(this._primaryBottomItem);
-        this.menu.addMenuItem(this._tabletMenu);
-        this.menu.addMenuItem(this._backlightMenu);
+        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        this.menu.addMenuItem(this._matchPanelsItem);
+        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        this.menu.addMenuItem(this._backlightButtonsItem);
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         this.menu.addMenuItem(this._micItem);
 
-        this.connect('clicked', () => {
-            if (!this._extension.state)
-                return;
-            if (this._extension.state.keyboardPogoDocked)
-                return;
-
-            const target = !this.checked;
-            this._extension.callMethod(
-                'SetSecondaryDisplayDesired',
-                GLib.Variant.new('(b)', [target]),
-            );
-        });
+        this.connect('clicked', () => this.menu.open());
     }
 
     /**
@@ -310,20 +452,56 @@ class ZenbookKeyboardBatteryToggle extends QuickMenuToggle {
      * @param {boolean} full
      */
     update(state) {
-        const connectedText = connectionStateText(state);
-        const connectedShort = connectionStateShortText(state);
-        const batteryText = state.keyboardBatteryPresent
-            ? `${state.keyboardBatteryPercentage}%${state.keyboardBatteryCharging ? ' ⚡' : ''}`
-            : 'Unknown';
-        const severity = batterySeverity(state.keyboardBatteryPresent, state.keyboardBatteryPercentage);
+        const connectedText = connectionStateText(state.keyboardConnectionType);
+        const connectedShort = connectionStateShortText(state.keyboardConnectionType);
+        const hasLink = state.keyboardConnected;
+        const rotation = state.displayRotation ?? 'normal';
+        const showLiveBattery = state.keyboardBatteryPresent;
+        const batteryPct = showLiveBattery
+            ? state.keyboardBatteryPercentage
+            : state.keyboardBatteryLastKnownPresent
+                ? state.keyboardBatteryLastKnownPercentage
+                : null;
+        const charging = state.keyboardBatteryEffectiveCharging;
+        const flowIndicator = keyboardBatteryIndicator(state.keyboardConnectionType, charging);
+        const chargePrefix = flowIndicator ? ` ${flowIndicator}` : '';
+        const buttonSubtitle = batteryPct === null
+            ? connectedShort
+            : `${connectedShort}${chargePrefix} [${batteryPct}%]`;
+        const keyboardStatusText = batteryPct === null
+            ? hasLink
+                ? `Keyboard [ ${connectedShort} ]`
+                : 'Keyboard [ Detached ]   ( last n/a )'
+            : hasLink
+                ? `Keyboard [ ${connectedShort} ]   ( ${batteryPct}%${flowIndicator ? ` ${flowIndicator}` : ''} )`
+                : `Keyboard [ Detached ]   ( last ${batteryPct}% )`;
+        const severity = batterySeverity(batteryPct !== null, batteryPct ?? 0);
         // The daemon provides sessionQuiet to indicate stale sessions; no need to calculate age locally
         const staleSession = state.sessionQuiet === true;
         const tabletKnown = state.tabletMappingMode !== null;
+        const sessionAgeSeconds = state.sessionLastSeenUsec === null
+            ? null
+            : Math.max(0, Math.floor((Number(state.nowUsec) - Number(state.sessionLastSeenUsec)) / 1000000));
 
-        this.subtitle = `${connectedShort} · ${batteryText}`;
-        this._linkItem.label.text = `Keyboard ${connectedText}`;
-        this._batteryItem.label.text = `Keyboard battery ${batteryText}`;
-        updateSeverityStyle(this._batteryItem.label, 'zenbook-kbd-battery', severity);
+        this.subtitle = buttonSubtitle;
+        if (this._subtitleLabel) {
+            const subtitleText = this._subtitleLabel.clutter_text;
+            this._subtitleLabel.remove_style_class_name('zenbook-dimmed');
+            if (!subtitleText) {
+                this._subtitleLabel.text = buttonSubtitle;
+            } else if (!showLiveBattery && batteryPct !== null && !hasLink) {
+                const prefix = `${connectedShort} `;
+                const suffix = `[${batteryPct}%]`;
+                subtitleText.set_markup(
+                    `${escapeMarkup(prefix)}<span alpha="55%">${escapeMarkup(suffix)}</span>`,
+                );
+            } else {
+                subtitleText.set_markup(escapeMarkup(buttonSubtitle));
+            }
+        }
+        this._statusItem.label.text = keyboardStatusText;
+        updateSeverityStyle(this._statusItem.label, 'zenbook-kbd-battery', severity);
+        setDimmed(this._statusItem.label, !showLiveBattery && batteryPct !== null && !hasLink);
         if (!state.rootReachable) {
             this._healthItem.label.text = 'Root off · Session unknown';
             updateHealthStyle(this._healthItem.label, 'off');
@@ -340,45 +518,38 @@ class ZenbookKeyboardBatteryToggle extends QuickMenuToggle {
             this._healthItem.label.text = 'Root on · Session off';
             updateHealthStyle(this._healthItem.label, 'off');
         }
-        this._tabletMenu.label.text = tabletKnown ? 'Stylus / tablet mapping' : 'Stylus / tablet mapping (pending)';
-        this._tabletMenu.setSensitive(tabletKnown);
-        this._primaryTopItem.setOrnament(
-            state.desiredPrimary === 'eDP-1' ? PopupMenu.Ornament.DOT : PopupMenu.Ornament.NONE,
-        );
-        this._primaryBottomItem.setOrnament(
-            state.desiredPrimary === 'eDP-2' ? PopupMenu.Ornament.DOT : PopupMenu.Ornament.NONE,
-        );
+        this.gicon = this._duoIcon;
+        this.checked = state.rootReachable && state.sessionRegistered === true && !staleSession;
+        this._secondaryDisplayItem.setSensitive(state.rootReachable);
+        this._secondaryDisplayItem.label.text = secondaryDisplayLabel(rotation);
+        this._rotationItem.label.text = rotationStatusText(rotation);
+        this._suppressSecondaryDisplayToggle = true;
+        this._secondaryDisplayItem.setToggleState(state.desiredSecondaryEnabled);
+        this._suppressSecondaryDisplayToggle = false;
+        setDimmed(this._secondaryDisplayItem, state.keyboardPogoDocked);
+        this._primaryTopItem.setSensitive(state.rootReachable);
+        this._suppressPrimaryToggle = true;
+        this._primaryTopItem.setToggleState(state.desiredPrimary === 'eDP-1');
+        this._suppressPrimaryToggle = false;
 
-        this.iconName = 'input-keyboard-symbolic';
-
-        this.checked = state.desiredSecondaryEnabled;
-        if (state.keyboardPogoDocked) {
-            this.sensitive = false;
-            this._availabilityItem.label.text = 'Second display unavailable while attached';
-        } else {
-            this.sensitive = true;
-            this._availabilityItem.label.text = 'Second display available';
-        }
-
-        const hasLink = state.keyboardUsbConnected || state.keyboardPogoDocked || state.bluetoothConnected;
         const backlightKnown = state.keyboardBacklightLevel !== null;
-        this._backlightMenu.setSensitive(hasLink && backlightKnown);
-        this._backlightMenu.label.text = backlightKnown
-            ? `Keyboard backlight (${BACKLIGHT_LABELS[state.keyboardBacklightLevel]})`
-            : 'Keyboard backlight (daemon update pending)';
-        for (const [level, item] of this._backlightMenuItems.entries()) {
-            item.setOrnament(
-                backlightKnown && level === state.keyboardBacklightLevel
-                    ? PopupMenu.Ornament.DOT
-                    : PopupMenu.Ornament.NONE,
-            );
+        const backlightAvailable = state.rootReachable && hasLink && backlightKnown;
+        this._backlightRowLabel.text = 'Backlight';
+        setDimmed(this._backlightButtonsItem, !backlightAvailable);
+        for (const [level, button] of this._backlightTickButtons.entries()) {
+            button.reactive = backlightAvailable;
+            button.can_focus = backlightAvailable;
+            if (backlightKnown && level === state.keyboardBacklightLevel)
+                button.add_style_class_name('zenbook-backlight-level-button-active');
+            else
+                button.remove_style_class_name('zenbook-backlight-level-button-active');
         }
         if (state.micMuteLed === null) {
             this._micItem.setSensitive(false);
         } else {
             this._micItem.setSensitive(true);
             this._suppressMicToggle = true;
-            this._micItem.setToggleState(state.micMuteLed);
+            this._micItem.setToggleState(!state.micMuteLed);
             this._suppressMicToggle = false;
         }
 
@@ -397,7 +568,7 @@ const ZenbookKeyboardBatteryIndicator = GObject.registerClass(
 class ZenbookKeyboardBatteryIndicator extends SystemIndicator {
     _init(extension) {
         super._init();
-
+        this._zenbookDuoMarker = true;
         // Icon in the top bar (same row as system battery, clock, etc.)
         this._panelIcon = this._addIndicator();
         this._panelIcon.icon_name = 'input-keyboard-symbolic';
@@ -409,6 +580,8 @@ class ZenbookKeyboardBatteryIndicator extends SystemIndicator {
             text: '',
             y_align: Clutter.ActorAlign.CENTER,
         });
+        this._panelLabel.clutter_text.ellipsize = Pango.EllipsizeMode.NONE;
+        this._panelLabel.clutter_text.line_wrap = false;
         this.add_child(this._panelLabel);
         this._panelLabel.visible = false;
 
@@ -421,16 +594,22 @@ class ZenbookKeyboardBatteryIndicator extends SystemIndicator {
      * Refresh all visual elements from daemon state.
      */
     update(state) {
-        const hasLink = state.keyboardUsbConnected || state.keyboardPogoDocked || state.bluetoothConnected;
-        const show = hasLink || state.keyboardBatteryPresent;
-        const severity = batterySeverity(state.keyboardBatteryPresent, state.keyboardBatteryPercentage);
+        const hasLink = state.keyboardConnected;
+        const batteryPct = state.keyboardBatteryPresent
+            ? state.keyboardBatteryPercentage
+            : state.keyboardBatteryLastKnownPresent
+                ? state.keyboardBatteryLastKnownPercentage
+                : null;
+        const charging = state.keyboardBatteryEffectiveCharging;
+        const show = hasLink || state.keyboardBatteryLastKnownPresent;
+        const severity = batterySeverity(batteryPct !== null, batteryPct ?? 0);
         this._panelIcon.visible = show;
         this._panelLabel.visible = show;
 
-        if (state.keyboardBatteryPresent) {
+        if (batteryPct !== null) {
             this._panelIcon.icon_name = 'input-keyboard-symbolic';
-            const suffix = state.keyboardBatteryCharging ? '⚡' : '';
-            this._panelLabel.text = `${state.keyboardBatteryPercentage}%${suffix}`;
+            const suffix = keyboardBatteryIndicator(state.keyboardConnectionType, charging);
+            this._panelLabel.text = `${batteryPct}%${suffix}`;
         } else {
             this._panelIcon.icon_name = 'input-keyboard-symbolic';
             this._panelLabel.text = hasLink ? '—' : '';
@@ -442,7 +621,7 @@ class ZenbookKeyboardBatteryIndicator extends SystemIndicator {
     }
 
     destroy() {
-        this._toggle.destroy();
+        this._toggle = null;
         super.destroy();
     }
 });
@@ -452,7 +631,9 @@ class ZenbookKeyboardBatteryIndicator extends SystemIndicator {
 export default class ZenbookDuoExtension extends Extension {
     enable() {
         this.state = null;
+        this._removeStaleIndicators();
         this._indicator = new ZenbookKeyboardBatteryIndicator(this);
+        this._micRefreshInFlight = false;
 
         // Insert the indicator into the Quick Settings status area.
         Main.panel.statusArea.quickSettings.addExternalIndicator(this._indicator);
@@ -463,14 +644,20 @@ export default class ZenbookDuoExtension extends Extension {
             keyboardUsbConnected: false,
             keyboardPogoDocked: false,
             bluetoothConnected: false,
+            keyboardConnected: false,
+            keyboardConnectionType: 'detached',
             keyboardBatteryPresent: false,
             keyboardBatteryPercentage: 0,
             keyboardBatteryCharging: false,
+            keyboardBatteryLastKnownPresent: false,
+            keyboardBatteryLastKnownPercentage: 0,
+            keyboardBatteryEffectiveCharging: false,
             keyboardBatteryFull: false,
             desiredPrimary: 'eDP-1',
             desiredSecondaryEnabled: false,
             desiredDisplayAttachment: 'builtin_only',
             desiredDisplayLayout: 'joined',
+            displayRotation: 'normal',
             displayBrightness: null,
             displayApplyPaused: false,
             tabletMappingEnabled: null,
@@ -478,7 +665,6 @@ export default class ZenbookDuoExtension extends Extension {
             tabletMappingApplyNonce: null,
             sessionRegistered: null,
             sessionOwner: null,
-            sessionId: null,
             sessionLastSeenUsec: null,
             sessionQuiet: null,
             micMuteLed: null,
@@ -493,7 +679,7 @@ export default class ZenbookDuoExtension extends Extension {
         this._disconnectDbus();
 
         if (this._indicator) {
-            this._indicator.quickSettingsItems.forEach(i => i.destroy());
+            this._indicator.quickSettingsItems.forEach(item => item.destroy());
             this._indicator.destroy();
             this._indicator = null;
         }
@@ -501,6 +687,24 @@ export default class ZenbookDuoExtension extends Extension {
         if (this._healthTimerId) {
             GLib.Source.remove(this._healthTimerId);
             this._healthTimerId = 0;
+        }
+    }
+
+    _removeStaleIndicators() {
+        const quickSettings = Main.panel.statusArea.quickSettings;
+        const gridChildren = quickSettings?.menu?._grid?.get_children?.() ?? [];
+        for (const item of gridChildren) {
+            const title = item.title ?? item._title?.text ?? item.label?.text ?? '';
+            if (item._zenbookDuoMarker || title === ZENBOOK_TILE_TITLE)
+                item.destroy();
+        }
+
+        const indicatorChildren = quickSettings?._indicators?.get_children?.() ?? [];
+        for (const indicator of indicatorChildren) {
+            const hasZenbookLabel = indicator.get_children?.().some(child =>
+                child.has_style_class_name?.('zenbook-kbd-battery-label')) ?? false;
+            if (indicator._zenbookDuoMarker || hasZenbookLabel)
+                indicator.destroy();
         }
     }
 
@@ -543,7 +747,7 @@ export default class ZenbookDuoExtension extends Extension {
                 if (!this._healthTimerId) {
                     this._healthTimerId = GLib.timeout_add_seconds(
                         GLib.PRIORITY_DEFAULT,
-                        10,
+                        1,
                         () => {
                             this._refresh();
                             return GLib.SOURCE_CONTINUE;
@@ -597,6 +801,8 @@ export default class ZenbookDuoExtension extends Extension {
                 try {
                     proxy.call_finish(result);
                     this._refresh();
+                    if (methodName === 'SetMicMute')
+                        this._refreshMicMuteLed();
                 } catch (e) {
                     console.error(`[zenbook-duo] D-Bus call ${methodName} failed: ${e.message}`);
                 }
@@ -620,14 +826,20 @@ export default class ZenbookDuoExtension extends Extension {
         const usbVar = get('KeyboardUsbConnected');
         const pogoVar = get('KeyboardPogoDocked');
         const btVar = get('BluetoothConnected');
+        const connectedVar = get('KeyboardConnected');
+        const connectionTypeVar = get('KeyboardConnectionType');
         const presentVar = get('KeyboardBatteryPresent');
         const pctVar = get('KeyboardBatteryPercentage');
         const chargingVar = get('KeyboardBatteryCharging');
+        const lastKnownPresentVar = get('KeyboardBatteryLastKnownPresent');
+        const lastKnownPctVar = get('KeyboardBatteryLastKnownPercentage');
+        const effectiveChargingVar = get('KeyboardBatteryEffectiveCharging');
         const fullVar = get('KeyboardBatteryFull');
         const desiredPrimaryVar = get('DesiredPrimary');
         const desiredSecondaryVar = get('DesiredSecondaryEnabled');
         const desiredAttachmentVar = get('DesiredDisplayAttachment');
         const desiredLayoutVar = get('DesiredDisplayLayout');
+        const rotationVar = get('DisplayRotation');
         const brightnessVar = get('DisplayBrightness');
         const displayPausedVar = get('DisplayApplyPaused');
         const tabletMappingEnabledVar = get('TabletMappingEnabled');
@@ -635,27 +847,33 @@ export default class ZenbookDuoExtension extends Extension {
         const tabletMappingApplyNonceVar = get('TabletMappingApplyNonce');
         const sessionRegisteredVar = get('SessionRegistered');
         const sessionOwnerVar = get('SessionOwner');
-        const sessionIdVar = get('SessionId');
         const sessionLastSeenUsecVar = get('SessionLastSeenUsec');
         const sessionQuietVar = get('SessionQuiet');
         const micMuteVar = get('MicMuteLed');
         const backlightLevelVar = get('KeyboardBacklightLevel');
         const rootReachable = Boolean(this._proxy.get_name_owner());
+        const nowUsec = Date.now() * 1000;
 
         this.state = {
             rootReachable,
-            nowUsec: Date.now() * 1000,
+            nowUsec,
             keyboardUsbConnected: variantValue(usbVar, false),
             keyboardPogoDocked: variantValue(pogoVar, false),
             bluetoothConnected: variantValue(btVar, false),
+            keyboardConnected: variantValue(connectedVar, false),
+            keyboardConnectionType: variantValue(connectionTypeVar, 'detached'),
             keyboardBatteryPresent: variantValue(presentVar, false),
             keyboardBatteryPercentage: variantValue(pctVar, 0),
             keyboardBatteryCharging: variantValue(chargingVar, false),
+            keyboardBatteryLastKnownPresent: variantValue(lastKnownPresentVar, false),
+            keyboardBatteryLastKnownPercentage: variantValue(lastKnownPctVar, 0),
+            keyboardBatteryEffectiveCharging: variantValue(effectiveChargingVar, false),
             keyboardBatteryFull: variantValue(fullVar, false),
             desiredPrimary: variantValue(desiredPrimaryVar, 'eDP-1'),
             desiredSecondaryEnabled: variantValue(desiredSecondaryVar, false),
             desiredDisplayAttachment: variantValue(desiredAttachmentVar, 'builtin_only'),
             desiredDisplayLayout: variantValue(desiredLayoutVar, 'joined'),
+            displayRotation: variantValue(rotationVar, 'normal'),
             displayBrightness: brightnessVar ? brightnessVar.deepUnpack() : null,
             displayApplyPaused: variantValue(displayPausedVar, false),
             tabletMappingEnabled: tabletMappingEnabledVar ? tabletMappingEnabledVar.get_boolean() : null,
@@ -665,7 +883,6 @@ export default class ZenbookDuoExtension extends Extension {
                 : null,
             sessionRegistered: sessionRegisteredVar ? sessionRegisteredVar.get_boolean() : null,
             sessionOwner: sessionOwnerVar ? sessionOwnerVar.deepUnpack() : null,
-            sessionId: numberFromVariantValue(sessionIdVar),
             sessionLastSeenUsec: numberFromVariantValue(sessionLastSeenUsecVar),
             sessionQuiet: sessionQuietVar ? sessionQuietVar.get_boolean() : null,
             micMuteLed: micMuteVar ? micMuteVar.get_boolean() : null,
@@ -673,5 +890,47 @@ export default class ZenbookDuoExtension extends Extension {
         };
 
         this._indicator.update(this.state);
+        this._refreshMicMuteLed();
+    }
+
+    _refreshMicMuteLed() {
+        if (!this._proxy || !this._indicator || this._micRefreshInFlight)
+            return;
+        if (!this._proxy.get_name_owner())
+            return;
+
+        this._micRefreshInFlight = true;
+        Gio.DBus.system.call(
+            DBUS_SERVICE,
+            DBUS_PATH,
+            'org.freedesktop.DBus.Properties',
+            'Get',
+            GLib.Variant.new('(ss)', [DBUS_INTERFACE, 'MicMuteLed']),
+            new GLib.VariantType('(v)'),
+            Gio.DBusCallFlags.NONE,
+            -1,
+            null,
+            (_connection, result) => {
+                this._micRefreshInFlight = false;
+
+                try {
+                    const reply = Gio.DBus.system.call_finish(result);
+                    const [value] = reply.deepUnpack();
+                    const micMuteLed = value.deepUnpack();
+
+                    if (!this.state || this.state.micMuteLed === micMuteLed)
+                        return;
+
+                    this.state = {
+                        ...this.state,
+                        micMuteLed,
+                        nowUsec: Date.now() * 1000,
+                    };
+                    this._indicator?.update(this.state);
+                } catch (e) {
+                    console.error(`[zenbook-duo] MicMuteLed refresh failed: ${e.message}`);
+                }
+            },
+        );
     }
 }

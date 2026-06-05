@@ -7,9 +7,9 @@
  */
 
 .zenbook-kbd-battery-label {
-    font-size: 0.8em;
-    margin-left: 2px;
-    margin-right: 4px;
+    font-size: 0.75em;
+    margin-left: 1px;
+    margin-right: 2px;
 }
 
 .zenbook-kbd-battery-status {
@@ -38,4 +38,53 @@
 
 .zenbook-status-warn {
     color: #f6d32d;
+}
+
+.zenbook-dimmed {
+    opacity: 0.55;
+}
+
+.zenbook-backlight-box {
+    spacing: 8px;
+    min-width: 260px;
+}
+
+.zenbook-backlight-ticks {
+    spacing: 8px;
+    x-expand: true;
+}
+
+.zenbook-backlight-level {
+    x-expand: true;
+}
+
+.zenbook-backlight-level-button {
+    padding: 8px 10px;
+    min-width: 0;
+    min-height: 0;
+}
+
+.zenbook-backlight-level-content {
+    spacing: 4px;
+}
+
+.zenbook-backlight-level-icon {
+    icon-size: 18px;
+}
+
+.zenbook-backlight-level-label {
+    font-size: 0.85em;
+    text-align: center;
+}
+
+.zenbook-backlight-level-button-active {
+    background-color: rgba(53, 132, 228, 0.2);
+}
+
+.zenbook-backlight-row {
+    spacing: 8px;
+}
+
+.zenbook-backlight-row-label {
+    min-width: 0;
 }

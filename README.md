@@ -263,8 +263,9 @@ Read all root **properties** (keyboard, battery, display desire, tablet mapping,
 zenbook-duo-daemon state
 ```
 
-`state` includes `session_quiet`, which turns true when the registered session has gone quiet for
-long enough that the extension should warn about stale session-side updates.
+`state` includes `session_quiet`, which turns true only when the registered session stops sending
+its lightweight D-Bus heartbeat for long enough that the extension should warn about a stale or
+stuck session link.
 
 `control mic-mute …` now toggles the default microphone source mute and keeps the keyboard mic
 LED in sync with that mute state.
