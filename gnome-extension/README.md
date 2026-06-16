@@ -7,10 +7,11 @@ from the `zenbook-duo-daemon` directly in the GNOME UI.
 
 | Location | What you see |
 |---|---|
-| **Top-bar status area** (right side) | Keyboard icon + battery `%`, with `⚡` while charging and `↓` while discharging over Bluetooth. Battery severity thresholds are highlighted: `<25%` warning, `<10%` severe, `<5%` critical. |
-| **Quick Settings panel** (the dropdown) | A compact **Zen Duo** tile with stacked dual-display icon, subtitle like `BT ↓ [43%]`, `USB ⚡ [23%]`, `POGO ⚡ [29%]`, or `Detached [24%]` with the cached battery portion dimmed, plus health, keyboard, and rotation status rows. |
+| **Top-bar status area** (right side) | Keyboard icon + battery `%`, with a separate accent-colored `↓` while discharging over Bluetooth. The percentage color follows daemon-backed discharging (`25/10/5` by default) and charging (`50/75/100` by default) milestone settings. |
+| **Quick Settings panel** (the dropdown) | A compact **Zen Duo** tile with stacked dual-display icon, subtitle like `BT ( 43% ↓ )`, `USB ( 23% ⚡ )`, `POGO ( 29% ⚡ )`, or `Detached ( 24% )` with the cached battery portion dimmed, plus health, keyboard, and rotation status rows. |
 | **Quick Settings actions** | **Bottom/Left/Right/Top display** switch for desired on/off state, **Top display as primary** switch, **Stylus match displays** switch, a compact **Keyboard backlight** header with a single row of larger icon-and-label buttons underneath (`Off / Low / Medium / High`, reusing the medium icon for both middle levels), and **Microphone** switch (`on` = unmuted, `off` = muted; the keyboard LED follows the observed backend state). The secondary-display row stays visible and dims while pogo-attached, and switch rows stay open after toggling. |
-| **Daemon/session status** | In the tile menu, shows `Root: up/unreachable` and session link status (`linked`, `quiet`, `not registered`, or `daemon update pending`), plus owner/id and last-seen age when available. `quiet` means the registered session stopped heartbeating on D-Bus, not merely that nothing changed. |
+| **Extension settings** | The extension now exposes a **Settings** window that edits daemon-backed battery thresholds and color values, persisting them into the root daemon config for both the extension and battery notifications. |
+| **Daemon/session status** | In the tile menu, shows `Root on/off` and session link status (`linked`, `quiet`, `not registered`, or `daemon update pending`). `quiet` means the registered session stopped heartbeating on D-Bus, not merely that nothing changed. |
 
 > The stylus-mapping switch is shown only when the daemon exposes the tablet mapping mode field; otherwise it stays disabled as "daemon pending".
 
@@ -25,7 +26,7 @@ from the `zenbook-duo-daemon` directly in the GNOME UI.
 
 Properties read: `KeyboardUsbConnected`, `KeyboardPogoDocked`,
 `BluetoothConnected`, `KeyboardBatteryPresent`, `KeyboardBatteryPercentage`,
-`KeyboardBatteryCharging`, `KeyboardBatteryFull`, `DesiredPrimary`,
+`KeyboardBatteryCharging`, `KeyboardBatteryFull`, `BatteryUiConfigJson`, `DesiredPrimary`,
 `DesiredSecondaryEnabled`, `DesiredDisplayAttachment`, `DesiredDisplayLayout`,
 `DisplayBrightness`, `DisplayApplyPaused`, `TabletMappingEnabled`,
 `TabletMappingMode`, `TabletMappingApplyNonce`, `SessionRegistered`,
@@ -34,7 +35,7 @@ Properties read: `KeyboardUsbConnected`, `KeyboardPogoDocked`,
 
 Methods called (from Quick Settings actions): `SetSecondaryDisplayDesired(bool)`,
 `SetDesiredPrimary(string)`, `SetTabletMappingMode(string)`, `SetMicMute(bool)`,
-`SetKeyboardBacklightLevel(byte)`.
+`SetKeyboardBacklightLevel(byte)`, `SetBatteryUiConfigJson(string)` (from the prefs window).
 
 ## Requirements
 

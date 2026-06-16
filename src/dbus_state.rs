@@ -1,6 +1,7 @@
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -10,7 +11,7 @@ use zbus::fdo::{self, DBusProxy};
 use zbus::message::{Header, Type};
 use zbus::{MatchRule, MessageStream, connection, proxy, Connection};
 
-use crate::config::Config;
+use crate::config::{BatteryUiConfig, Config};
 use crate::idle_detection::ActivityNotifier;
 use crate::polkit;
 use crate::config::{
@@ -102,6 +103,9 @@ async fn dbus_caller_pid(connection: &Connection, sender: &str) -> fdo::Result<u
 
 struct RootStateInterface {
     state_manager: KeyboardStateManager,
+    activity_notifier: ActivityNotifier,
+    config_path: PathBuf,
+    battery_ui_config: Arc<RwLock<BatteryUiConfig>>,
     registration: Arc<RwLock<Option<RegisteredSession>>>,
     registered: Arc<AtomicBool>,
     ack_tx: broadcast::Sender<AckEvent>,
@@ -111,6 +115,9 @@ struct RootStateInterface {
 impl RootStateInterface {
     fn new(
         state_manager: KeyboardStateManager,
+        activity_notifier: ActivityNotifier,
+        config_path: PathBuf,
+        battery_ui_config: Arc<RwLock<BatteryUiConfig>>,
         registration: Arc<RwLock<Option<RegisteredSession>>>,
         registered: Arc<AtomicBool>,
         ack_tx: broadcast::Sender<AckEvent>,
@@ -118,6 +125,9 @@ impl RootStateInterface {
     ) -> Self {
         Self {
             state_manager,
+            activity_notifier,
+            config_path,
+            battery_ui_config,
             registration,
             registered,
             ack_tx,
@@ -163,6 +173,43 @@ impl RootStateInterface {
         };
         let pid = dbus_caller_pid(connection, sender.as_str()).await?;
         polkit::check_authorization(connection, pid, polkit::ACTION_OPERATOR).await
+    }
+
+    async fn persist_battery_ui_config(&self, config: BatteryUiConfig) -> fdo::Result<()> {
+        config.validate().map_err(fdo::Error::Failed)?;
+        let mut file_config = Config::read(&self.config_path).await;
+        file_config.battery_ui = config.clone();
+        file_config.write(&self.config_path).await.map_err(fdo::Error::Failed)?;
+        *self.battery_ui_config.write().await = config;
+        notify_battery_ui_config_changed()
+            .await
+            .map_err(|e| fdo::Error::Failed(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn persist_ambient_keyboard_backlight_enabled(&self, enabled: bool) -> fdo::Result<()> {
+        let mut file_config = Config::read(&self.config_path).await;
+        file_config.ambient_keyboard_backlight_enabled = enabled;
+        file_config.write(&self.config_path).await.map_err(fdo::Error::Failed)?;
+        self.state_manager
+            .set_ambient_keyboard_backlight_enabled(enabled)
+            .await;
+        notify_ambient_keyboard_backlight_changed()
+            .await
+            .map_err(|e| fdo::Error::Failed(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn persist_idle_timeout_seconds(&self, seconds: u64) -> fdo::Result<()> {
+        let mut file_config = Config::read(&self.config_path).await;
+        file_config.idle_timeout_seconds = seconds;
+        file_config.write(&self.config_path).await.map_err(fdo::Error::Failed)?;
+        self.state_manager.set_idle_timeout_seconds(seconds).await;
+        self.activity_notifier.set_idle_timeout_seconds(seconds);
+        notify_idle_timeout_changed()
+            .await
+            .map_err(|e| fdo::Error::Failed(e.to_string()))?;
+        Ok(())
     }
 }
 
@@ -272,10 +319,22 @@ impl RootStateInterface {
         self.state_manager.get_mic_mute_led()
     }
 
-    /// Keyboard backlight level: 0 = off, 1 = low, 2 = medium, 3 = high.
+    /// Requested keyboard backlight level: 0 = off, 1 = low, 2 = medium, 3 = high.
     #[zbus(property)]
     fn keyboard_backlight_level(&self) -> u8 {
+        self.state_manager.requested_keyboard_backlight().level()
+    }
+
+    /// Effective keyboard backlight level after idle / suspend / ambient overrides.
+    #[zbus(property)]
+    fn keyboard_backlight_effective_level(&self) -> u8 {
         self.state_manager.get_keyboard_backlight().level()
+    }
+
+    #[zbus(property)]
+    async fn battery_ui_config_json(&self) -> String {
+        serde_json::to_string(&*self.battery_ui_config.read().await)
+            .unwrap_or_else(|_| serde_json::to_string(&BatteryUiConfig::default()).unwrap())
     }
 
     /// GNOME pen → panel remapping master switch (see `src/session/tablet_mapping.rs`).
@@ -311,6 +370,21 @@ impl RootStateInterface {
     #[zbus(property)]
     fn ambient_light_enabled(&self) -> bool {
         self.state_manager.get_ambient_light_enabled()
+    }
+
+    #[zbus(property)]
+    fn ambient_light_available(&self) -> bool {
+        self.state_manager.ambient_light_available()
+    }
+
+    #[zbus(property)]
+    fn ambient_keyboard_backlight_enabled(&self) -> bool {
+        self.state_manager.ambient_keyboard_backlight_enabled()
+    }
+
+    #[zbus(property)]
+    fn idle_timeout_seconds(&self) -> u32 {
+        self.state_manager.idle_timeout_seconds().min(u64::from(u32::MAX)) as u32
     }
 
     #[zbus(property)]
@@ -645,6 +719,7 @@ impl RootStateInterface {
     ) -> fdo::Result<()> {
         self.require_operator(&header, connection).await?;
         self.state_manager.toggle_keyboard_backlight().await;
+        self.activity_notifier.notify();
         Ok(())
     }
 
@@ -667,6 +742,31 @@ impl RootStateInterface {
             }
         };
         self.state_manager.set_keyboard_backlight(state).await;
+        self.activity_notifier.notify();
+        Ok(())
+    }
+
+    async fn set_ambient_keyboard_backlight_enabled(
+        &self,
+        enabled: bool,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+    ) -> fdo::Result<()> {
+        self.require_operator(&header, connection).await?;
+        self.persist_ambient_keyboard_backlight_enabled(enabled).await?;
+        info!("Operator: ambient_keyboard_backlight_enabled={enabled}");
+        Ok(())
+    }
+
+    async fn set_idle_timeout_seconds(
+        &self,
+        seconds: u32,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+    ) -> fdo::Result<()> {
+        self.require_operator(&header, connection).await?;
+        self.persist_idle_timeout_seconds(u64::from(seconds)).await?;
+        info!("Operator: idle_timeout_seconds={seconds}");
         Ok(())
     }
 
@@ -691,6 +791,20 @@ impl RootStateInterface {
             .set_tablet_mapping_enabled(enabled)
             .await;
         info!("Operator: tablet_mapping_enabled={enabled}");
+        Ok(())
+    }
+
+    async fn set_battery_ui_config_json(
+        &self,
+        config_json: String,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+    ) -> fdo::Result<()> {
+        self.require_operator(&header, connection).await?;
+        let parsed: BatteryUiConfig =
+            serde_json::from_str(&config_json).map_err(|e| fdo::Error::Failed(e.to_string()))?;
+        self.persist_battery_ui_config(parsed).await?;
+        info!("Operator: updated battery_ui settings");
         Ok(())
     }
 
@@ -815,7 +929,10 @@ trait RootState {
     fn set_mic_mute(&self, enabled: bool) -> zbus::Result<()>;
     fn toggle_keyboard_backlight(&self) -> zbus::Result<()>;
     fn set_keyboard_backlight_level(&self, level: u8) -> zbus::Result<()>;
+    fn set_ambient_keyboard_backlight_enabled(&self, enabled: bool) -> zbus::Result<()>;
+    fn set_idle_timeout_seconds(&self, seconds: u32) -> zbus::Result<()>;
     fn set_desired_primary(&self, primary: String) -> zbus::Result<()>;
+    fn set_battery_ui_config_json(&self, config_json: String) -> zbus::Result<()>;
     fn set_tablet_mapping_enabled(&self, enabled: bool) -> zbus::Result<()>;
     fn set_tablet_mapping_mode(&self, mode: String) -> zbus::Result<()>;
     fn toggle_tablet_mapping_mode(&self) -> zbus::Result<()>;
@@ -861,6 +978,12 @@ trait RootState {
     fn keyboard_backlight_level(&self) -> zbus::Result<u8>;
 
     #[zbus(property)]
+    fn keyboard_backlight_effective_level(&self) -> zbus::Result<u8>;
+
+    #[zbus(property)]
+    fn battery_ui_config_json(&self) -> zbus::Result<String>;
+
+    #[zbus(property)]
     fn tablet_mapping_enabled(&self) -> zbus::Result<bool>;
 
     #[zbus(property)]
@@ -877,6 +1000,15 @@ trait RootState {
 
     #[zbus(property)]
     fn ambient_light_enabled(&self) -> zbus::Result<bool>;
+
+    #[zbus(property)]
+    fn ambient_light_available(&self) -> zbus::Result<bool>;
+
+    #[zbus(property)]
+    fn ambient_keyboard_backlight_enabled(&self) -> zbus::Result<bool>;
+
+    #[zbus(property)]
+    fn idle_timeout_seconds(&self) -> zbus::Result<u32>;
 
     #[zbus(property)]
     fn desired_display_attachment(&self) -> zbus::Result<String>;
@@ -1073,7 +1205,42 @@ pub async fn notify_mic_mute_led_changed(
     emit_mic_mute_led_changed().await
 }
 
-async fn emit_keyboard_backlight_changed() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+async fn emit_keyboard_backlight_changed(
+    requested_changed: bool,
+    effective_changed: bool,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    if !requested_changed && !effective_changed {
+        return Ok(false);
+    }
+    let Some(handle) = get_root_handle().await else {
+        return Ok(false);
+    };
+
+    let iface_ref = handle
+        .connection
+        .object_server()
+        .interface::<_, RootStateInterface>(ROOT_DBUS_PATH)
+        .await?;
+    let iface = iface_ref.get().await;
+    let emitter = iface_ref.signal_emitter();
+    if requested_changed {
+        iface.keyboard_backlight_level_changed(&emitter).await?;
+    }
+    if effective_changed {
+        iface.keyboard_backlight_effective_level_changed(&emitter).await?;
+    }
+
+    Ok(handle.registered.load(Ordering::SeqCst))
+}
+
+pub async fn notify_keyboard_backlight_changes(
+    requested_changed: bool,
+    effective_changed: bool,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    emit_keyboard_backlight_changed(requested_changed, effective_changed).await
+}
+
+async fn emit_battery_ui_config_changed() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let Some(handle) = get_root_handle().await else {
         return Ok(false);
     };
@@ -1086,15 +1253,65 @@ async fn emit_keyboard_backlight_changed() -> Result<bool, Box<dyn std::error::E
     iface_ref
         .get()
         .await
-        .keyboard_backlight_level_changed(iface_ref.signal_emitter())
+        .battery_ui_config_json_changed(iface_ref.signal_emitter())
         .await?;
 
     Ok(handle.registered.load(Ordering::SeqCst))
 }
 
-pub async fn notify_keyboard_backlight_changed(
+pub async fn notify_battery_ui_config_changed(
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    emit_keyboard_backlight_changed().await
+    emit_battery_ui_config_changed().await
+}
+
+async fn emit_ambient_keyboard_backlight_changed(
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(handle) = get_root_handle().await else {
+        return Ok(false);
+    };
+
+    let iface_ref = handle
+        .connection
+        .object_server()
+        .interface::<_, RootStateInterface>(ROOT_DBUS_PATH)
+        .await?;
+    let iface = iface_ref.get().await;
+    let emitter = iface_ref.signal_emitter();
+    iface.ambient_light_available_changed(&emitter).await?;
+    iface
+        .ambient_keyboard_backlight_enabled_changed(&emitter)
+        .await?;
+
+    Ok(handle.registered.load(Ordering::SeqCst))
+}
+
+pub async fn notify_ambient_keyboard_backlight_changed(
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    emit_ambient_keyboard_backlight_changed().await
+}
+
+async fn emit_idle_timeout_changed() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(handle) = get_root_handle().await else {
+        return Ok(false);
+    };
+
+    let iface_ref = handle
+        .connection
+        .object_server()
+        .interface::<_, RootStateInterface>(ROOT_DBUS_PATH)
+        .await?;
+    iface_ref
+        .get()
+        .await
+        .idle_timeout_seconds_changed(iface_ref.signal_emitter())
+        .await?;
+
+    Ok(handle.registered.load(Ordering::SeqCst))
+}
+
+pub async fn notify_idle_timeout_changed(
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    emit_idle_timeout_changed().await
 }
 
 async fn emit_tablet_mapping_changed() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
@@ -1417,6 +1634,7 @@ async fn watch_prepare_for_sleep(
 
 pub async fn start_root_service(
     state_manager: KeyboardStateManager,
+    config_path: PathBuf,
     config: Config,
     activity_notifier: ActivityNotifier,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1424,6 +1642,7 @@ pub async fn start_root_service(
     let registered = Arc::new(AtomicBool::new(false));
     let (ack_tx, _) = broadcast::channel(16);
     let apply_guard = Arc::new(Mutex::new(DisplayApplyGuard::default()));
+    let battery_ui_config = Arc::new(RwLock::new(config.battery_ui.clone()));
 
     let connection = connection::Builder::system()?
         .name(ROOT_DBUS_SERVICE)?
@@ -1431,6 +1650,9 @@ pub async fn start_root_service(
             ROOT_DBUS_PATH,
             RootStateInterface::new(
                 state_manager.clone(),
+                activity_notifier.clone(),
+                config_path,
+                battery_ui_config,
                 registration.clone(),
                 registered.clone(),
                 ack_tx.clone(),
@@ -1807,6 +2029,11 @@ pub async fn query_root_state_for_cli() -> Result<Vec<(String, String)>, String>
     );
     push_root_state_property(
         &mut rows,
+        "keyboard_backlight_effective_level",
+        proxy.keyboard_backlight_effective_level().await,
+    );
+    push_root_state_property(
+        &mut rows,
         "tablet_mapping_enabled",
         proxy.tablet_mapping_enabled().await,
     );
@@ -1830,6 +2057,21 @@ pub async fn query_root_state_for_cli() -> Result<Vec<(String, String)>, String>
         &mut rows,
         "ambient_light_enabled",
         proxy.ambient_light_enabled().await,
+    );
+    push_root_state_property(
+        &mut rows,
+        "ambient_light_available",
+        proxy.ambient_light_available().await,
+    );
+    push_root_state_property(
+        &mut rows,
+        "ambient_keyboard_backlight_enabled",
+        proxy.ambient_keyboard_backlight_enabled().await,
+    );
+    push_root_state_property(
+        &mut rows,
+        "idle_timeout_seconds",
+        proxy.idle_timeout_seconds().await,
     );
     push_root_state_property(
         &mut rows,

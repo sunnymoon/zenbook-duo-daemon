@@ -176,6 +176,144 @@ impl Default for TabletMappingConfig {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct BatteryUiConfig {
+    #[serde(default = "default_discharge_warning_pct")]
+    pub discharge_warning_pct: u8,
+    #[serde(default = "default_discharge_severe_pct")]
+    pub discharge_severe_pct: u8,
+    #[serde(default = "default_discharge_critical_pct")]
+    pub discharge_critical_pct: u8,
+    #[serde(default = "default_charge_half_pct")]
+    pub charge_half_pct: u8,
+    #[serde(default = "default_charge_high_pct")]
+    pub charge_high_pct: u8,
+    #[serde(default = "default_charge_full_pct")]
+    pub charge_full_pct: u8,
+    #[serde(default = "default_discharge_warning_color")]
+    pub discharge_warning_color: String,
+    #[serde(default = "default_discharge_severe_color")]
+    pub discharge_severe_color: String,
+    #[serde(default = "default_discharge_critical_color")]
+    pub discharge_critical_color: String,
+    #[serde(default = "default_charge_half_color")]
+    pub charge_half_color: String,
+    #[serde(default = "default_charge_high_color")]
+    pub charge_high_color: String,
+    #[serde(default = "default_charge_full_color")]
+    pub charge_full_color: String,
+}
+
+fn default_discharge_warning_pct() -> u8 {
+    25
+}
+
+fn default_discharge_severe_pct() -> u8 {
+    10
+}
+
+fn default_discharge_critical_pct() -> u8 {
+    5
+}
+
+fn default_charge_half_pct() -> u8 {
+    50
+}
+
+fn default_charge_high_pct() -> u8 {
+    75
+}
+
+fn default_charge_full_pct() -> u8 {
+    100
+}
+
+fn default_discharge_warning_color() -> String {
+    "#f9f06b".to_string()
+}
+
+fn default_discharge_severe_color() -> String {
+    "#ffbe6f".to_string()
+}
+
+fn default_discharge_critical_color() -> String {
+    "#f66151".to_string()
+}
+
+fn default_charge_half_color() -> String {
+    "#ffa348".to_string()
+}
+
+fn default_charge_high_color() -> String {
+    "#f9f06b".to_string()
+}
+
+fn default_charge_full_color() -> String {
+    "#8ff0a4".to_string()
+}
+
+fn default_ambient_keyboard_backlight_enabled() -> bool {
+    false
+}
+
+impl Default for BatteryUiConfig {
+    fn default() -> Self {
+        Self {
+            discharge_warning_pct: default_discharge_warning_pct(),
+            discharge_severe_pct: default_discharge_severe_pct(),
+            discharge_critical_pct: default_discharge_critical_pct(),
+            charge_half_pct: default_charge_half_pct(),
+            charge_high_pct: default_charge_high_pct(),
+            charge_full_pct: default_charge_full_pct(),
+            discharge_warning_color: default_discharge_warning_color(),
+            discharge_severe_color: default_discharge_severe_color(),
+            discharge_critical_color: default_discharge_critical_color(),
+            charge_half_color: default_charge_half_color(),
+            charge_high_color: default_charge_high_color(),
+            charge_full_color: default_charge_full_color(),
+        }
+    }
+}
+
+fn is_valid_hex_color(color: &str) -> bool {
+    color.len() == 7
+        && color.starts_with('#')
+        && color.chars().skip(1).all(|c| c.is_ascii_hexdigit())
+}
+
+impl BatteryUiConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(self.discharge_critical_pct < self.discharge_severe_pct
+            && self.discharge_severe_pct < self.discharge_warning_pct
+            && self.discharge_warning_pct <= 100)
+        {
+            return Err(
+                "discharge thresholds must satisfy critical < severe < warning <= 100".to_string(),
+            );
+        }
+        if !(self.charge_half_pct < self.charge_high_pct
+            && self.charge_high_pct < self.charge_full_pct
+            && self.charge_full_pct <= 100)
+        {
+            return Err("charge thresholds must satisfy half < high < full <= 100".to_string());
+        }
+
+        for (name, color) in [
+            ("discharge_warning_color", &self.discharge_warning_color),
+            ("discharge_severe_color", &self.discharge_severe_color),
+            ("discharge_critical_color", &self.discharge_critical_color),
+            ("charge_half_color", &self.charge_half_color),
+            ("charge_high_color", &self.charge_high_color),
+            ("charge_full_color", &self.charge_full_color),
+        ] {
+            if !is_valid_hex_color(color) {
+                return Err(format!("{name} must be a #RRGGBB color, got {color}"));
+            }
+        }
+        Ok(())
+    }
+}
+
 pub fn tablet_mode_to_str(mode: TabletMapMode) -> &'static str {
     match mode {
         TabletMapMode::OneToOne => "one_to_one",
@@ -215,6 +353,10 @@ pub struct Config {
     pub secondary_backlight_path: String,
     /// Idle timeout in seconds. Set to 0 to disable idle detection.
     pub idle_timeout_seconds: u64,
+    #[serde(default = "default_ambient_keyboard_backlight_enabled")]
+    pub ambient_keyboard_backlight_enabled: bool,
+    #[serde(default)]
+    pub battery_ui: BatteryUiConfig,
 }
 
 impl Config {
@@ -268,6 +410,8 @@ impl Default for Config {
             secondary_backlight_path: "/sys/class/backlight/card1-eDP-2-backlight/brightness"
                 .to_string(),
             idle_timeout_seconds: 300, // 5 minutes
+            ambient_keyboard_backlight_enabled: default_ambient_keyboard_backlight_enabled(),
+            battery_ui: BatteryUiConfig::default(),
         }
     }
 }
@@ -275,10 +419,8 @@ impl Default for Config {
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/zenbook-duo-daemon/config.toml";
 
 impl Config {
-    pub async fn write_default_config(config_path: &PathBuf) {
-        let config = Config::default();
-        let config_str = toml::to_string(&config).unwrap();
-        let help = "
+    fn help_text() -> &'static str {
+        "
 # # Example Configuration:
 #
 # # Zenbook Duo keys (physical → config keys; see `src/config.rs` module docs for vendor bytes):
@@ -301,6 +443,7 @@ impl Config {
 #
 # fn_lock = true             # To input F1-F12, you need to press Fn + F1-F12
 # idle_timeout_seconds = 300 # 5 minutes, set to 0 to disable idle detection
+# ambient_keyboard_backlight_enabled = false # When true, very low ambient light raises keyboard backlight to at least Low while active
 #
 # [usb_keyboard_ports]                   # Hub port = lsusb -t port (see `usb_keyboard_ports.rs`)
 # pogo_dock_hub_ports = [\"6\"]          # UX8406CA: 6 = bottom pogo, 4 = side charge (not pogo)
@@ -308,14 +451,52 @@ impl Config {
 # [tablet]                               # Optional: GNOME Wayland pen → panel mapping (see README)
 # enable = true                          # When true, reapplies after each successful display reconcile
 # mode = \"one_to_one\"                  # or \"all_to_primary\" — see `TabletMapMode` in `src/config.rs`
-        ".trim();
-        let config_str = format!("{}\n\n\n{}", help, config_str);
+#
+# [battery_ui]                           # Extension + notification thresholds/colors, persisted in the daemon
+# discharge_warning_pct = 25
+# discharge_severe_pct = 10
+# discharge_critical_pct = 5
+# charge_half_pct = 50
+# charge_high_pct = 75
+# charge_full_pct = 100
+# discharge_warning_color = \"#f9f06b\"
+# discharge_severe_color = \"#ffbe6f\"
+# discharge_critical_color = \"#f66151\"
+# charge_half_color = \"#ffa348\"
+# charge_high_color = \"#f9f06b\"
+# charge_full_color = \"#8ff0a4\"
+        "
+        .trim()
+    }
 
-        let parent = config_path.parent().unwrap();
-        if !fs::try_exists(parent).await.unwrap_or(false) {
-            fs::create_dir_all(parent).await.unwrap();
+    fn to_file_text(&self) -> Result<String, String> {
+        self.battery_ui.validate()?;
+        let config_str = toml::to_string(self)
+            .map_err(|e| format!("Failed to serialize config: {e}"))?;
+        Ok(format!("{}\n\n\n{}", Self::help_text(), config_str))
+    }
+
+    pub async fn write(&self, config_path: &PathBuf) -> Result<(), String> {
+        let config_str = self.to_file_text()?;
+        let parent = config_path.parent().ok_or_else(|| {
+            format!("Config path {} has no parent directory", config_path.display())
+        })?;
+        if !fs::try_exists(parent)
+            .await
+            .map_err(|e| format!("Failed to check config dir {}: {e}", parent.display()))?
+        {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| format!("Failed to create config dir {}: {e}", parent.display()))?;
         }
-        fs::write(config_path, config_str).await.unwrap();
+        fs::write(config_path, config_str)
+            .await
+            .map_err(|e| format!("Failed to write config file {}: {e}", config_path.display()))
+    }
+
+    pub async fn write_default_config(config_path: &PathBuf) {
+        let config = Config::default();
+        config.write(config_path).await.unwrap();
     }
 
     /// Try to read config file, returns error if read or parse fails
@@ -323,7 +504,10 @@ impl Config {
         let config_str = fs::read_to_string(config_path)
             .await
             .map_err(|e| format!("Failed to read config file: {}", e))?;
-        toml::from_str(&config_str).map_err(|e| format!("Failed to parse config file: {}", e))
+        let config: Config = toml::from_str(&config_str)
+            .map_err(|e| format!("Failed to parse config file: {}", e))?;
+        config.battery_ui.validate()?;
+        Ok(config)
     }
 
     /// Read config file, creating default if it doesn't exist
@@ -332,6 +516,8 @@ impl Config {
             Self::write_default_config(config_path).await;
         }
         let config_str = fs::read_to_string(config_path).await.unwrap();
-        toml::from_str(&config_str).unwrap()
+        let config: Config = toml::from_str(&config_str).unwrap();
+        config.battery_ui.validate().unwrap();
+        config
     }
 }

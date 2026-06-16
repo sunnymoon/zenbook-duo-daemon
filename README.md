@@ -57,6 +57,7 @@ The project currently installs multiple components:
 - ✅ Keyboard battery warnings (tiered notifications at 20% / 10% / 5% with themed icons)
 - ✅ Keyboard battery level over USB (`0x5a 0x3d` vendor reports) and Bluetooth, with persistence across USB ↔ BT transitions
 - ✅ Stylus / tablet panel mapping (`one_to_one` / `all_to_primary`) via session + D-Bus operator controls
+- ✅ Daemon-backed battery threshold/color settings for the GNOME extension + notifications (`[battery_ui]` in `config.toml`, with extension prefs UI)
 
 ## Current known limitations
 

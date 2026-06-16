@@ -5,9 +5,9 @@
 
 use std::time::Duration;
 
-use futures::stream::StreamExt;
+use futures::StreamExt;
 use log::{debug, warn};
-use tokio::time::{MissedTickBehavior, interval, interval_at};
+use tokio::time::{MissedTickBehavior, interval};
 use zbus::Connection;
 use zbus::fdo::ObjectManagerProxy;
 use zbus::proxy;
@@ -15,7 +15,7 @@ use zbus::zvariant::Str;
 
 use crate::state::KeyboardStateManager;
 
-const BATTERY_POLL_SECS: u64 = 60;
+const BT_USB_STATE_POLL_SECS: u64 = 5;
 
 #[proxy(
     interface = "org.bluez.Battery1",
@@ -136,19 +136,23 @@ async fn monitor_bt_battery_once(
         .build()
         .await?;
 
+    match device_proxy.connected().await {
+        Ok(true) => {}
+        Ok(false) => {
+            state_manager.clear_keyboard_battery_if_no_source();
+            return Err("keyboard BT disconnected".into());
+        }
+        Err(e) => warn!("BT device Connected property: {e}"),
+    }
+
     if let Ok(pct) = battery_proxy.percentage().await {
         state_manager.set_keyboard_battery_bluetooth(pct);
     }
 
-    let mut battery_stream = battery_proxy.receive_percentage_changed().await;
-    let mut connected_stream = device_proxy.receive_connected_changed().await;
-    let mut usb_poll = interval(Duration::from_secs(2));
+    let mut pct_changes = battery_proxy.receive_percentage_changed().await;
+    let mut connected_changes = device_proxy.receive_connected_changed().await;
+    let mut usb_poll = interval(Duration::from_secs(BT_USB_STATE_POLL_SECS));
     usb_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut pct_poll = interval_at(
-        tokio::time::Instant::now() + Duration::from_secs(BATTERY_POLL_SECS),
-        Duration::from_secs(BATTERY_POLL_SECS),
-    );
-    pct_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
         if state_manager.is_usb_keyboard_connected() {
@@ -156,25 +160,25 @@ async fn monitor_bt_battery_once(
         }
 
         tokio::select! {
-            Some(change) = battery_stream.next() => {
-                match change.get().await {
-                    Ok(pct) => state_manager.set_keyboard_battery_bluetooth(pct),
-                    Err(e) => warn!("BT battery Percentage property: {e}"),
+            change = connected_changes.next() => {
+                if change.is_none() {
+                    return Err("keyboard BT connected stream ended".into());
                 }
-            }
-            _ = pct_poll.tick() => {
-                if let Ok(pct) = battery_proxy.percentage().await {
-                    state_manager.set_keyboard_battery_bluetooth(pct);
-                }
-            }
-            Some(change) = connected_stream.next() => {
-                match change.get().await {
-                    Ok(true) => continue,
+                match device_proxy.connected().await {
+                    Ok(true) => {}
                     Ok(false) => {
                         state_manager.clear_keyboard_battery_if_no_source();
                         return Err("keyboard BT disconnected".into());
                     }
                     Err(e) => warn!("BT device Connected property: {e}"),
+                }
+            }
+            change = pct_changes.next() => {
+                if change.is_none() {
+                    return Err("keyboard BT battery stream ended".into());
+                }
+                if let Ok(pct) = battery_proxy.percentage().await {
+                    state_manager.set_keyboard_battery_bluetooth(pct);
                 }
             }
             _ = usb_poll.tick() => {

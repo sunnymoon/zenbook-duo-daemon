@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -9,8 +10,8 @@ use tokio::sync::Mutex;
 use tokio::time::{interval_at, Duration, Instant, MissedTickBehavior};
 use zbus::{Connection, proxy, zvariant::Value};
 
+use crate::config::BatteryUiConfig;
 use crate::keyboard_battery::BATTERY_FULL_PCT_THRESHOLD;
-use crate::keyboard_battery_bt::find_keyboard_bluez_path;
 
 // ── D-Bus proxies ─────────────────────────────────────────────────────────────
 
@@ -78,27 +79,12 @@ trait RootState {
 
     #[zbus(property)]
     fn keyboard_battery_last_known_percentage(&self) -> zbus::Result<u8>;
-}
-
-#[proxy(
-    interface = "org.bluez.Battery1",
-    default_service = "org.bluez"
-)]
-trait BlueZBattery {
-    #[zbus(property)]
-    fn percentage(&self) -> zbus::Result<u8>;
-}
-
-#[proxy(
-    interface = "org.bluez.Device1",
-    default_service = "org.bluez"
-)]
-trait BlueZDevice {
-    #[zbus(property)]
-    fn connected(&self) -> zbus::Result<bool>;
 
     #[zbus(property)]
-    fn name(&self) -> zbus::Result<String>;
+    fn keyboard_battery_effective_charging(&self) -> zbus::Result<bool>;
+
+    #[zbus(property)]
+    fn battery_ui_config_json(&self) -> zbus::Result<String>;
 }
 
 // ── Shared replace-id chains (keyboard + battery + BT disconnect vs display recovery) ──
@@ -143,6 +129,74 @@ async fn last_known_battery_text(
     fallback
         .map(|p| format!("{p}%"))
         .unwrap_or_else(|| "not available".to_string())
+}
+
+async fn current_or_last_known_battery_text(root_proxy: Option<&RootStateProxy<'_>>) -> String {
+    if let Some(proxy) = root_proxy
+        && proxy.keyboard_battery_present().await.unwrap_or(false)
+    {
+        return format!("{}%", proxy.keyboard_battery_percentage().await.unwrap_or(0));
+    }
+
+    last_known_battery_text(root_proxy, None).await
+}
+
+async fn battery_ui_config(root_proxy: Option<&RootStateProxy<'_>>) -> BatteryUiConfig {
+    let Some(proxy) = root_proxy else {
+        return BatteryUiConfig::default();
+    };
+    let Ok(json) = proxy.battery_ui_config_json().await else {
+        return BatteryUiConfig::default();
+    };
+    serde_json::from_str(&json).unwrap_or_default()
+}
+
+fn battery_pct_markup(pct: u8) -> String {
+    format!("<b>{pct}%</b>")
+}
+
+fn first_existing_icon_path(candidates: &[&str]) -> Option<String> {
+    for candidate in candidates {
+        if Path::new(candidate).exists() {
+            return Some((*candidate).to_string());
+        }
+    }
+    None
+}
+
+fn discharge_warning_icon() -> String {
+    first_existing_icon_path(&["/usr/share/icons/Adwaita/symbolic/status/battery-low-symbolic.svg"])
+        .unwrap_or_else(|| "battery-low-symbolic".to_string())
+}
+
+fn discharge_severe_icon() -> String {
+    first_existing_icon_path(&["/usr/share/icons/Adwaita/symbolic/status/battery-caution-symbolic.svg"])
+        .unwrap_or_else(|| "battery-caution-symbolic".to_string())
+}
+
+fn discharge_critical_icon() -> String {
+    first_existing_icon_path(&["/usr/share/icons/Adwaita/symbolic/legacy/battery-empty-symbolic.svg"])
+        .unwrap_or_else(|| "battery-empty-symbolic".to_string())
+}
+
+fn charging_half_icon() -> String {
+    first_existing_icon_path(&["/usr/share/icons/Adwaita/symbolic/legacy/battery-caution-charging-symbolic.svg"])
+        .unwrap_or_else(|| "battery-caution-charging-symbolic".to_string())
+}
+
+fn charging_high_icon() -> String {
+    first_existing_icon_path(&["/usr/share/icons/Adwaita/symbolic/legacy/battery-good-charging-symbolic.svg"])
+        .unwrap_or_else(|| "battery-good-charging-symbolic".to_string())
+}
+
+fn charging_full_icon() -> String {
+    first_existing_icon_path(&["/usr/share/icons/Adwaita/symbolic/legacy/battery-full-charged-symbolic.svg"])
+        .unwrap_or_else(|| "battery-full-charged-symbolic".to_string())
+}
+
+fn battery_status_line(pct_text: &str, charging: bool) -> String {
+    let mode = if charging { "charging" } else { "discharging" };
+    format!("Battery: {pct_text} ({mode}).")
 }
 
 struct DisplayRecoveryNotifState {
@@ -312,20 +366,6 @@ fn bullet_lines(lines: &[&str]) -> String {
         .map(|line| format!("• {line}"))
         .collect::<Vec<_>>()
         .join("\u{2028}")
-}
-
-/// Read ASUS keyboard battery from BlueZ (system bus). Used when sending detach+Bluetooth copy.
-pub async fn read_keyboard_battery_pct(system: &Connection) -> Option<u8> {
-    let path = find_keyboard_bluez_path(system).await?;
-    let proxy = BlueZBatteryProxy::builder(system)
-        .destination("org.bluez")
-        .ok()?
-        .path(path.as_str())
-        .ok()?
-        .build()
-        .await
-        .ok()?;
-    proxy.percentage().await.ok()
 }
 
 /// Transient notification — shown briefly, never stored in the notification area.
@@ -557,14 +597,10 @@ pub async fn run(
                             desired_secondary_enabled,
                         );
 
-                        if let Some(sys) = system_conn.as_ref() {
-                            if bluetooth_connected {
-                                let pct = read_keyboard_battery_pct(sys).await;
-                                let pct_txt = last_known_battery_text(root_proxy.as_ref(), pct).await;
-                                let extra =
-                                    format!("discharging (current battery level: {pct_txt}).");
-                                body = append_line_sep(&body, &format!("• {extra}"));
-                            }
+                        if bluetooth_connected {
+                            let pct_txt = current_or_last_known_battery_text(root_proxy.as_ref()).await;
+                            let extra = battery_status_line(&pct_txt, false);
+                            body = append_line_sep(&body, &format!("• {extra}"));
                         }
 
                         if let Err(e) = notify_keyboard_display_transient_fresh(
@@ -593,7 +629,7 @@ pub async fn run(
                     if let Some(chain) = Some(keyboard_display_notif_state()) {
                         let last = chain.lock().await.last_battery_pct;
                         let pct_txt = last_known_battery_text(root_proxy.as_ref(), last).await;
-                        let extra = format!("charging (last battery level: {pct_txt}).");
+                        let extra = battery_status_line(&pct_txt, true);
                         body = append_line_sep(&body, &format!("• {extra}"));
                     }
 
@@ -677,13 +713,12 @@ pub async fn run(
                         let chain = keyboard_display_notif_state();
                         let last = chain.lock().await.last_battery_pct;
                         let pct_txt = last_known_battery_text(root_proxy.as_ref(), last).await;
-                        let extra = format!("charging (last battery level: {pct_txt}).");
+                        let extra = battery_status_line(&pct_txt, true);
                         body = append_line_sep(&body, &format!("• {extra}"));
-                    } else if let Some(sys) = system_conn.as_ref() {
+                    } else {
                         if bluetooth_connected {
-                            let pct = read_keyboard_battery_pct(sys).await;
-                            let pct_txt = last_known_battery_text(root_proxy.as_ref(), pct).await;
-                            let extra = format!("discharging (current battery level: {pct_txt}).");
+                            let pct_txt = current_or_last_known_battery_text(root_proxy.as_ref()).await;
+                            let extra = battery_status_line(&pct_txt, false);
                             body = append_line_sep(&body, &format!("• {extra}"));
                         }
                     }
@@ -713,13 +748,6 @@ pub async fn run(
 // GNOME Shell often ignores client `expire_timeout` for banner dwell time; urgency `critical`
 // (byte 2) makes low-battery notifications sticky. See `docs/notes-gnome-shell-notifications.md`.
 
-const BATTERY_WARN_PCT_LOW: u8 = 20;
-const BATTERY_WARN_PCT_VERY_LOW: u8 = 10;
-const BATTERY_WARN_PCT_CRITICAL: u8 = 5;
-
-const CHARGE_MILESTONE_PCT_HALF: u8 = 50;
-const CHARGE_MILESTONE_PCT_HIGH: u8 = 75;
-
 const BATTERY_EXPIRE_MS_CRITICAL: i32 = 120_000;
 const BATTERY_EXPIRE_MS_BELOW_10: i32 = 60_000;
 const BATTERY_EXPIRE_MS_BELOW_20: i32 = 60_000;
@@ -737,14 +765,14 @@ struct KeyboardBatteryWarn {
 }
 
 impl KeyboardBatteryWarn {
-    fn clear_recovered(&mut self, pct: u8) {
-        if pct > BATTERY_WARN_PCT_CRITICAL {
+    fn clear_recovered(&mut self, pct: u8, config: &BatteryUiConfig) {
+        if pct > config.discharge_critical_pct {
             self.shown_below_5 = false;
         }
-        if pct > BATTERY_WARN_PCT_VERY_LOW {
+        if pct > config.discharge_severe_pct {
             self.shown_below_10 = false;
         }
-        if pct > BATTERY_WARN_PCT_LOW {
+        if pct > config.discharge_warning_pct {
             self.shown_below_20 = false;
         }
     }
@@ -833,28 +861,29 @@ fn is_keyboard_battery_full(pct: u8, firmware_full: bool) -> bool {
 }
 
 /// Battery warnings while **USB detached** and keyboard on Bluetooth.
-/// All tiers use urgency **critical** (byte 2) + **persistent** hints so GNOME treats them as
-/// high-severity; `expire_timeout` is kept for spec compliance (mostly ignored by Shell).
-/// Thresholds fire at **≤** the documented percentages (5%, 10%, 20%).
+/// Thresholds fire at **≤** the configured percentages. Warning/severe are transient, while the
+/// critical red tier is persistent so GNOME keeps it in the notification area until dismissed.
 async fn maybe_emit_battery_warning_detached_bt(
     notif: &NotificationsProxy<'_>,
     pct: u8,
     w: &mut KeyboardBatteryWarn,
+    config: &BatteryUiConfig,
 ) {
-    if pct <= BATTERY_WARN_PCT_CRITICAL && !w.shown_below_5 {
+    if pct <= config.discharge_critical_pct && !w.shown_below_5 {
         w.shown_below_5 = true;
         w.shown_below_10 = true;
         w.shown_below_20 = true;
-        let mut hints = persistent_urgency_hints(2);
-        hints.insert("image-path", Value::from("battery-level-0-symbolic"));
+        let hints = persistent_urgency_hints(2);
+        let icon = discharge_critical_icon();
         let body = format!(
-            "Keyboard battery at <b>{pct}%</b>.\u{2028}\
-             Reattach the keyboard to USB immediately — it could become unavailable at any moment."
+            "Keyboard battery at {}.\u{2028}\
+             Reattach the keyboard to USB immediately — it could become unavailable at any moment.",
+            battery_pct_markup(pct)
         );
         let _ = notify_keyboard_display_chain(
             notif,
-            "dialog-error",
-            "Keyboard battery critical!",
+            &icon,
+            &format!("Keyboard battery below {}%", config.discharge_critical_pct),
             &body,
             hints,
             BATTERY_EXPIRE_MS_CRITICAL,
@@ -868,19 +897,20 @@ async fn maybe_emit_battery_warning_detached_bt(
         return;
     }
 
-    if pct <= BATTERY_WARN_PCT_VERY_LOW && !w.shown_below_10 {
+    if pct <= config.discharge_severe_pct && !w.shown_below_10 {
         w.shown_below_10 = true;
         w.shown_below_20 = true;
-        let mut hints = persistent_urgency_hints(2);
-        hints.insert("image-path", Value::from("battery-caution-symbolic"));
+        let hints = urgency_hints(2);
+        let icon = discharge_severe_icon();
         let body = format!(
-            "Keyboard battery at <b>{pct}%</b>.\u{2028}\
-             Attach the keyboard to USB to charge before it becomes critical."
+            "Keyboard battery at {}.\u{2028}\
+             Attach the keyboard to USB to charge before it becomes critical.",
+            battery_pct_markup(pct)
         );
-        let _ = notify_keyboard_display_chain(
+        let _ = notify_keyboard_display_transient_fresh(
             notif,
-            "dialog-warning",
-            "Keyboard battery below 10%",
+            &icon,
+            &format!("Keyboard battery below {}%", config.discharge_severe_pct),
             &body,
             hints,
             BATTERY_EXPIRE_MS_BELOW_10,
@@ -893,19 +923,19 @@ async fn maybe_emit_battery_warning_detached_bt(
         }
         return;
     }
-
-    if pct <= BATTERY_WARN_PCT_LOW && !w.shown_below_20 {
+    if pct <= config.discharge_warning_pct && !w.shown_below_20 {
         w.shown_below_20 = true;
-        let mut hints = persistent_urgency_hints(2);
-        hints.insert("image-path", Value::from("battery-full-charging-symbolic"));
+        let hints = urgency_hints(1);
+        let icon = discharge_warning_icon();
         let body = format!(
-            "Keyboard battery at <b>{pct}%</b>.\u{2028}\
-             Running on Bluetooth power — level is informational only."
+            "Keyboard battery at {}.\u{2028}\
+             Running on Bluetooth power — level is informational only.",
+            battery_pct_markup(pct)
         );
-        let _ = notify_keyboard_display_chain(
+        let _ = notify_keyboard_display_transient_fresh(
             notif,
-            "dialog-warning",
-            "Keyboard battery below 20%",
+            &icon,
+            &format!("Keyboard battery below {}%", config.discharge_warning_pct),
             &body,
             hints,
             BATTERY_EXPIRE_MS_BELOW_20,
@@ -924,25 +954,26 @@ async fn maybe_emit_battery_charging_milestones(
     pct: u8,
     w: &mut KeyboardBatteryChargeWarn,
     rate: &ChargingRateTracker,
+    config: &BatteryUiConfig,
 ) {
-    if pct >= CHARGE_MILESTONE_PCT_HALF && !w.shown_half {
+    if pct >= config.charge_half_pct && !w.shown_half {
         w.shown_half = true;
         let eta = format_charge_eta_minutes(rate.eta_minutes_to(pct, 100));
-        let mut hints = urgency_hints(1);
-        hints.insert(
-            "image-path",
-            Value::from("battery-medium-charging-symbolic"),
-        );
+        let hints = urgency_hints(1);
+        let icon = charging_half_icon();
         let mut lines = vec![
-            format!("Keyboard battery at <b>{pct}%</b> while charging on USB."),
+            format!(
+                "Keyboard battery at {} while charging on USB.",
+                battery_pct_markup(pct)
+            ),
         ];
         if !eta.is_empty() {
             lines.push(eta);
         }
         let _ = notify_keyboard_display_transient_fresh(
             notif,
-            "battery-medium-charging-symbolic",
-            "Keyboard charging — 50%",
+            &icon,
+            &format!("Keyboard charging — {}%", config.charge_half_pct),
             &bullet_lines(&lines.iter().map(String::as_str).collect::<Vec<_>>()),
             hints,
             CHARGE_MILESTONE_EXPIRE_MS,
@@ -950,21 +981,24 @@ async fn maybe_emit_battery_charging_milestones(
         .await;
     }
 
-    if pct >= CHARGE_MILESTONE_PCT_HIGH && !w.shown_high {
+    if pct >= config.charge_high_pct && !w.shown_high {
         w.shown_high = true;
         let eta = format_charge_eta_minutes(rate.eta_minutes_to(pct, 100));
-        let mut hints = urgency_hints(1);
-        hints.insert("image-path", Value::from("battery-good-charging-symbolic"));
+        let hints = urgency_hints(1);
+        let icon = charging_high_icon();
         let mut lines = vec![
-            format!("Keyboard battery at <b>{pct}%</b> while charging on USB."),
+            format!(
+                "Keyboard battery at {} while charging on USB.",
+                battery_pct_markup(pct)
+            ),
         ];
         if !eta.is_empty() {
             lines.push(eta);
         }
         let _ = notify_keyboard_display_transient_fresh(
             notif,
-            "battery-good-charging-symbolic",
-            "Keyboard charging — 75%",
+            &icon,
+            &format!("Keyboard charging — {}%", config.charge_high_pct),
             &bullet_lines(&lines.iter().map(String::as_str).collect::<Vec<_>>()),
             hints,
             CHARGE_MILESTONE_EXPIRE_MS,
@@ -993,17 +1027,18 @@ async fn maybe_emit_battery_full_charged(
     } else {
         bullet_lines(&[
             &format!(
-                "Keyboard battery is at <b>{pct}%</b> — the highest level this pack reports when full."
+                "Keyboard battery is at {} — the highest level this pack reports when full.",
+                battery_pct_markup(pct)
             ),
             "You can unplug the side USB cable and use Bluetooth again.",
         ])
     };
 
-    let mut hints = urgency_hints(1);
-    hints.insert("image-path", Value::from("battery-full-charged-symbolic"));
+    let hints = urgency_hints(1);
+    let icon = charging_full_icon();
     let _ = notify_keyboard_display_transient_fresh(
         notif,
-        "battery-full-charged",
+        &icon,
         "Keyboard battery full",
         &body,
         hints,
@@ -1021,6 +1056,7 @@ async fn on_usb_battery_update(
     was_below_full: &mut bool,
     bw_charge: &mut KeyboardBatteryChargeWarn,
     rate: &mut ChargingRateTracker,
+    config: &BatteryUiConfig,
 ) -> bool {
     if pct == *last_pct && !firmware_full {
         return true;
@@ -1035,7 +1071,7 @@ async fn on_usb_battery_update(
 
     if charging {
         rate.record(pct);
-        maybe_emit_battery_charging_milestones(notif, pct, bw_charge, rate).await;
+        maybe_emit_battery_charging_milestones(notif, pct, bw_charge, rate, config).await;
     }
 
     let full = is_keyboard_battery_full(pct, firmware_full);
@@ -1057,6 +1093,7 @@ async fn on_battery_pct_update(
     was_below_full: &mut bool,
     w: &mut KeyboardBatteryWarn,
     usb_attached: bool,
+    config: &BatteryUiConfig,
 ) -> bool {
     if pct == *last_pct {
         return true;
@@ -1069,9 +1106,9 @@ async fn on_battery_pct_update(
         st.last_battery_pct = Some(pct);
     }
 
-    w.clear_recovered(pct);
+    w.clear_recovered(pct, config);
     if !usb_attached {
-        maybe_emit_battery_warning_detached_bt(notif, pct, w).await;
+        maybe_emit_battery_warning_detached_bt(notif, pct, w, config).await;
     }
 
     if pct < BATTERY_FULL_PCT_THRESHOLD {
@@ -1099,7 +1136,7 @@ async fn on_battery_pct_update(
         };
         let _ = notify_keyboard_display_transient_fresh(
             notif,
-            "battery-full-charged",
+            "battery-full-charged-symbolic",
             summary,
             &body,
             urgency_hints(1),
@@ -1140,13 +1177,7 @@ async fn battery_monitor_inner(
             monitor_usb_keyboard_battery(&root_proxy, &notif, bw_charge, rate).await?;
         } else {
             rate.reset();
-            monitor_bluetooth_keyboard_battery(
-                &system_conn,
-                &notif,
-                &root_proxy,
-                bw_discharge,
-            )
-            .await?;
+            monitor_bluetooth_keyboard_battery(&notif, &root_proxy, bw_discharge).await?;
         }
     }
 }
@@ -1164,9 +1195,10 @@ async fn monitor_usb_keyboard_battery(
         let pct = root_proxy.keyboard_battery_percentage().await.unwrap_or(0);
         let charging = root_proxy.keyboard_battery_charging().await.unwrap_or(false);
         let full = root_proxy.keyboard_battery_full().await.unwrap_or(false);
+        let ui_config = battery_ui_config(Some(root_proxy)).await;
         last_pct = pct;
         was_below_full = !is_keyboard_battery_full(pct, full);
-        if pct < CHARGE_MILESTONE_PCT_HALF {
+        if pct < ui_config.charge_half_pct {
             bw_charge.reset_for_new_charge();
         }
         rate.reset();
@@ -1182,6 +1214,7 @@ async fn monitor_usb_keyboard_battery(
             &mut was_below_full,
             bw_charge,
             rate,
+            &ui_config,
         )
         .await;
     } else {
@@ -1227,6 +1260,7 @@ async fn monitor_usb_keyboard_battery(
         let pct = root_proxy.keyboard_battery_percentage().await.unwrap_or(last_pct);
         let charging = root_proxy.keyboard_battery_charging().await.unwrap_or(false);
         let full = root_proxy.keyboard_battery_full().await.unwrap_or(false);
+        let ui_config = battery_ui_config(Some(root_proxy)).await;
 
         let _ = on_usb_battery_update(
             notif,
@@ -1237,59 +1271,47 @@ async fn monitor_usb_keyboard_battery(
             &mut was_below_full,
             bw_charge,
             rate,
+            &ui_config,
         )
         .await;
     }
 }
 
 async fn monitor_bluetooth_keyboard_battery(
-    system_conn: &Connection,
     notif: &NotificationsProxy<'_>,
     root_proxy: &RootStateProxy<'_>,
     bw_discharge: &mut KeyboardBatteryWarn,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let device_path = loop {
-        if let Some(p) = find_keyboard_bluez_path(system_conn).await {
-            break p;
-        }
-        tokio::time::sleep(Duration::from_secs(10)).await;
-    };
-
-    let battery_proxy = BlueZBatteryProxy::builder(system_conn)
-        .destination("org.bluez")?
-        .path(device_path.as_str())?
-        .build()
-        .await?;
-
-    let device_proxy = BlueZDeviceProxy::builder(system_conn)
-        .destination("org.bluez")?
-        .path(device_path.as_str())?
-        .build()
-        .await?;
-
     let mut last_pct: u8;
     let mut was_below_full: bool;
 
-    match battery_proxy.percentage().await {
-        Ok(pct) => {
+    match root_proxy.keyboard_battery_percentage().await {
+        Ok(pct) if root_proxy.keyboard_battery_present().await.unwrap_or(false) => {
+            let ui_config = battery_ui_config(Some(root_proxy)).await;
             last_pct = pct;
-            was_below_full = pct < BATTERY_FULL_PCT_THRESHOLD;
-            bw_discharge.clear_recovered(pct);
-            maybe_emit_battery_warning_detached_bt(notif, pct, bw_discharge).await;
+            was_below_full = !is_keyboard_battery_full(
+                pct,
+                root_proxy.keyboard_battery_full().await.unwrap_or(false),
+            );
+            bw_discharge.clear_recovered(pct, &ui_config);
+            maybe_emit_battery_warning_detached_bt(notif, pct, bw_discharge, &ui_config).await;
             {
                 let chain = keyboard_display_notif_state();
                 let mut st = chain.lock().await;
                 st.last_battery_pct = Some(pct);
             }
         }
-        Err(_) => {
+        Ok(_) | Err(_) => {
             last_pct = 0;
             was_below_full = false;
         }
     }
 
-    let mut battery_stream = battery_proxy.receive_percentage_changed().await;
-    let mut connected_stream = device_proxy.receive_connected_changed().await;
+    let mut pct_stream = root_proxy.receive_keyboard_battery_percentage_changed().await;
+    let mut present_stream = root_proxy.receive_keyboard_battery_present_changed().await;
+    let mut full_stream = root_proxy.receive_keyboard_battery_full_changed().await;
+    let mut usb_stream = root_proxy.receive_keyboard_usb_connected_changed().await;
+    let mut bt_stream = root_proxy.receive_bluetooth_connected_changed().await;
     let mut pct_poll = interval_at(
         Instant::now() + Duration::from_secs(BATTERY_POLL_SECS),
         Duration::from_secs(BATTERY_POLL_SECS),
@@ -1302,74 +1324,78 @@ async fn monitor_bluetooth_keyboard_battery(
         }
 
         tokio::select! {
-            Some(change) = battery_stream.next() => {
-                let pct = match change.get().await {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                if on_battery_pct_update(notif, pct, &mut last_pct, &mut was_below_full, bw_discharge, false).await {
-                    continue;
-                }
-            }
-
+            _ = pct_stream.next() => {}
+            _ = present_stream.next() => {}
+            _ = full_stream.next() => {}
+            _ = usb_stream.next() => {}
+            _ = bt_stream.next() => {}
             _ = pct_poll.tick() => {
-                let pct = battery_proxy.percentage().await.unwrap_or(last_pct);
-                let _ = on_battery_pct_update(notif, pct, &mut last_pct, &mut was_below_full, bw_discharge, false).await;
-            }
-
-            Some(change) = connected_stream.next() => {
-                let connected = match change.get().await {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-
-                if connected {
-                    return Ok(());
-                }
-
-                let usb_attached_now = root_proxy.keyboard_usb_connected().await.unwrap_or(false);
-
-                if !usb_attached_now {
-                    let (had_tier, last_known) = {
-                        let chain = keyboard_display_notif_state();
-                        let st = chain.lock().await;
-                        (st.had_battery_tier_while_usb_detached, st.last_battery_pct)
-                    };
-                    if had_tier {
-                        let pct_txt = last_known_battery_text(Some(root_proxy), last_known).await;
-                        let body = bullet_lines(&[
-                            "Did you disable the keyboard or did it run out of battery?",
-                            &format!("Last known battery percentage: {pct_txt}."),
-                        ]);
-                        let _ = notify_keyboard_display_chain(
-                            notif,
-                            "dialog-warning",
-                            "Bluetooth keyboard disconnected",
-                            &body,
-                            persistent_urgency_hints(2),
-                            BATTERY_EXPIRE_MS_CRITICAL,
-                        )
-                        .await;
-                    } else {
-                        let body = bullet_lines(&[
-                            "Keyboard Bluetooth has disconnected.",
-                            "The keyboard may have run out of battery or been switched off.",
-                            "Attach it via USB to check or recharge.",
-                        ]);
-                        let _ = notify_keyboard_display_transient_fresh(
-                            notif,
-                            "dialog-warning",
-                            "Keyboard disconnected",
-                            &body,
-                            urgency_hints(1),
-                            6_000,
-                        )
-                        .await;
-                    }
-                }
-
-                return Err("keyboard BT disconnected".into());
             }
         }
+
+        let usb_attached_now = root_proxy.keyboard_usb_connected().await.unwrap_or(false);
+        if usb_attached_now {
+            return Ok(());
+        }
+
+        let bluetooth_connected = root_proxy.bluetooth_connected().await.unwrap_or(false);
+        if !bluetooth_connected {
+            let (had_tier, last_known) = {
+                let chain = keyboard_display_notif_state();
+                let st = chain.lock().await;
+                (st.had_battery_tier_while_usb_detached, st.last_battery_pct)
+            };
+            if had_tier {
+                let pct_txt = last_known_battery_text(Some(root_proxy), last_known).await;
+                let body = bullet_lines(&[
+                    "Did you disable the keyboard or did it run out of battery?",
+                    &format!("Last known battery percentage: {pct_txt}."),
+                ]);
+                let _ = notify_keyboard_display_chain(
+                    notif,
+                    "dialog-warning",
+                    "Bluetooth keyboard disconnected",
+                    &body,
+                    persistent_urgency_hints(2),
+                    BATTERY_EXPIRE_MS_CRITICAL,
+                )
+                .await;
+            } else {
+                let body = bullet_lines(&[
+                    "Keyboard Bluetooth has disconnected.",
+                    "The keyboard may have run out of battery or been switched off.",
+                    "Attach it via USB to check or recharge.",
+                ]);
+                let _ = notify_keyboard_display_transient_fresh(
+                    notif,
+                    "dialog-warning",
+                    "Keyboard disconnected",
+                    &body,
+                    urgency_hints(1),
+                    6_000,
+                )
+                .await;
+            }
+            return Err("keyboard BT disconnected".into());
+        }
+
+        if !root_proxy.keyboard_battery_present().await.unwrap_or(false) {
+            continue;
+        }
+
+        let pct = root_proxy.keyboard_battery_percentage().await.unwrap_or(last_pct);
+        let full = root_proxy.keyboard_battery_full().await.unwrap_or(false);
+        let ui_config = battery_ui_config(Some(root_proxy)).await;
+        let _ = on_battery_pct_update(
+            notif,
+            pct,
+            &mut last_pct,
+            &mut was_below_full,
+            bw_discharge,
+            false,
+            &ui_config,
+        )
+        .await;
+        was_below_full = !is_keyboard_battery_full(pct, full);
     }
 }

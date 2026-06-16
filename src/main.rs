@@ -156,6 +156,7 @@ enum ControlCmd {
 }
 
 mod config;
+mod ambient_light;
 mod dbus_state;
 mod polkit;
 mod events;
@@ -303,6 +304,8 @@ async fn run_daemon(config_path: PathBuf) {
             let state_manager = KeyboardStateManager::new(
                 true,
                 pogo_docked,
+                config.idle_timeout_seconds,
+                config.ambient_keyboard_backlight_enabled,
                 config.tablet.clone(),
                 event_sender.clone(),
             )
@@ -324,6 +327,8 @@ async fn run_daemon(config_path: PathBuf) {
             let state_manager = KeyboardStateManager::new(
                 false,
                 false,
+                config.idle_timeout_seconds,
+                config.ambient_keyboard_backlight_enabled,
                 config.tablet.clone(),
                 event_sender.clone(),
             )
@@ -342,6 +347,7 @@ async fn run_daemon(config_path: PathBuf) {
 
     if let Err(e) = dbus_state::start_root_service(
         state_manager.clone(),
+        config_path.clone(),
         config.clone(),
         activity_notifier.clone(),
     )
@@ -349,6 +355,20 @@ async fn run_daemon(config_path: PathBuf) {
     {
         error!("Failed to start root D-Bus service: {e}");
         process::exit(1);
+    }
+
+    {
+        let state_manager = state_manager.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Err(e) = ambient_light::run(state_manager.clone()).await {
+                    warn!("Ambient light monitor error: {e}");
+                    state_manager.set_ambient_light_sensor_available(false).await;
+                    state_manager.set_ambient_light_lux(None).await;
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
     }
 
     if state_manager.keyboard_battery_percentage().is_some()

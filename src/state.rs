@@ -12,6 +12,7 @@ const BACKLIGHT_STATE_FILE: &str = "/var/lib/zenbook-duo-daemon/backlight";
 const DISPLAY_STATE_FILE: &str = "/var/lib/zenbook-duo-daemon/display-state";
 const BATTERY_STATE_FILE: &str = "/var/lib/zenbook-duo-daemon/keyboard-battery";
 const KEYBOARD_CONNECTION_GRACE: Duration = Duration::from_secs(1);
+pub(crate) const LOW_LIGHT_KEYBOARD_BACKLIGHT_LUX_THRESHOLD: f64 = 10.0;
 
 #[derive(Default, Serialize, Deserialize)]
 struct PersistedKeyboardBattery {
@@ -183,7 +184,7 @@ pub fn validate_desired_display_mode_strings(attachment: &str, layout: &str) -> 
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyboardBacklightState {
     Off,
     Low,
@@ -224,13 +225,21 @@ impl KeyboardBacklightState {
         }
     }
 
-    /// D-Bus `KeyboardBacklightLevel`: 0 = off, 1 = low, 2 = medium, 3 = high.
+    /// Backlight level encoding: 0 = off, 1 = low, 2 = medium, 3 = high.
     pub fn level(self) -> u8 {
         match self {
             Self::Off => 0,
             Self::Low => 1,
             Self::Medium => 2,
             Self::High => 3,
+        }
+    }
+
+    fn max(self, other: Self) -> Self {
+        if self.level() >= other.level() {
+            self
+        } else {
+            other
         }
     }
 }
@@ -253,6 +262,10 @@ struct InnerState {
     desired_secondary_display_enabled: bool,
     is_secondary_display_enabled: bool,
     ambient_light_enabled: bool,
+    ambient_keyboard_backlight_enabled: bool,
+    ambient_light_available: bool,
+    ambient_light_lux: Option<f64>,
+    idle_timeout_seconds: u64,
     /// Mirrors persisted display-state JSON (`desired_primary`).
     desired_primary: Option<String>,
     desired_display_attachment: String,
@@ -283,6 +296,8 @@ impl KeyboardStateManager {
     pub async fn new(
         is_usb_connected: bool,
         is_pogo_docked: bool,
+        idle_timeout_seconds: u64,
+        ambient_keyboard_backlight_enabled: bool,
         tablet_defaults: TabletMappingConfig,
         sender: broadcast::Sender<Event>,
     ) -> Self {
@@ -341,6 +356,10 @@ impl KeyboardStateManager {
                 desired_secondary_display_enabled,
                 is_secondary_display_enabled,
                 ambient_light_enabled,
+                ambient_keyboard_backlight_enabled,
+                ambient_light_available: false,
+                ambient_light_lux: None,
+                idle_timeout_seconds,
                 desired_primary: snap.desired_primary.clone(),
                 desired_display_attachment,
                 desired_display_layout,
@@ -454,42 +473,114 @@ impl KeyboardStateManager {
         }
     }
 
+    fn low_light_active(state: &InnerState) -> bool {
+        state.ambient_keyboard_backlight_enabled
+            && state.ambient_light_available
+            && state
+                .ambient_light_lux
+                .is_some_and(|lux| lux <= LOW_LIGHT_KEYBOARD_BACKLIGHT_LUX_THRESHOLD)
+    }
+
+    fn effective_keyboard_backlight(state: &InnerState) -> KeyboardBacklightState {
+        if state.is_suspended || state.is_idle {
+            return KeyboardBacklightState::Off;
+        }
+
+        if Self::low_light_active(state) {
+            state.backlight.max(KeyboardBacklightState::Low)
+        } else {
+            state.backlight
+        }
+    }
+
+    fn emit_effective_keyboard_backlight(&self) {
+        self.sender.send(Event::Backlight(self.get_keyboard_backlight())).ok();
+    }
+
+    fn backlight_snapshot(state: &InnerState) -> (KeyboardBacklightState, KeyboardBacklightState) {
+        (state.backlight, Self::effective_keyboard_backlight(state))
+    }
+
+    fn notify_keyboard_backlight_changes_async(requested_changed: bool, effective_changed: bool) {
+        if !requested_changed && !effective_changed {
+            return;
+        }
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(e) = crate::dbus_state::notify_keyboard_backlight_changes(
+                    requested_changed,
+                    effective_changed,
+                )
+                .await
+                {
+                    log::warn!("Failed to publish keyboard backlight update: {e}");
+                }
+            });
+        }
+    }
+
     pub fn suspend_start(&self) {
-        let mut state = self.state.write().unwrap();
-        state.is_suspended = true;
+        let effective_changed = {
+            let mut state = self.state.write().unwrap();
+            let (_, previous_effective) = Self::backlight_snapshot(&state);
+            state.is_suspended = true;
+            let (_, current_effective) = Self::backlight_snapshot(&state);
+            previous_effective != current_effective
+        };
         self.sender.send(Event::MicMuteLed(false)).ok();
-        self.sender
-            .send(Event::Backlight(KeyboardBacklightState::Off))
-            .ok();
+        if effective_changed {
+            self.sender
+                .send(Event::Backlight(KeyboardBacklightState::Off))
+                .ok();
+        }
+        Self::notify_keyboard_backlight_changes_async(false, effective_changed);
     }
 
     pub fn suspend_end(&self) {
-        let mut state = self.state.write().unwrap();
-        state.is_suspended = false;
-        drop(state);
+        let effective_changed = {
+            let mut state = self.state.write().unwrap();
+            let (_, previous_effective) = Self::backlight_snapshot(&state);
+            state.is_suspended = false;
+            let (_, current_effective) = Self::backlight_snapshot(&state);
+            previous_effective != current_effective
+        };
         self.sender
             .send(Event::MicMuteLed(self.get_mic_mute_led()))
             .ok();
-        self.sender
-            .send(Event::Backlight(self.get_keyboard_backlight()))
-            .ok();
+        if effective_changed {
+            self.emit_effective_keyboard_backlight();
+        }
+        Self::notify_keyboard_backlight_changes_async(false, effective_changed);
     }
 
     pub fn idle_start(&self) {
-        let mut state = self.state.write().unwrap();
-        state.is_idle = true;
-        self.sender
-            .send(Event::Backlight(KeyboardBacklightState::Off))
-            .ok();
+        let effective_changed = {
+            let mut state = self.state.write().unwrap();
+            let (_, previous_effective) = Self::backlight_snapshot(&state);
+            state.is_idle = true;
+            let (_, current_effective) = Self::backlight_snapshot(&state);
+            previous_effective != current_effective
+        };
+        if effective_changed {
+            self.sender
+                .send(Event::Backlight(KeyboardBacklightState::Off))
+                .ok();
+        }
+        Self::notify_keyboard_backlight_changes_async(false, effective_changed);
     }
 
     pub fn idle_end(&self) {
-        let mut state = self.state.write().unwrap();
-        state.is_idle = false;
-        drop(state);
-        self.sender
-            .send(Event::Backlight(self.get_keyboard_backlight()))
-            .ok();
+        let effective_changed = {
+            let mut state = self.state.write().unwrap();
+            let (_, previous_effective) = Self::backlight_snapshot(&state);
+            state.is_idle = false;
+            let (_, current_effective) = Self::backlight_snapshot(&state);
+            previous_effective != current_effective
+        };
+        if effective_changed {
+            self.emit_effective_keyboard_backlight();
+        }
+        Self::notify_keyboard_backlight_changes_async(false, effective_changed);
     }
 
     pub fn set_mic_mute_led(&self, enabled: bool) {
@@ -517,38 +608,54 @@ impl KeyboardStateManager {
     }
 
     pub async fn set_keyboard_backlight(&self, new_state: KeyboardBacklightState) {
-        let should_emit = {
+        let ((previous_requested, previous_effective), (current_requested, current_effective)) = {
             let mut state = self.state.write().unwrap();
+            let previous = Self::backlight_snapshot(&state);
             state.backlight = new_state;
-            !state.is_idle && !state.is_suspended
+            let current = Self::backlight_snapshot(&state);
+            (previous, current)
         };
         persist_backlight_disk(new_state).await;
-        if should_emit {
-            self.sender.send(Event::Backlight(new_state)).ok();
+        if previous_effective != current_effective {
+            self.sender.send(Event::Backlight(current_effective)).ok();
         }
-        Self::notify_keyboard_backlight_changed_async();
+        Self::notify_keyboard_backlight_changes_async(
+            previous_requested != current_requested,
+            previous_effective != current_effective,
+        );
     }
 
     pub async fn toggle_keyboard_backlight(&self) {
-        let (next, should_emit) = {
+        let (next, previous_requested, current_requested, previous_effective, current_effective) = {
             let mut state = self.state.write().unwrap();
+            let (previous_requested, previous_effective) = Self::backlight_snapshot(&state);
             state.backlight = state.backlight.next();
-            (state.backlight, !state.is_idle && !state.is_suspended)
+            let (current_requested, current_effective) = Self::backlight_snapshot(&state);
+            (
+                state.backlight,
+                previous_requested,
+                current_requested,
+                previous_effective,
+                current_effective,
+            )
         };
         persist_backlight_disk(next).await;
-        if should_emit {
-            self.sender.send(Event::Backlight(next)).ok();
+        if previous_effective != current_effective {
+            self.sender.send(Event::Backlight(current_effective)).ok();
         }
-        Self::notify_keyboard_backlight_changed_async();
+        Self::notify_keyboard_backlight_changes_async(
+            previous_requested != current_requested,
+            previous_effective != current_effective,
+        );
+    }
+
+    pub fn requested_keyboard_backlight(&self) -> KeyboardBacklightState {
+        self.state.read().unwrap().backlight
     }
 
     pub fn get_keyboard_backlight(&self) -> KeyboardBacklightState {
         let state = self.state.read().unwrap();
-        if state.is_suspended || state.is_idle {
-            KeyboardBacklightState::Off
-        } else {
-            state.backlight
-        }
+        Self::effective_keyboard_backlight(&state)
     }
 
     pub async fn set_secondary_display_tracked(&self, enabled: bool) {
@@ -926,21 +1033,31 @@ impl KeyboardStateManager {
         }
     }
 
-    fn notify_keyboard_backlight_changed_async() {
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                if let Err(e) = crate::dbus_state::notify_keyboard_backlight_changed().await {
-                    log::warn!("Failed to publish keyboard backlight update: {e}");
-                }
-            });
-        }
-    }
-
     fn notify_display_rotation_changed_async() {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 if let Err(e) = crate::dbus_state::notify_display_rotation_changed().await {
                     log::warn!("Failed to publish display rotation update: {e}");
+                }
+            });
+        }
+    }
+
+    fn notify_ambient_keyboard_backlight_changed_async() {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(e) = crate::dbus_state::notify_ambient_keyboard_backlight_changed().await {
+                    log::warn!("Failed to publish ambient keyboard backlight settings update: {e}");
+                }
+            });
+        }
+    }
+
+    fn notify_idle_timeout_changed_async() {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(e) = crate::dbus_state::notify_idle_timeout_changed().await {
+                    log::warn!("Failed to publish idle timeout update: {e}");
                 }
             });
         }
@@ -1124,5 +1241,173 @@ impl KeyboardStateManager {
     pub fn get_ambient_light_enabled(&self) -> bool {
         let state = self.state.read().unwrap();
         state.ambient_light_enabled
+    }
+
+    pub async fn set_ambient_keyboard_backlight_enabled(&self, enabled: bool) {
+        let (changed, previous_effective, current_effective) = {
+            let mut state = self.state.write().unwrap();
+            if state.ambient_keyboard_backlight_enabled == enabled {
+                return;
+            }
+            let (_, previous_effective) = Self::backlight_snapshot(&state);
+            state.ambient_keyboard_backlight_enabled = enabled;
+            let (_, current_effective) = Self::backlight_snapshot(&state);
+            (true, previous_effective, current_effective)
+        };
+        if previous_effective != current_effective {
+            self.sender.send(Event::Backlight(current_effective)).ok();
+        }
+        if changed {
+            Self::notify_ambient_keyboard_backlight_changed_async();
+            Self::notify_keyboard_backlight_changes_async(
+                false,
+                previous_effective != current_effective,
+            );
+        }
+    }
+
+    pub fn ambient_keyboard_backlight_enabled(&self) -> bool {
+        self.state.read().unwrap().ambient_keyboard_backlight_enabled
+    }
+
+    pub fn ambient_light_available(&self) -> bool {
+        self.state.read().unwrap().ambient_light_available
+    }
+
+    pub async fn set_ambient_light_sensor_available(&self, available: bool) {
+        let (previous_effective, current_effective) = {
+            let mut state = self.state.write().unwrap();
+            if state.ambient_light_available == available {
+                return;
+            }
+            let (_, previous_effective) = Self::backlight_snapshot(&state);
+            state.ambient_light_available = available;
+            if !available {
+                state.ambient_light_lux = None;
+            }
+            let (_, current_effective) = Self::backlight_snapshot(&state);
+            (previous_effective, current_effective)
+        };
+        if previous_effective != current_effective {
+            self.sender.send(Event::Backlight(current_effective)).ok();
+        }
+        Self::notify_ambient_keyboard_backlight_changed_async();
+        Self::notify_keyboard_backlight_changes_async(false, previous_effective != current_effective);
+    }
+
+    pub async fn set_ambient_light_lux(&self, lux: Option<f64>) {
+        let (previous_effective, current_effective) = {
+            let mut state = self.state.write().unwrap();
+            if state.ambient_light_lux == lux {
+                return;
+            }
+            let (_, previous_effective) = Self::backlight_snapshot(&state);
+            state.ambient_light_lux = lux;
+            let (_, current_effective) = Self::backlight_snapshot(&state);
+            (previous_effective, current_effective)
+        };
+        if previous_effective != current_effective {
+            self.sender.send(Event::Backlight(current_effective)).ok();
+        }
+        Self::notify_keyboard_backlight_changes_async(false, previous_effective != current_effective);
+    }
+
+    pub fn idle_timeout_seconds(&self) -> u64 {
+        self.state.read().unwrap().idle_timeout_seconds
+    }
+
+    pub async fn set_idle_timeout_seconds(&self, seconds: u64) {
+        let changed = {
+            let mut state = self.state.write().unwrap();
+            if state.idle_timeout_seconds == seconds {
+                false
+            } else {
+                state.idle_timeout_seconds = seconds;
+                true
+            }
+        };
+        if changed {
+            Self::notify_idle_timeout_changed_async();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_state() -> InnerState {
+        InnerState {
+            backlight: KeyboardBacklightState::Off,
+            mic_mute_led: false,
+            is_suspended: false,
+            is_idle: false,
+            is_usb_connected: false,
+            is_pogo_docked: false,
+            bt_connected_count: 0,
+            keyboard_last_connection_kind: KeyboardConnectionKind::Detached,
+            keyboard_disconnected_at: None,
+            desired_secondary_display_enabled: true,
+            is_secondary_display_enabled: true,
+            ambient_light_enabled: false,
+            ambient_keyboard_backlight_enabled: false,
+            ambient_light_available: false,
+            ambient_light_lux: None,
+            idle_timeout_seconds: 300,
+            desired_primary: Some("eDP-1".to_string()),
+            desired_display_attachment: "builtin_only".to_string(),
+            desired_display_layout: "joined".to_string(),
+            display_rotation: "normal".to_string(),
+            display_brightness: None,
+            keyboard_battery_pct: None,
+            keyboard_battery_charging: false,
+            keyboard_battery_full: false,
+            keyboard_battery_last_known_pct: None,
+            keyboard_battery_last_known_full: false,
+            tablet_mapping_enabled: true,
+            tablet_mapping_mode: TabletMapMode::OneToOne,
+            tablet_mapping_apply_nonce: 0,
+        }
+    }
+
+    #[test]
+    fn low_light_promotes_off_to_low() {
+        let mut state = sample_state();
+        state.ambient_keyboard_backlight_enabled = true;
+        state.ambient_light_available = true;
+        state.ambient_light_lux = Some(LOW_LIGHT_KEYBOARD_BACKLIGHT_LUX_THRESHOLD);
+
+        assert_eq!(
+            KeyboardStateManager::effective_keyboard_backlight(&state).level(),
+            KeyboardBacklightState::Low.level()
+        );
+    }
+
+    #[test]
+    fn idle_still_forces_backlight_off() {
+        let mut state = sample_state();
+        state.backlight = KeyboardBacklightState::High;
+        state.ambient_keyboard_backlight_enabled = true;
+        state.ambient_light_available = true;
+        state.ambient_light_lux = Some(1.0);
+        state.is_idle = true;
+
+        assert_eq!(
+            KeyboardStateManager::effective_keyboard_backlight(&state).level(),
+            KeyboardBacklightState::Off.level()
+        );
+    }
+
+    #[test]
+    fn requested_backlight_survives_idle_override() {
+        let mut state = sample_state();
+        state.backlight = KeyboardBacklightState::High;
+        state.is_idle = true;
+
+        assert_eq!(state.backlight.level(), KeyboardBacklightState::High.level());
+        assert_eq!(
+            KeyboardStateManager::effective_keyboard_backlight(&state).level(),
+            KeyboardBacklightState::Off.level()
+        );
     }
 }
