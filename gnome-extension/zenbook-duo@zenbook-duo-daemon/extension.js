@@ -37,6 +37,7 @@
  *   SessionLastSeenUsec
  *   MicMuteLed
  *   KeyboardBacklightLevel
+ *   KeyboardBacklightEffectiveLevel
  *
  * Methods used by UI actions:
  *   SetMicMute(bool)
@@ -107,6 +108,7 @@ const DBUS_XML = `
     <property name="DesiredSecondaryEnabled" type="b" access="read"/>
     <property name="MicMuteLed" type="b" access="read"/>
     <property name="KeyboardBacklightLevel" type="y" access="read"/>
+    <property name="KeyboardBacklightEffectiveLevel" type="y" access="read"/>
     <property name="DesiredDisplayAttachment" type="s" access="read"/>
     <property name="DesiredDisplayLayout" type="s" access="read"/>
     <property name="DisplayRotation" type="s" access="read"/>
@@ -647,6 +649,7 @@ class ZenbookKeyboardBatteryToggle extends QuickMenuToggle {
         this._primaryTopItem.setToggleState(state.desiredPrimary === 'eDP-1');
         this._suppressPrimaryToggle = false;
         const backlightKnown = state.keyboardBacklightLevel !== null;
+        const effectiveBacklightKnown = state.keyboardBacklightEffectiveLevel !== null;
         const backlightAvailable = state.rootReachable && hasLink && backlightKnown;
         setDimmed(this._backlightButtonsItem, !backlightAvailable);
         for (const [level, button] of this._backlightTickButtons.entries()) {
@@ -656,6 +659,12 @@ class ZenbookKeyboardBatteryToggle extends QuickMenuToggle {
                 button.add_style_class_name('zenbook-backlight-level-button-active');
             else
                 button.remove_style_class_name('zenbook-backlight-level-button-active');
+            if (effectiveBacklightKnown &&
+                level === state.keyboardBacklightEffectiveLevel &&
+                state.keyboardBacklightEffectiveLevel !== state.keyboardBacklightLevel)
+                button.add_style_class_name('zenbook-backlight-level-button-effective');
+            else
+                button.remove_style_class_name('zenbook-backlight-level-button-effective');
         }
         if (state.micMuteLed === null) {
             this._micItem.setSensitive(false);
@@ -993,6 +1002,7 @@ export default class ZenbookDuoExtension extends Extension {
         const sessionQuietVar = get('SessionQuiet');
         const micMuteVar = get('MicMuteLed');
         const backlightLevelVar = get('KeyboardBacklightLevel');
+        const effectiveBacklightLevelVar = get('KeyboardBacklightEffectiveLevel');
         const rootReachable = Boolean(this._proxy.get_name_owner());
         const nowUsec = Date.now() * 1000;
 
@@ -1030,6 +1040,9 @@ export default class ZenbookDuoExtension extends Extension {
             sessionQuiet: sessionQuietVar ? sessionQuietVar.get_boolean() : null,
             micMuteLed: micMuteVar ? micMuteVar.get_boolean() : null,
             keyboardBacklightLevel: backlightLevelVar ? backlightLevelVar.get_byte() : null,
+            keyboardBacklightEffectiveLevel: effectiveBacklightLevelVar
+                ? effectiveBacklightLevelVar.get_byte()
+                : null,
         };
 
         this._indicator.update(this.state);

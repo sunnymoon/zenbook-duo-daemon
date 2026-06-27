@@ -616,7 +616,7 @@ impl KeyboardStateManager {
             (previous, current)
         };
         persist_backlight_disk(new_state).await;
-        if previous_effective != current_effective {
+        if previous_requested != current_requested || previous_effective != current_effective {
             self.sender.send(Event::Backlight(current_effective)).ok();
         }
         Self::notify_keyboard_backlight_changes_async(
@@ -640,7 +640,7 @@ impl KeyboardStateManager {
             )
         };
         persist_backlight_disk(next).await;
-        if previous_effective != current_effective {
+        if previous_requested != current_requested || previous_effective != current_effective {
             self.sender.send(Event::Backlight(current_effective)).ok();
         }
         Self::notify_keyboard_backlight_changes_async(

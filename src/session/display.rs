@@ -27,6 +27,11 @@ const GNOME_TOPOLOGY_DEBOUNCE_MS: u64 = 600;
 /// Reconcile debounce for availability nudges (MonitorsChanged path) — shorter because the
 /// MonitorsChanged handler already debounced and verified serial stability.
 const AVAILABILITY_RECONCILE_DEBOUNCE_MS: u64 = 200;
+/// On session daemon startup, gnome-shell has already reset the display (it always does on a new
+/// shell process). Using the full 1200ms debounce means the bottom screen stays off for ~2s.
+/// A short startup debounce recovers faster; by the time our daemon starts, Mutter is already up
+/// (graphical-session.target fired before us), so there is no risk of racing an unready compositor.
+const STARTUP_RECONCILE_DEBOUNCE_MS: u64 = 200;
 /// After phase 1 of the eDP-2-primary two-step apply, wait before phase 2 so KMS/Mutter can finish
 /// committing the dual layout. See README "Dual display / Mutter apply ordering".
 const EDPTWO_PRIMARY_PHASE1_STABILITY_MS: u64 = 300;
@@ -289,6 +294,155 @@ fn read_scale_for_connector(logical: &[LogicalMonitor], connector: &str) -> Opti
         .map(|lm| lm.2)
 }
 
+/// monitors.xml `<transform><rotation>` token for a Mutter transform, or `None`
+/// for transform 0 (normal, unflipped) which Mutter omits entirely.
+fn transform_to_xml_rotation(transform: u32) -> Option<&'static str> {
+    match transform {
+        0 => None,
+        1 => Some("left"),
+        2 => Some("upside_down"),
+        3 => Some("right"),
+        4 => Some("normal"),
+        5 => Some("left"),
+        6 => Some("upside_down"),
+        7 => Some("right"),
+        _ => None,
+    }
+}
+
+/// Serialize Mutter's current logical layout into the exact `monitors.xml` v2 format
+/// Mutter itself writes. Mutter D-Bus state is the source of truth; this string is only
+/// a derived cache so the layout can be read back at login (by the user session and the
+/// GDM greeter) without our daemon needing to re-apply — which is what causes login flicker.
+fn serialize_monitors_xml(
+    physical: &[PhysicalMonitor],
+    logical: &[LogicalMonitor],
+    global_props: &HashMap<String, OwnedValue>,
+) -> String {
+    let modes = extract_all_modes(physical);
+    let layout_mode = global_props
+        .get("layout-mode")
+        .and_then(|v| u32::try_from(v.clone()).ok())
+        .unwrap_or(1);
+    let layout_mode_str = if layout_mode == 2 { "physical" } else { "logical" };
+
+    let esc = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
+
+    let mut out = String::new();
+    out.push_str("<monitors version=\"2\">\n");
+    out.push_str("  <configuration>\n");
+    out.push_str(&format!("    <layoutmode>{layout_mode_str}</layoutmode>\n"));
+
+    for (x, y, scale, transform, primary, refs, _props) in logical {
+        out.push_str("    <logicalmonitor>\n");
+        out.push_str(&format!("      <x>{x}</x>\n"));
+        out.push_str(&format!("      <y>{y}</y>\n"));
+        out.push_str(&format!("      <scale>{scale}</scale>\n"));
+        if *primary {
+            out.push_str("      <primary>yes</primary>\n");
+        }
+        if let Some(rotation) = transform_to_xml_rotation(*transform) {
+            out.push_str("      <transform>\n");
+            out.push_str(&format!("        <rotation>{rotation}</rotation>\n"));
+            if *transform >= 4 {
+                out.push_str("        <flipped>yes</flipped>\n");
+            }
+            out.push_str("      </transform>\n");
+        }
+        for (connector, vendor, product, serial) in refs {
+            out.push_str("      <monitor>\n");
+            out.push_str("        <monitorspec>\n");
+            out.push_str(&format!("          <connector>{}</connector>\n", esc(connector)));
+            out.push_str(&format!("          <vendor>{}</vendor>\n", esc(vendor)));
+            out.push_str(&format!("          <product>{}</product>\n", esc(product)));
+            out.push_str(&format!("          <serial>{}</serial>\n", esc(serial)));
+            out.push_str("        </monitorspec>\n");
+            if let Some((mode_id, w, h)) = modes.get(connector) {
+                let rate = mode_id.split('@').nth(1).unwrap_or("");
+                out.push_str("        <mode>\n");
+                out.push_str(&format!("          <width>{w}</width>\n"));
+                out.push_str(&format!("          <height>{h}</height>\n"));
+                out.push_str(&format!("          <rate>{rate}</rate>\n"));
+                out.push_str("        </mode>\n");
+            }
+            out.push_str("      </monitor>\n");
+        }
+        out.push_str("    </logicalmonitor>\n");
+    }
+    out.push_str("  </configuration>\n");
+    out.push_str("</monitors>\n");
+    out
+}
+
+/// `$XDG_CONFIG_HOME/monitors.xml` (default `$HOME/.config/monitors.xml`).
+fn user_monitors_xml_path() -> String {
+    let config_home = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+            format!("{home}/.config")
+        });
+    format!("{config_home}/monitors.xml")
+}
+
+/// Atomically write the user's `monitors.xml` (temp file + rename).
+async fn write_user_monitors_xml(xml: &str) -> std::io::Result<()> {
+    let path = user_monitors_xml_path();
+    if let Some(dir) = std::path::Path::new(&path).parent() {
+        tokio::fs::create_dir_all(dir).await?;
+    }
+    let tmp = format!("{path}.tmp.{}", std::process::id());
+    tokio::fs::write(&tmp, xml).await?;
+    tokio::fs::rename(&tmp, &path).await?;
+    Ok(())
+}
+
+/// After the display reaches a stable state, persist it (so login is flicker-free) and
+/// propagate it to the GDM greeter via the root daemon. No-op when the serialized layout
+/// is unchanged since the last persist, or when the state looks transitional/corrupted.
+async fn persist_layout_if_changed(
+    display: &DisplayConfigProxy<'_>,
+    last_persisted: &mut Option<String>,
+) {
+    let (_, physical, logical, props) = match display.get_current_state().await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("persist_layout: get_current_state failed: {e}");
+            return;
+        }
+    };
+    let (cfg, corrupted) = read_current_config(&logical);
+    if corrupted || cfg.is_empty() {
+        return;
+    }
+    let xml = serialize_monitors_xml(&physical, &logical, &props);
+    if last_persisted.as_deref() == Some(xml.as_str()) {
+        return;
+    }
+
+    match write_user_monitors_xml(&xml).await {
+        Ok(()) => info!(
+            "persist_layout: wrote {} ({} bytes, {} logical monitors)",
+            user_monitors_xml_path(),
+            xml.len(),
+            logical.len()
+        ),
+        Err(e) => warn!("persist_layout: writing user monitors.xml failed: {e}"),
+    }
+
+    match crate::dbus_state::persist_display_layout_xml_to_root(xml.clone()).await {
+        Ok(()) => info!("persist_layout: propagated layout to GDM via root daemon"),
+        Err(e) => warn!("persist_layout: propagate to GDM via root failed: {e}"),
+    }
+
+    *last_persisted = Some(xml);
+}
+
 /// Returns true if the error is a Mutter "displays not adjacent" error.
 fn is_non_adjacent_error<E: std::fmt::Display>(e: &E) -> bool {
     let s = e.to_string().to_lowercase();
@@ -388,7 +542,7 @@ fn requested_layout_matches_full(
                 if warn_on_field_mismatch {
                     warn!("{msg}");
                 } else {
-                    debug!("{msg} (current vs desired — apply needed)");
+                    info!("{msg} (current vs desired — apply needed)");
                 }
                 return false;
             }
@@ -1320,6 +1474,14 @@ fn ensure_display_recovery_task(
                     return;
                 }
                 Err(e) => {
+                    let msg = e.to_string();
+                    if is_dead_session_error(&msg) {
+                        warn!(
+                            "Display recovery: session D-Bus is dead (Broken pipe) — \
+                             this is a stale session daemon; exiting cleanly"
+                        );
+                        std::process::exit(0);
+                    }
                     warn!(
                         "Display recovery: attempt {}/{} failed after {}: {}",
                         attempt, MAX_ATTEMPTS, reason, e
@@ -1403,6 +1565,13 @@ fn schedule_reconcile(
     *debounce_deadline = Some(new_deadline);
 }
 
+/// Returns true when the error string indicates the session D-Bus connection is irrecoverably
+/// dead — typically a Broken pipe after GDM hands off to the real user session and gnome-shell
+/// has already exited. In that case the daemon is stale and should exit rather than retrying.
+fn is_dead_session_error(msg: &str) -> bool {
+    msg.contains("Broken pipe") || msg.contains("os error 32")
+}
+
 /// Re-run GNOME tablet `output` gsettings from current Mutter state (operator / D-Bus driven).
 pub async fn reapply_tablet_mapping_now(
     display: &DisplayConfigProxy<'_>,
@@ -1422,6 +1591,33 @@ pub async fn reapply_tablet_mapping_now(
     }
 }
 
+/// Log the full current Mutter display configuration at INFO level for diagnostics.
+/// `label` identifies the call site (e.g. "startup", "post-apply").
+async fn log_display_snapshot(label: &str, display: &DisplayConfigProxy<'_>) {
+    match display.get_current_state().await {
+        Ok((serial, physical, logical, _)) => {
+            let modes = extract_all_modes(&physical);
+            let (cfg, corrupted) = read_current_config(&logical);
+            let mut parts: Vec<String> = cfg
+                .iter()
+                .map(|(conn, (x, y, scale, transform, is_primary))| {
+                    let mode = modes.get(conn).map(|(m, _, _)| m.as_str()).unwrap_or("?");
+                    format!(
+                        "{conn}@({x},{y}) s={scale:.3} t={transform} pri={is_primary} mode={mode}"
+                    )
+                })
+                .collect();
+            parts.sort();
+            info!(
+                "Display snapshot [{label}]: serial={serial} corrupted={corrupted} connectors={} | {}",
+                cfg.len(),
+                parts.join(", ")
+            );
+        }
+        Err(e) => warn!("Display snapshot [{label}]: get_current_state failed: {e}"),
+    }
+}
+
 pub async fn run(
     mut orient_rx: broadcast::Receiver<String>,
     mut kb_rx: broadcast::Receiver<bool>,
@@ -1434,6 +1630,32 @@ pub async fn run(
     tablet_config: Arc<tokio::sync::RwLock<crate::config::TabletMappingConfig>>,
     mut tablet_remap_rx: broadcast::Receiver<()>,
 ) {
+    {
+        let pid = std::process::id();
+        let uid = nix::unistd::getuid();
+        let uname = nix::unistd::User::from_uid(uid)
+            .ok()
+            .flatten()
+            .map(|u| u.name)
+            .unwrap_or_else(|| "?".to_string());
+        let env = |k: &str| std::env::var(k).unwrap_or_else(|_| "<unset>".to_string());
+        info!(
+            "Session display daemon starting: pid={pid} uid={uid} user={uname} \
+             XDG_SESSION_ID={} XDG_SESSION_TYPE={} XDG_SESSION_DESKTOP={} \
+             WAYLAND_DISPLAY={} DISPLAY={} DBUS_SESSION_BUS_ADDRESS={}",
+            env("XDG_SESSION_ID"),
+            env("XDG_SESSION_TYPE"),
+            env("XDG_SESSION_DESKTOP"),
+            env("WAYLAND_DISPLAY"),
+            env("DISPLAY"),
+            if std::env::var("DBUS_SESSION_BUS_ADDRESS").is_ok() {
+                "<set>"
+            } else {
+                "<unset>"
+            }
+        );
+    }
+
     let conn = loop {
         match Connection::session().await {
             Ok(c) => break c,
@@ -1467,6 +1689,7 @@ pub async fn run(
     if let Ok(transform) = current_desired_transform(&display).await {
         info!("Display: startup desired transform={transform}");
     }
+    log_display_snapshot("startup", &display).await;
     let mut availability_rx = availability_tx.subscribe();
     let mut availability_task: Option<tokio::task::JoinHandle<()>> = None;
     ensure_availability_monitor(
@@ -1486,6 +1709,13 @@ pub async fn run(
     let mut debounce_deadline: Option<tokio::time::Instant> = None;
     let mut pending_reason: &'static str = "display state update";
     let mut changed_apply_waiting_followup = false;
+    // True until the first reconcile attempt completes. While in startup, use
+    // STARTUP_RECONCILE_DEBOUNCE_MS instead of RECONCILE_DEBOUNCE_MS so that
+    // we recover from gnome-shell's startup display reset as quickly as possible.
+    let mut in_startup = true;
+    // Last layout (serialized monitors.xml) we persisted to disk + propagated to GDM.
+    // Used to skip redundant writes when the stable layout has not changed.
+    let mut last_persisted_layout: Option<String> = None;
 
     // Do not apply any desired_primary at startup from the local default.
     // Root daemon is the authority and will publish the real desired_primary
@@ -1500,6 +1730,7 @@ pub async fn run(
             }, if debounce_deadline.is_some() => {
                 info!("Display debounce: applying scheduled reconcile for '{}'", pending_reason);
                 debounce_deadline = None;
+                in_startup = false;
                 if let Some(until) = quiet_until {
                     if tokio::time::Instant::now() < until {
                         info!("Display reconcile: quiet period active, skipping apply");
@@ -1586,6 +1817,7 @@ pub async fn run(
                             "Display reconcile completed in {:.2}ms",
                             start.elapsed().as_secs_f64() * 1000.0
                         );
+                        persist_layout_if_changed(&display, &mut last_persisted_layout).await;
                     }
                     Err(e) if e.is_guard_block() => {
                         warn!("Display reconcile skipped ({e}); not starting recovery without apply guard");
@@ -1597,6 +1829,14 @@ pub async fn run(
                         );
                     }
                     Err(e) => {
+                        let msg = e.to_string();
+                        if is_dead_session_error(&msg) {
+                            warn!(
+                                "Display reconcile: session D-Bus is dead (Broken pipe) — \
+                                 stale session daemon; exiting cleanly"
+                            );
+                            std::process::exit(0);
+                        }
                         warn!("Display reconcile failed after {pending_reason}: {e}");
                         ensure_display_recovery_task(
                             &mut recovery_task,
@@ -1667,7 +1907,7 @@ pub async fn run(
                         &mut debounce_deadline,
                         &mut pending_reason,
                         "desired secondary update",
-                        RECONCILE_DEBOUNCE_MS,
+                        if in_startup { STARTUP_RECONCILE_DEBOUNCE_MS } else { RECONCILE_DEBOUNCE_MS },
                     );
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => warn!("Desired secondary handler lagged by {n}"),
@@ -1741,7 +1981,7 @@ pub async fn run(
                         &mut debounce_deadline,
                         &mut pending_reason,
                         "desired primary update",
-                        RECONCILE_DEBOUNCE_MS,
+                        if in_startup { STARTUP_RECONCILE_DEBOUNCE_MS } else { RECONCILE_DEBOUNCE_MS },
                     );
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => warn!("DesiredPrimary handler lagged by {n}"),

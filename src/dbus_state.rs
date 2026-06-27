@@ -447,6 +447,23 @@ impl RootStateInterface {
         Ok(())
     }
 
+    /// Persist the session's current display layout (serialized monitors.xml) to the
+    /// system-wide and GDM-greeter locations, so the login screen and pre-session boot
+    /// come up with the user's layout (no flicker). The session daemon writes its own
+    /// ~/.config/monitors.xml; this privileged path covers the root-owned targets.
+    async fn persist_display_layout_xml(
+        &self,
+        xml: String,
+        #[zbus(header)] header: Header<'_>,
+    ) -> fdo::Result<()> {
+        self.ensure_registered_sender(&header).await?;
+        self.mark_session_activity().await;
+        write_gdm_monitors_xml(&xml)
+            .await
+            .map_err(fdo::Error::Failed)?;
+        Ok(())
+    }
+
     #[zbus(property)]
     fn display_brightness(&self) -> u32 {
         self.state_manager.get_display_brightness_value().unwrap_or(0)
@@ -528,7 +545,8 @@ impl RootStateInterface {
         let pid = dbus_caller_pid(connection, sender.as_str()).await?;
         polkit::check_authorization(connection, pid, polkit::ACTION_REGISTER_SESSION).await?;
 
-        if self.state_manager.is_secondary_display_enabled() {
+        let replacing_existing_session = self.registration.read().await.is_some();
+        if self.state_manager.is_secondary_display_enabled() && !replacing_existing_session {
             crate::secondary_display::arm_sysfs_fallback_once();
             self.state_manager.emit_secondary_display_state();
             if crate::secondary_display::wait_for_secondary_display_state(true, Duration::from_secs(8))
@@ -538,6 +556,10 @@ impl RootStateInterface {
             } else {
                 warn!("ROOT DBus: timed out waiting for secondary display enable during session registration");
             }
+        } else if self.state_manager.is_secondary_display_enabled() && replacing_existing_session {
+            info!(
+                "ROOT DBus: replacing existing session registration while secondary is already enabled; skipping pre-registration secondary sync"
+            );
         }
 
         let now = session_now_usec();
@@ -923,6 +945,7 @@ trait RootState {
     fn report_ambient_light_enabled(&self, value: bool) -> zbus::Result<()>;
     fn report_observed_display_mode(&self, attachment: String, layout: String) -> zbus::Result<()>;
     fn report_display_rotation(&self, rotation: String) -> zbus::Result<()>;
+    fn persist_display_layout_xml(&self, xml: String) -> zbus::Result<()>;
     fn register_display_apply_attempt(&self) -> zbus::Result<bool>;
     fn resume_display_applies(&self) -> zbus::Result<()>;
     fn toggle_mic_mute(&self) -> zbus::Result<()>;
@@ -1941,6 +1964,113 @@ pub async fn report_display_rotation_from_session(rotation: String) -> Result<()
         .await
         .map_err(|e| format!("report_display_rotation: {e}"))?;
     Ok(())
+}
+
+/// Ask the root daemon to persist the serialized `monitors.xml` to the root-owned GDM
+/// greeter / system-wide locations (`/etc/xdg` + `/var/lib/gdm/seat0/config`).
+pub async fn persist_display_layout_xml_to_root(xml: String) -> Result<(), String> {
+    let (connection, _) = {
+        let guard = session_registered_system_bus_cell().lock().await;
+        guard
+            .as_ref()
+            .map(|(c, sid)| (c.clone(), *sid))
+            .ok_or_else(|| {
+                "session system bus not registered yet (is the session daemon running and connected to root?)"
+                    .to_string()
+            })?
+    };
+
+    let proxy = RootStateProxy::new(&connection)
+        .await
+        .map_err(|e| format!("root state proxy for persist_display_layout_xml: {e}"))?;
+    proxy
+        .persist_display_layout_xml(xml)
+        .await
+        .map_err(|e| format!("persist_display_layout_xml: {e}"))?;
+    Ok(())
+}
+
+/// GDM greeter / system-wide monitors.xml targets written by the root daemon.
+const GDM_MONITORS_TARGETS: &[&str] = &[
+    "/etc/xdg/monitors.xml",
+    "/var/lib/gdm/seat0/config/monitors.xml",
+];
+
+/// Write the serialized layout to the root-owned GDM/system targets. Best-effort per
+/// target: a failure on one (e.g. the greeter dir does not exist yet) is logged but does
+/// not abort the others. The `/etc/xdg` target is the robust one (root-owned, world
+/// readable, immune to GDM's drifting dynamic uid); the seat0 target is greeter-specific.
+async fn write_gdm_monitors_xml(xml: &str) -> Result<(), String> {
+    let mut wrote_any = false;
+    let mut last_err: Option<String> = None;
+
+    for target in GDM_MONITORS_TARGETS {
+        let path = std::path::Path::new(target);
+        if let Some(dir) = path.parent() {
+            if !dir.exists() {
+                // Only /etc/xdg is guaranteed; the GDM seat0 dir is created by GDM itself.
+                if target.starts_with("/etc/xdg") {
+                    if let Err(e) = tokio::fs::create_dir_all(dir).await {
+                        last_err = Some(format!("create {}: {e}", dir.display()));
+                        continue;
+                    }
+                } else {
+                    info!("persist GDM layout: skipping {target} (greeter dir not present yet)");
+                    continue;
+                }
+            }
+        }
+
+        let tmp = format!("{target}.tmp.{}", std::process::id());
+        if let Err(e) = tokio::fs::write(&tmp, xml).await {
+            last_err = Some(format!("write {tmp}: {e}"));
+            continue;
+        }
+        if let Err(e) = tokio::fs::rename(&tmp, target).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            last_err = Some(format!("rename to {target}: {e}"));
+            continue;
+        }
+        let _ = tokio::fs::set_permissions(
+            target,
+            std::os::unix::fs::PermissionsExt::from_mode(0o644),
+        )
+        .await;
+
+        // The greeter-specific file must be readable by the gdm-owned seat dir.
+        if target.starts_with("/var/lib/gdm") {
+            chown_to_gdm(target);
+        }
+        best_effort_restorecon(target);
+
+        info!("persist GDM layout: wrote {target} ({} bytes)", xml.len());
+        wrote_any = true;
+    }
+
+    if wrote_any {
+        Ok(())
+    } else {
+        Err(last_err.unwrap_or_else(|| "no GDM monitors.xml target was writable".to_string()))
+    }
+}
+
+/// Best-effort chown of a path to the `gdm` user/group (greeter file ownership).
+fn chown_to_gdm(path: &str) {
+    if let Ok(Some(user)) = nix::unistd::User::from_name("gdm") {
+        let uid = user.uid;
+        let gid = user.gid;
+        if let Err(e) = nix::unistd::chown(path, Some(uid), Some(gid)) {
+            warn!("persist GDM layout: chown gdm {path} failed: {e}");
+        }
+    }
+}
+
+/// Best-effort SELinux relabel so the greeter (confined) can read the file on Fedora.
+fn best_effort_restorecon(path: &str) {
+    let _ = std::process::Command::new("restorecon")
+        .arg("-F")
+        .arg(path)
+        .status();
 }
 
 pub async fn resume_display_applies() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

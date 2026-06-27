@@ -269,6 +269,37 @@ run_user_systemctl() {
         systemctl --user "$@"
 }
 
+user_session_override_file() {
+    local user="$1"
+    local home_dir
+
+    home_dir="$(getent passwd "${user}" | cut -d: -f6)"
+    if [ -z "${home_dir}" ]; then
+        return 1
+    fi
+
+    printf '%s\n' "${home_dir}/.config/systemd/user/${SESSION_SERVICE_NAME}.service"
+}
+
+remove_stale_session_override_for_user() {
+    local uid="$1"
+    local user="$2"
+    local override_file
+
+    override_file="$(user_session_override_file "${user}")" || return 0
+    if [ ! -f "${override_file}" ]; then
+        return 0
+    fi
+
+    if cmp -s "${override_file}" "${SESSION_SERVICE_FILE}"; then
+        echo "Removing stale user override ${override_file} for ${user}..."
+        rm -f "${override_file}"
+        run_user_systemctl "${uid}" "${user}" daemon-reload || true
+    else
+        echo "Warning: Keeping customized user override ${override_file} for ${user}" >&2
+    fi
+}
+
 for_each_active_user() {
     while read -r uid user _; do
         if [ -n "${uid}" ] && [ -n "${user}" ]; then
@@ -285,6 +316,35 @@ reload_system_dbus() {
         return 0
     fi
     echo "Warning: Failed to reload system D-Bus policy; a reboot or manual reload may be required" >&2
+}
+
+# Enable fractional-scaling in the GDM greeter's dconf database so the greeter accepts
+# monitors.xml configs that use fractional scales (e.g. the Zenbook Duo's 5/3 scale).
+# Without this, Mutter silently drops the greeter monitors.xml (GDM bug #1028) and the
+# login screen falls back to its default (side-by-side) layout. The session/root daemon
+# writes /etc/xdg/monitors.xml + /var/lib/gdm/seat0/config/monitors.xml at runtime.
+setup_gdm_fractional_scaling() {
+    local gdm_db_dir="/etc/dconf/db/gdm.d"
+    local conf="${gdm_db_dir}/02-zenbook-duo-fractional-scaling"
+
+    if [ ! -d "/etc/dconf/db" ]; then
+        echo "Note: dconf not present; skipping GDM fractional-scaling setup" >&2
+        return 0
+    fi
+
+    echo "Configuring GDM greeter fractional scaling (dconf)..."
+    mkdir -p "${gdm_db_dir}"
+    # Remove the older manually-seeded filename if present, so we own a single canonical file.
+    rm -f "${gdm_db_dir}/02-fractional-scaling"
+    cat > "${conf}" <<'EOF'
+# Installed by zenbook-duo-daemon: allow the GDM greeter to honor monitors.xml
+# configs that use fractional scaling (required for the Zenbook Duo dual-panel layout).
+[org/gnome/mutter]
+experimental-features=['scale-monitor-framebuffer']
+EOF
+    if ! dconf update 2>/dev/null; then
+        echo "Warning: 'dconf update' failed; GDM greeter layout may not apply" >&2
+    fi
 }
 
 stop_session_service_for_user() {
@@ -444,6 +504,7 @@ install() {
         rm -f "${BINARY_PATH}" "${SERVICE_FILE}" "${SESSION_SERVICE_FILE}"
         exit 1
     fi
+    for_each_active_user remove_stale_session_override_for_user
 
     echo "Downloading D-Bus policy file from ${GITHUB_REPO}/${DBUS_POLICY_NAME}..."
     if ! curl -fSL -o "${DBUS_POLICY_FILE}" "${GITHUB_REPO}/${DBUS_POLICY_NAME}"; then
@@ -459,6 +520,8 @@ install() {
     reload_system_dbus || true
 
     install_polkit_policy_from_url
+    
+    setup_gdm_fractional_scaling
     
     # Run migrate-config command
     echo "Running config migration..."
@@ -557,12 +620,15 @@ local_install() {
     echo "Copying session service file from ${session_service_file_path}..."
     ensure_session_systemd_user_dir
     cp "${session_service_file_path}" "${SESSION_SERVICE_FILE}"
+    for_each_active_user remove_stale_session_override_for_user
 
     echo "Copying D-Bus policy file from ${dbus_policy_file_path}..."
     cp "${dbus_policy_file_path}" "${DBUS_POLICY_FILE}"
     reload_system_dbus || true
 
     install_polkit_policy_from_path "${polkit_policy_file_path}"
+    
+    setup_gdm_fractional_scaling
     
     # Run migrate-config command
     echo "Running config migration..."
