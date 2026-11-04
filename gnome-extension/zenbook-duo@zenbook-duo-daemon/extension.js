@@ -60,8 +60,11 @@ import {
     SystemIndicator,
     QuickMenuToggle,
 } from 'resource:///org/gnome/shell/ui/quickSettings.js';
-import {PopupAnimation} from 'resource:///org/gnome/shell/ui/boxpointer.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
+
+const VERTICAL_BOX_LAYOUT = 'orientation' in St.BoxLayout.prototype
+    ? {orientation: Clutter.Orientation.VERTICAL}
+    : {vertical: true};
 
 // ── D-Bus constants ────────────────────────────────────────────────────────
 const DBUS_SERVICE   = 'asus.zenbook.duo';
@@ -495,7 +498,7 @@ class ZenbookKeyboardBatteryToggle extends QuickMenuToggle {
         });
         const backlightBox = new St.BoxLayout({
             style_class: 'zenbook-backlight-box',
-            vertical: true,
+            ...VERTICAL_BOX_LAYOUT,
             x_expand: true,
             x_align: Clutter.ActorAlign.FILL,
         });
@@ -525,7 +528,7 @@ class ZenbookKeyboardBatteryToggle extends QuickMenuToggle {
             });
             const buttonContent = new St.BoxLayout({
                 style_class: 'zenbook-backlight-level-content',
-                vertical: true,
+                ...VERTICAL_BOX_LAYOUT,
                 x_align: Clutter.ActorAlign.CENTER,
                 y_align: Clutter.ActorAlign.CENTER,
             });
@@ -565,7 +568,7 @@ class ZenbookKeyboardBatteryToggle extends QuickMenuToggle {
         const settingsItem = new PopupMenu.PopupMenuItem('More settings...');
         settingsItem.connectObject('activate', () => {
             this._extension.openPreferences();
-            this.menu.close(PopupAnimation.FADE);
+            this.menu.close();
         }, this);
         settingsItem.visible = Main.sessionMode.allowSettings;
         this.menu.addMenuItem(settingsItem);
