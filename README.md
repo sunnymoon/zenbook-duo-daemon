@@ -161,6 +161,12 @@ The install script **merges only the missing Zenbook sections** into:
 
 It does **not** replace unrelated user quirks already present in that file.
 
+The installer also marks the detachable USB and Bluetooth touchpads as internal
+in `/etc/udev/hwdb.d/81-zenbook-duo-touchpad.hwdb` and rebuilds the hardware
+database. Newer udev versions otherwise classify the removable USB connection as
+external, which makes libinput disable DWT even with the keyboard quirks above.
+Reconnect the keyboard or log out and back in after installing this override.
+
 ## Installation
 
 ### Install from a local checkout

@@ -194,6 +194,20 @@ merge_zenbook_duo_quirks() {
 
 }
 
+install_touchpad_integration_hwdb() {
+    local hwdb_file="/etc/udev/hwdb.d/81-zenbook-duo-touchpad.hwdb"
+    mkdir -p "$(dirname "${hwdb_file}")"
+    cat > "${hwdb_file}" <<'EOF'
+# The detachable keyboard includes the laptop touchpad, even on a removable port.
+touchpad:usb:v0b05p1b2c:*
+touchpad:usb:v0b05p1bf2:*
+touchpad:bluetooth:v0b05p1bf3:*
+ ID_INPUT_TOUCHPAD_INTEGRATION=internal
+EOF
+    systemd-hwdb update
+    echo "Installed Zenbook Duo touchpad integration override; reconnect the keyboard or log out/in."
+}
+
 install_quirks_from_release() {
     local temp_quirks
     temp_quirks="$(mktemp)"
@@ -477,6 +491,7 @@ install() {
     chmod +x "${BINARY_PATH}"
     install_cli_symlink
     install_quirks_from_release
+    install_touchpad_integration_hwdb
     
     # Download main service file
     echo "Downloading service file from ${GITHUB_REPO}/zenbook-duo-daemon.service..."
@@ -612,6 +627,7 @@ local_install() {
     chmod +x "${BINARY_PATH}"
     install_cli_symlink
     install_quirks_from_local_source "${quirks_file_path}"
+    install_touchpad_integration_hwdb
     
     # Copy service files
     echo "Copying service file from ${service_file_path}..."
