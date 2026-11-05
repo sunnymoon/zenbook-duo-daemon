@@ -1,4 +1,10 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use futures::stream::StreamExt;
 use log::{debug, info, warn};
@@ -22,6 +28,17 @@ use crate::{
 
 const VENDOR_INTERFACE: u8 = 4;
 const USB_BATTERY_GET_POLL_SECS: u64 = 30;
+
+// A re-enumerated keyboard can start a new USB task before the old receive task exits.
+static USB_KEYBOARD_SESSION: AtomicU64 = AtomicU64::new(0);
+
+fn begin_usb_keyboard_session() -> u64 {
+    USB_KEYBOARD_SESSION.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+fn is_current_usb_keyboard_session(session: u64) -> bool {
+    USB_KEYBOARD_SESSION.load(Ordering::Acquire) == session
+}
 
 async fn poll_usb_battery_via_get_report(device: &Arc<Device>) -> Option<(u8, u8)> {
     let query = parse_hex_string("5a3d0000000000000000000000000000");
@@ -172,6 +189,7 @@ pub async fn start_usb_keyboard_task(
 ) -> (DeviceId, broadcast::Sender<()>) {
     let (shutdown_tx, shutdown_rx1) = broadcast::channel::<()>(1);
     let device_id = keyboard.id();
+    let usb_session = begin_usb_keyboard_session();
 
     let keyboard_device = Arc::new(keyboard.open().await.unwrap());
     let bus_id = keyboard.bus_id();
@@ -291,7 +309,11 @@ pub async fn start_usb_keyboard_task(
             tokio::select! {
                 _ = shutdown_rx2.recv() => {
                     info!("USB receive task shutting down");
-                    state_manager.set_usb_keyboard_connection(false, false);
+                    if is_current_usb_keyboard_session(usb_session) {
+                        state_manager.set_usb_keyboard_connection(false, false);
+                    } else {
+                        info!("USB receive task superseded by a newer connection; keeping USB state");
+                    }
                     virtual_keyboard.lock().await.release_all_keys();
                     break;
                 }
@@ -485,5 +507,19 @@ async fn send_mute_microphone_state(keyboard: &Arc<Device>, state: bool) {
         .await
     {
         warn!("Failed to send mic mute state: {:?}", e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_usb_session_cannot_clear_newer_connection() {
+        let old_session = begin_usb_keyboard_session();
+        let new_session = begin_usb_keyboard_session();
+
+        assert!(!is_current_usb_keyboard_session(old_session));
+        assert!(is_current_usb_keyboard_session(new_session));
     }
 }
